@@ -93,6 +93,12 @@ pub struct TodayView {
     pub series: Vec<SeriesPoint>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CurrencyTotal {
+    pub currency: String,
+    pub amount: f64,
+}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct ProviderHealth {
@@ -106,14 +112,17 @@ pub struct ProviderHealth {
     pub exhausted: usize,
     pub disabled: usize,
     pub half_open: usize,
-    pub balance: f64,
-    pub balance_known: bool,
-    pub currency: String,
+    /// Balances are never summed across currencies.
+    pub balances: Vec<CurrencyTotal>,
 }
 
 impl ProviderHealth {
     pub fn all_unavailable(&self) -> bool {
         self.account_count > 0 && self.healthy == 0 && self.half_open == 0
+    }
+
+    pub fn balance_known(&self) -> bool {
+        !self.balances.is_empty()
     }
 }
 

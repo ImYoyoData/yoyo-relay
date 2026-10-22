@@ -313,6 +313,11 @@ fn migrate_value(mut value: Value) -> Value {
         // v0 -> v1: every field has a serde default; only the marker changes.
         obj.insert("schema_version".into(), Value::from(1));
     }
+    if version < 2 {
+        // v1 -> v2: model profiles are derived lazily from routes when absent,
+        // so only the marker needs to move. Existing route metadata remains.
+        obj.insert("schema_version".into(), Value::from(2));
+    }
     value
 }
 
@@ -385,6 +390,26 @@ pub fn validate(config: &AppConfig) -> Vec<String> {
         }
     }
 
+    let mut profile_names = HashSet::new();
+    for p in &config.model_profiles {
+        let name = p.client_model.trim();
+        if name.is_empty() {
+            errors.push("模型档案的客户端模型名不能为空".into());
+        } else if !profile_names.insert(name.to_string()) {
+            errors.push(format!("模型档案重复：{name}"));
+        }
+        if let Some(context) = p.context_window {
+            if context == 0 {
+                errors.push(format!("模型「{name}」的上下文窗口必须大于 0"));
+            }
+        }
+        if let (Some(context), Some(max_output)) = (p.context_window, p.max_output_tokens) {
+            if max_output > context {
+                errors.push(format!("模型「{name}」的最大输出不能大于上下文窗口"));
+            }
+        }
+    }
+
     for k in &config.local_keys {
         if !ids.insert(format!("k:{}", k.id)) {
             errors.push(format!("本地 Key ID 重复：{}", k.id));
@@ -428,10 +453,20 @@ mod tests {
             api_key: "sk-plaintext-secret".into(),
             ..Account::default()
         });
+        config.model_profiles.push(ClientModelProfile {
+            client_model: "test-model".into(),
+            context_window: Some(128_000),
+            max_output_tokens: Some(8_192),
+            input_modalities: vec!["text".into(), "image".into()],
+            reasoning_levels: vec!["low".into(), "high".into()],
+            ..ClientModelProfile::default()
+        });
         store.save(&mut config).unwrap();
         assert!(is_encrypted(&config.accounts[0].api_key));
         let out = store.load().unwrap();
         assert_eq!(out.config.accounts.len(), 1);
+        assert_eq!(out.config.model_profiles.len(), 1);
+        assert_eq!(out.config.model_profiles[0].context_window, Some(128_000));
         let plain = store.decrypt(&out.config.accounts[0].api_key).unwrap();
         assert_eq!(plain, "sk-plaintext-secret");
         let raw = fs::read_to_string(&store.paths.config_file).unwrap();

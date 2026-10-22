@@ -95,8 +95,8 @@ impl App {
             let healthy = health.as_ref().map(|h| h.healthy).unwrap_or(0);
             let balance_text = health
                 .as_ref()
-                .filter(|h| h.balance_known)
-                .map(|h| widgets::format_money(h.balance, &h.currency));
+                .filter(|h| h.balance_known())
+                .map(|h| widgets::format_currency_totals(&h.balances));
             let mut add_for_provider = None;
             let provider_id = provider.id.clone();
             super::kit::surface(ui, |ui| {

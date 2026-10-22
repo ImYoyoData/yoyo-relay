@@ -834,7 +834,7 @@ pub async fn test_local_key(gw: &Gateway, key_id: &str) -> TestResult {
             return result;
         }
     };
-    let endpoint = format!("{}/v1/models", gw.endpoint());
+    let endpoint = gw.models_url();
     let started = Instant::now();
     let resp = gw
         .client_for(&endpoint)

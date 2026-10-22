@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -611,7 +611,7 @@ impl Runtime {
             let inflight = self.scheduler.inflight_of(&account.id);
             let quota = self.scheduler.quota_snapshot(account, &cfg.scheduler, now);
             let (balance, estimated, source, updated, _note) =
-                self.compute_balance(account, &balance_rows);
+                self.compute_balance(account, &cfg, &balance_rows);
             let (today_tokens, today_requests) = self
                 .db
                 .sum_account_since(&account.id, today_start)
@@ -668,9 +668,7 @@ impl Runtime {
             let mut disabled = 0;
             let mut half_open = 0;
             let mut total = 0;
-            let mut balance_sum = 0.0;
-            let mut balance_known = false;
-            let mut currency = String::from("USD");
+            let mut provider_balances: BTreeMap<String, f64> = BTreeMap::new();
             for account in cfg.accounts_of(&provider.id) {
                 total += 1;
                 let view = accounts.iter().find(|a| a.id == account.id);
@@ -683,9 +681,9 @@ impl Runtime {
                 }
                 if let Some(view) = view {
                     if let Some(amount) = view.balance {
-                        balance_sum += amount;
-                        balance_known = true;
-                        currency = view.balance_currency.clone();
+                        *provider_balances
+                            .entry(crate::config::normalize_currency(&view.balance_currency))
+                            .or_insert(0.0) += amount;
                     }
                     balances.push(BalanceView {
                         account_id: account.id.clone(),
@@ -713,9 +711,10 @@ impl Runtime {
                 exhausted,
                 disabled,
                 half_open,
-                balance: balance_sum,
-                balance_known,
-                currency,
+                balances: provider_balances
+                    .into_iter()
+                    .map(|(currency, amount)| CurrencyTotal { currency, amount })
+                    .collect(),
             });
         }
 
@@ -806,7 +805,7 @@ impl Runtime {
         }
         for b in &balances {
             if let Some(amount) = b.amount {
-                if amount < cfg.ui.low_balance_threshold && amount >= 0.0 {
+                if amount < cfg.ui.threshold_for(&b.currency) && amount >= 0.0 {
                     alerts.push(Alert {
                         level: AlertLevel::Warning,
                         text: format!(
@@ -829,9 +828,9 @@ impl Runtime {
         let (active_requests, queued_requests) = self.gateway.queue_depth();
         let snapshot = UiSnapshot {
             proxy: proxy_status,
-            endpoint: self.gateway.endpoint(),
+            endpoint: self.gateway.api_base(),
             uptime_secs: now - self.gateway.started_at,
-            client_models: cfg.client_models(),
+            client_models: cfg.servable_models(),
             today: TodayView {
                 totals: today_totals,
                 series: today_series,
@@ -860,6 +859,7 @@ impl Runtime {
     fn compute_balance(
         &self,
         account: &crate::config::Account,
+        cfg: &AppConfig,
         rows: &HashMap<String, crate::db::BalanceRow>,
     ) -> (Option<f64>, bool, String, i64, String) {
         match account.balance.mode {
@@ -897,11 +897,15 @@ impl Runtime {
                 }
             }
             BalanceMode::Manual => {
-                let spent = self
+                let spent_usd = self
                     .db
                     .cost_account_since(&account.id, account.balance.manual_updated_at)
                     .unwrap_or(0) as f64
                     / 1_000_000.0;
+                let currency = crate::config::normalize_currency(&account.balance.currency);
+                // Route prices are USD per Mtok; convert before subtracting
+                // from a balance that may be in CNY or another currency.
+                let spent = spent_usd * cfg.ui.fx_rate(&currency);
                 let amount = (account.balance.manual_amount - spent).max(0.0);
                 (
                     Some(amount),
@@ -981,10 +985,7 @@ impl Runtime {
                 self.scheduler
                     .build_chain(cfg, &model, crate::protocol::Ingress::Chat, false);
             notes.extend(chain.notes);
-            let fallback_model = routes
-                .iter()
-                .find_map(|r| r.fallback_client_model.clone())
-                .filter(|m| !m.trim().is_empty() && m != &model);
+            let fallback_model = cfg.fallback_for(&model);
             if let Some(fallback) = &fallback_model {
                 notes.push(format!("映射级兜底：{model} → {fallback}"));
             }

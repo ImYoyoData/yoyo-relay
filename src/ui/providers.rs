@@ -190,14 +190,11 @@ impl App {
                 super::kit::badge(ui, auth, theme::MUTED);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(health) = &health {
-                        if health.balance_known {
+                        if health.balance_known() {
                             ui.label(
-                                RichText::new(widgets::format_money(
-                                    health.balance,
-                                    &health.currency,
-                                ))
-                                .size(13.0)
-                                .strong(),
+                                RichText::new(widgets::format_currency_totals(&health.balances))
+                                    .size(13.0)
+                                    .strong(),
                             );
                             super::kit::badge(ui, "余额", theme::MUTED);
                         }

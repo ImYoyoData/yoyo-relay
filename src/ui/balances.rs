@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use armas::components::{Card, CardVariant};
 use egui::RichText;
 use egui_phosphor::regular as icons;
@@ -17,17 +19,44 @@ impl App {
             .cloned()
             .collect();
         let known: Vec<&BalanceView> = balances.iter().filter(|b| b.amount.is_some()).collect();
-        let currency = known
-            .first()
-            .map(|b| b.currency.clone())
-            .unwrap_or_else(|| "USD".into());
-        let total: f64 = known.iter().filter_map(|b| b.amount).sum();
+        let mut totals: BTreeMap<String, f64> = BTreeMap::new();
+        for balance in &known {
+            if let Some(amount) = balance.amount {
+                *totals
+                    .entry(crate::config::normalize_currency(&balance.currency))
+                    .or_insert(0.0) += amount;
+            }
+        }
+        let total_text = if totals.is_empty() {
+            "—".to_string()
+        } else {
+            totals
+                .iter()
+                .map(|(currency, amount)| widgets::format_money(*amount, currency))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
         let low = known
             .iter()
-            .filter(|b| b.amount.unwrap_or(0.0) < self.config.ui.low_balance_threshold)
+            .filter(|b| b.amount.unwrap_or(0.0) < self.config.ui.threshold_for(&b.currency))
             .count();
+        let threshold_text = if totals.is_empty() {
+            "按币种分别设置".to_string()
+        } else {
+            totals
+                .keys()
+                .map(|currency| {
+                    format!(
+                        "{} {}",
+                        currency,
+                        widgets::format_money(self.config.ui.threshold_for(currency), currency)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
         let auto_count = balances.iter().filter(|b| b.mode.contains("自动")).count();
-        let manual_count = balances.iter().filter(|b| b.estimated).count();
+        let manual_count = balances.iter().filter(|b| b.mode.contains("手动")).count();
 
         super::kit::page_header(
             ui,
@@ -46,11 +75,11 @@ impl App {
             (
                 icons::WALLET,
                 "已知余额合计",
-                widgets::format_money(total, &currency),
+                total_text,
                 if known.is_empty() {
                     "暂无可用余额数据".to_string()
                 } else {
-                    "自动 + 手动估算".to_string()
+                    "按币种分别统计，不做汇率相加".to_string()
                 },
                 theme::ACCENT,
             ),
@@ -58,10 +87,7 @@ impl App {
                 icons::WARNING_CIRCLE,
                 "低余额账号",
                 format!("{low} 个"),
-                format!(
-                    "阈值 {}",
-                    widgets::format_money(self.config.ui.low_balance_threshold, &currency)
-                ),
+                format!("阈值 {threshold_text}"),
                 if low > 0 { theme::ORANGE } else { theme::GREEN },
             ),
             (
@@ -150,7 +176,7 @@ impl App {
         let account = self.config.account(&balance.account_id);
         let low_amount = balance
             .amount
-            .map(|a| a < self.config.ui.low_balance_threshold)
+            .map(|a| a < self.config.ui.threshold_for(&balance.currency))
             .unwrap_or(false);
         let is_auto = account
             .map(|a| a.balance.mode == crate::config::BalanceMode::Auto)

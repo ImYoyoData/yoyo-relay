@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Top-level configuration
@@ -16,6 +18,8 @@ pub struct AppConfig {
     pub providers: Vec<Provider>,
     pub accounts: Vec<Account>,
     pub routes: Vec<ModelRoute>,
+    /// Client-facing model metadata. Routes reference these by client model name.
+    pub model_profiles: Vec<ClientModelProfile>,
     pub local_keys: Vec<LocalKey>,
 }
 
@@ -29,6 +33,7 @@ impl Default for AppConfig {
             providers: Vec::new(),
             accounts: Vec::new(),
             routes: Vec::new(),
+            model_profiles: Vec::new(),
             local_keys: Vec::new(),
         }
     }
@@ -67,17 +72,60 @@ impl AppConfig {
         routes
     }
 
-    /// All distinct client models exposed by enabled routes.
+    /// All distinct client models exposed by enabled routes, plus route models
+    /// that were created but do not have an upstream yet.
     pub fn client_models(&self) -> Vec<String> {
         let mut models: Vec<String> = self
             .routes
             .iter()
             .filter(|r| r.enabled)
             .map(|r| r.client_model.clone())
+            .chain(self.model_profiles.iter().map(|p| p.client_model.clone()))
             .collect();
         models.sort();
         models.dedup();
         models
+    }
+
+    /// Models that can actually receive traffic (at least one enabled route
+    /// and, when present, an enabled model profile).
+    pub fn servable_models(&self) -> Vec<String> {
+        let mut models: Vec<String> = self
+            .routes
+            .iter()
+            .filter(|r| r.enabled && self.model_enabled(&r.client_model))
+            .map(|r| r.client_model.clone())
+            .collect();
+        models.sort();
+        models.dedup();
+        models
+    }
+
+    pub fn model_enabled(&self, client_model: &str) -> bool {
+        self.model_profile(client_model)
+            .map(|profile| profile.enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn model_profile(&self, client_model: &str) -> Option<&ClientModelProfile> {
+        self.model_profiles
+            .iter()
+            .find(|p| p.client_model == client_model)
+    }
+
+    /// Mapping-level fallback configured on the model profile first, then on
+    /// any route (legacy layout).
+    pub fn fallback_for(&self, client_model: &str) -> Option<String> {
+        self.model_profile(client_model)
+            .and_then(|p| p.fallback_client_model.clone())
+            .filter(|m| !m.trim().is_empty() && m != client_model)
+            .or_else(|| {
+                self.routes
+                    .iter()
+                    .find(|r| r.client_model == client_model)
+                    .and_then(|r| r.fallback_client_model.clone())
+                    .filter(|m| !m.trim().is_empty() && m != client_model)
+            })
     }
 
     pub fn accounts_of(&self, provider_id: &str) -> Vec<Account> {
@@ -184,8 +232,37 @@ pub struct UiConfig {
     pub sidebar_width: f32,
     pub ui_scale: f32,
     pub balance_refresh_mins: u64,
+    /// Legacy/global fallback threshold. Per-currency values in
+    /// `low_balance_thresholds` take precedence.
     pub low_balance_threshold: f64,
+    /// Currency-specific low-balance thresholds, keyed by ISO code.
+    pub low_balance_thresholds: BTreeMap<String, f64>,
+    /// Currency units per 1 USD, used to estimate manual balances from
+    /// USD-priced route costs. Missing entries are treated as 1.0.
+    pub fx_rates: BTreeMap<String, f64>,
     pub onboarding_done: bool,
+}
+
+impl UiConfig {
+    pub fn threshold_for(&self, currency: &str) -> f64 {
+        self.low_balance_thresholds
+            .get(&normalize_currency(currency))
+            .copied()
+            .unwrap_or(self.low_balance_threshold)
+    }
+
+    /// Units of `currency` per 1 USD.
+    pub fn fx_rate(&self, currency: &str) -> f64 {
+        let currency = normalize_currency(currency);
+        if currency == "USD" {
+            return 1.0;
+        }
+        self.fx_rates
+            .get(&currency)
+            .copied()
+            .filter(|rate| *rate > 0.0)
+            .unwrap_or(1.0)
+    }
 }
 
 impl Default for UiConfig {
@@ -203,6 +280,11 @@ impl Default for UiConfig {
             ui_scale: 0.0,
             balance_refresh_mins: 10,
             low_balance_threshold: 5.0,
+            low_balance_thresholds: BTreeMap::from([
+                ("USD".to_string(), 5.0),
+                ("CNY".to_string(), 35.0),
+            ]),
+            fx_rates: BTreeMap::from([("USD".to_string(), 1.0), ("CNY".to_string(), 7.2)]),
             onboarding_done: false,
         }
     }
@@ -710,6 +792,53 @@ impl ModelRoute {
 }
 
 // ---------------------------------------------------------------------------
+// Client-facing model metadata
+// ---------------------------------------------------------------------------
+
+/// Metadata advertised by `GET /v1/models` for one client model.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct ClientModelProfile {
+    pub client_model: String,
+    pub display_name: String,
+    pub description: String,
+    pub owned_by: String,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    /// text / image / audio / file
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+    /// Free-form effort names such as off, low, medium, high.
+    pub reasoning_levels: Vec<String>,
+    pub supports_tools: bool,
+    pub supports_streaming: bool,
+    pub fallback_client_model: Option<String>,
+    pub enabled: bool,
+    pub created_at: i64,
+}
+
+impl Default for ClientModelProfile {
+    fn default() -> Self {
+        Self {
+            client_model: String::new(),
+            display_name: String::new(),
+            description: String::new(),
+            owned_by: "yoyo-relay".to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+            reasoning_levels: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            fallback_client_model: None,
+            enabled: true,
+            created_at: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Local keys
 // ---------------------------------------------------------------------------
 
@@ -795,5 +924,14 @@ pub fn fmt_duration_secs(secs: i64) -> String {
         format!("{m}m{s:02}s")
     } else {
         format!("{s}s")
+    }
+}
+
+pub fn normalize_currency(currency: &str) -> String {
+    let value = currency.trim().to_ascii_uppercase();
+    match value.as_str() {
+        "" => "USD".to_string(),
+        "RMB" => "CNY".to_string(),
+        _ => value,
     }
 }

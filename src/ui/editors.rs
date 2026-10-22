@@ -2,15 +2,15 @@ use egui::{ComboBox, Id, RichText, TextEdit};
 use egui_phosphor::regular as icons;
 
 use crate::config::{
-    new_id, now_ts, Account, AuthMode, BalanceConfig, BalanceMode, ModelRoute, PrefixRule,
-    Protocol, ProtocolStrategyMode, ProviderKind, QuotaConfig, QuotaWindow, RouteMode,
+    new_id, now_ts, Account, AuthMode, BalanceConfig, BalanceMode, ClientModelProfile, ModelRoute,
+    PrefixRule, Protocol, ProtocolStrategyMode, ProviderKind, QuotaConfig, QuotaWindow, RouteMode,
 };
 use crate::snapshot::NoticeLevel;
 
 use super::{theme, widgets};
 use super::{
     AccountDraft, App, ConfirmAction, Editor, LocalKeyDraft, ManualBalanceDraft, Page,
-    ProviderDraft, RouteDraft,
+    ProviderDraft, RouteDraft, RouteModelDraft,
 };
 
 impl App {
@@ -89,21 +89,71 @@ impl App {
         }
     }
 
-    pub(crate) fn open_new_route(&mut self) {
+    pub(crate) fn open_new_route_model(&mut self) {
+        let profile = ClientModelProfile {
+            created_at: now_ts(),
+            ..ClientModelProfile::default()
+        };
+        self.editor = Some(Editor::RouteModel(RouteModelDraft {
+            is_new: true,
+            original_model: String::new(),
+            reasoning_text: String::new(),
+            profile,
+        }));
+    }
+
+    pub(crate) fn open_edit_route_model(&mut self, client_model: &str) {
+        let profile = self
+            .config
+            .model_profile(client_model)
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut profile = ClientModelProfile {
+                    client_model: client_model.to_string(),
+                    created_at: now_ts(),
+                    ..ClientModelProfile::default()
+                };
+                if let Some(route) = self
+                    .config
+                    .routes
+                    .iter()
+                    .find(|r| r.client_model == client_model)
+                {
+                    profile.context_window = route.max_context_tokens;
+                    profile.fallback_client_model = route.fallback_client_model.clone();
+                    if route.capabilities.iter().any(|c| c == "vision") {
+                        profile.input_modalities.push("image".into());
+                    }
+                    if route
+                        .capabilities
+                        .iter()
+                        .any(|c| c == "reasoning" || c == "thinking")
+                    {
+                        profile.reasoning_levels =
+                            vec!["low".into(), "medium".into(), "high".into()];
+                    }
+                }
+                profile
+            });
+        let reasoning_text = profile.reasoning_levels.join(",");
+        self.editor = Some(Editor::RouteModel(RouteModelDraft {
+            is_new: false,
+            original_model: client_model.to_string(),
+            profile,
+            reasoning_text,
+        }));
+    }
+
+    /// Add an upstream model (provider + model id) inside an existing route model.
+    pub(crate) fn open_new_route(&mut self, client_model: &str) {
         let Some(provider) = self.config.providers.first().cloned() else {
-            self.toast(NoticeLevel::Warning, "请先添加供应商。");
+            self.toast(NoticeLevel::Warning, "请先添加供应商，再添加上游模型。");
             self.page = Page::Providers;
             return;
         };
-        let client_model = self
-            .config
-            .client_models()
-            .into_iter()
-            .next()
-            .unwrap_or_default();
         let route = ModelRoute {
             id: new_id(),
-            client_model,
+            client_model: client_model.to_string(),
             provider_id: provider.id,
             upstream_model: provider.test_model.clone().unwrap_or_default(),
             priority: 10,
@@ -326,6 +376,143 @@ impl App {
         true
     }
 
+    fn save_route_model(&mut self, draft: &RouteModelDraft) -> bool {
+        let mut profile = draft.profile.clone();
+        profile.client_model = profile.client_model.trim().to_string();
+        if profile.client_model.is_empty() {
+            self.toast(NoticeLevel::Error, "路由模型名不能为空。");
+            return false;
+        }
+        if profile.display_name.trim().is_empty() {
+            profile.display_name = profile.client_model.clone();
+        }
+        if profile.owned_by.trim().is_empty() {
+            profile.owned_by = "yoyo-relay".into();
+        }
+        profile.reasoning_levels = draft
+            .reasoning_text
+            .split(',')
+            .map(|level| level.trim().to_ascii_lowercase())
+            .filter(|level| !level.is_empty())
+            .collect();
+        profile.reasoning_levels.dedup();
+        profile.input_modalities = profile
+            .input_modalities
+            .iter()
+            .map(|m| m.trim().to_ascii_lowercase())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if profile.input_modalities.is_empty() {
+            profile.input_modalities.push("text".into());
+        }
+        profile.input_modalities.dedup();
+        profile.output_modalities = profile
+            .output_modalities
+            .iter()
+            .map(|m| m.trim().to_ascii_lowercase())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if profile.output_modalities.is_empty() {
+            profile.output_modalities.push("text".into());
+        }
+        profile.output_modalities.dedup();
+        profile.fallback_client_model = profile
+            .fallback_client_model
+            .take()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty() && m != &profile.client_model);
+        profile.context_window = profile.context_window.filter(|v| *v > 0);
+        profile.max_output_tokens = profile.max_output_tokens.filter(|v| *v > 0);
+        if let (Some(context), Some(max_output)) =
+            (profile.context_window, profile.max_output_tokens)
+        {
+            if max_output > context {
+                self.toast(NoticeLevel::Error, "最大输出不能大于上下文窗口。");
+                return false;
+            }
+        }
+        if draft.is_new
+            && self
+                .config
+                .model_profiles
+                .iter()
+                .any(|p| p.client_model == profile.client_model)
+        {
+            self.toast(NoticeLevel::Error, "该路由模型已存在。");
+            return false;
+        }
+        if profile.created_at == 0 {
+            profile.created_at = now_ts();
+        }
+
+        let backup = self.config.clone();
+        if !draft.is_new && !draft.original_model.is_empty() {
+            let old = draft.original_model.clone();
+            if old != profile.client_model
+                && self
+                    .config
+                    .model_profiles
+                    .iter()
+                    .any(|p| p.client_model == profile.client_model && p.client_model != old)
+            {
+                self.toast(NoticeLevel::Error, "该路由模型名已被占用。");
+                return false;
+            }
+            if let Some(existing) = self
+                .config
+                .model_profiles
+                .iter_mut()
+                .find(|p| p.client_model == old)
+            {
+                *existing = profile.clone();
+            } else {
+                self.config.model_profiles.push(profile.clone());
+            }
+            if old != profile.client_model {
+                for route in &mut self.config.routes {
+                    if route.client_model == old {
+                        route.client_model = profile.client_model.clone();
+                    }
+                    if route.fallback_client_model.as_deref() == Some(old.as_str()) {
+                        route.fallback_client_model = Some(profile.client_model.clone());
+                    }
+                }
+                for other in &mut self.config.model_profiles {
+                    if other.fallback_client_model.as_deref() == Some(old.as_str()) {
+                        other.fallback_client_model = Some(profile.client_model.clone());
+                    }
+                }
+                for key in &mut self.config.local_keys {
+                    for allowed in &mut key.allowed_models {
+                        if allowed == &old {
+                            *allowed = profile.client_model.clone();
+                        }
+                    }
+                }
+            }
+        } else {
+            self.config.model_profiles.push(profile.clone());
+        }
+        if !self.persist() {
+            self.config = backup;
+            return false;
+        }
+        let has_upstream = self
+            .config
+            .routes
+            .iter()
+            .any(|r| r.client_model == profile.client_model);
+        if has_upstream {
+            self.toast(NoticeLevel::Success, "路由模型已保存");
+        } else {
+            self.toast(
+                NoticeLevel::Info,
+                "路由模型已创建，请继续为它添加上游模型。",
+            );
+        }
+        true
+    }
+
     fn create_local_key(&mut self, draft: &LocalKeyDraft) -> bool {
         let name = draft.name.trim();
         if name.is_empty() {
@@ -392,6 +579,7 @@ impl App {
             Provider,
             Account,
             Route,
+            RouteModel,
             Key,
             Balance,
         }
@@ -417,11 +605,20 @@ impl App {
             Editor::Route(d) => (
                 EditorKind::Route,
                 if d.is_new {
-                    "新增路由"
+                    "添加上游模型"
                 } else {
-                    "编辑路由"
+                    "编辑上游模型"
                 },
-                "定义客户端模型到上游模型的映射与降级优先级。",
+                "选择供应商与真实模型名，并设置它在降级链中的优先级。",
+            ),
+            Editor::RouteModel(d) => (
+                EditorKind::RouteModel,
+                if d.is_new {
+                    "新增路由模型"
+                } else {
+                    "编辑路由模型"
+                },
+                "先定义客户端看到的模型与能力，再在卡片里添加上游供应商模型。",
             ),
             Editor::LocalKey(_) => (
                 EditorKind::Key,
@@ -449,6 +646,7 @@ impl App {
                         Editor::Provider(draft) => provider_form(self, ui, draft),
                         Editor::Account(draft) => account_form(self, ui, draft),
                         Editor::Route(draft) => route_form(self, ui, draft),
+                        Editor::RouteModel(draft) => route_model_form(ui, draft),
                         Editor::LocalKey(draft) => local_key_form(ui, draft),
                         Editor::ManualBalance(draft) => manual_balance_form(self, ui, draft),
                     });
@@ -466,6 +664,11 @@ impl App {
                     }
                     EditorKind::Key => {
                         if super::kit::primary_button(ui, icons::CHECK, "创建").clicked() {
+                            action = Some(EditorAction::Save);
+                        }
+                    }
+                    EditorKind::RouteModel => {
+                        if super::kit::primary_button(ui, icons::CHECK, "保存模型").clicked() {
                             action = Some(EditorAction::Save);
                         }
                     }
@@ -492,6 +695,7 @@ impl App {
                     Editor::Provider(draft) => self.save_provider(draft, test),
                     Editor::Account(draft) => self.save_account(draft, test),
                     Editor::Route(draft) => self.save_route(draft, test),
+                    Editor::RouteModel(draft) => self.save_route_model(draft),
                     Editor::LocalKey(draft) => self.create_local_key(draft),
                     Editor::ManualBalance(draft) => self.save_manual_balance(draft),
                 };
@@ -616,6 +820,22 @@ impl App {
                     .unwrap_or_else(|| "将删除该路由。".into());
                 ("删除路由", desc, true, "确认删除")
             }
+            ConfirmAction::DeleteRouteModel(model) => {
+                let upstreams = self
+                    .config
+                    .routes
+                    .iter()
+                    .filter(|r| r.client_model == *model)
+                    .count();
+                (
+                    "删除路由模型",
+                    format!(
+                        "将删除路由模型「{model}」及其 {upstreams} 个上游模型。历史用量记录会保留。"
+                    ),
+                    true,
+                    "确认删除",
+                )
+            }
             ConfirmAction::DeleteLocalKey(id) => {
                 let name = self
                     .config
@@ -686,6 +906,26 @@ impl App {
                 self.config.routes.retain(|r| r.id != id);
                 if self.persist() {
                     self.toast(NoticeLevel::Success, "路由已删除");
+                } else {
+                    self.config = backup;
+                }
+            }
+            ConfirmAction::DeleteRouteModel(model) => {
+                let backup = self.config.clone();
+                self.config.routes.retain(|r| r.client_model != model);
+                self.config
+                    .model_profiles
+                    .retain(|p| p.client_model != model);
+                for profile in &mut self.config.model_profiles {
+                    if profile.fallback_client_model.as_deref() == Some(model.as_str()) {
+                        profile.fallback_client_model = None;
+                    }
+                }
+                if self.persist() {
+                    self.toast(
+                        NoticeLevel::Success,
+                        format!("路由模型「{model}」及其上游已删除"),
+                    );
                 } else {
                     self.config = backup;
                 }
@@ -1567,18 +1807,27 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
 
 fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
     let route = &mut draft.route;
-    section(ui, "模型映射");
+    section(ui, "所属路由模型");
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new("客户端模型")
+                .size(11.0)
+                .color(theme::muted(ui)),
+        );
+        super::kit::badge(ui, &route.client_model, theme::ACCENT);
+        ui.label(
+            RichText::new("在路由模型卡片右上角可修改名称与模型能力")
+                .size(10.0)
+                .color(theme::muted(ui)),
+        );
+    });
+    ui.add_space(4.0);
+
+    section(ui, "上游模型");
     egui::Grid::new("route_basic")
         .num_columns(2)
         .spacing([14.0, 8.0])
         .show(ui, |ui| {
-            ui.label("客户端模型名");
-            ui.add(
-                TextEdit::singleline(&mut route.client_model)
-                    .desired_width(380.0)
-                    .hint_text("客户端请求里看到的 model"),
-            );
-            ui.end_row();
             ui.label("供应商");
             let provider_name = app
                 .config
@@ -1600,14 +1849,14 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
             ui.label("上游模型名");
             ui.add(
                 TextEdit::singleline(&mut route.upstream_model)
-                    .desired_width(380.0)
-                    .hint_text("发给供应商的真实模型名"),
+                    .desired_width(360.0)
+                    .hint_text("发给该供应商的真实模型名"),
             );
             ui.end_row();
             ui.label("优先级");
             ui.add(egui::DragValue::new(&mut route.priority).range(-100..=100));
             ui.label(
-                RichText::new("降序；同一供应商的多条路由视为同一层")
+                RichText::new("降序；同一供应商的多条上游视为同一层")
                     .size(10.5)
                     .color(theme::muted(ui)),
             );
@@ -1656,7 +1905,7 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
 
     if let Some(provider) = app.config.provider(&route.provider_id) {
         let resolved = provider.protocol_for(&route.upstream_model, route.protocol);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("实际协议").size(11.0).color(theme::muted(ui)));
             super::kit::badge(ui, resolved.label(), theme::BLUE_INFO);
             ui.label(
@@ -1673,9 +1922,14 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
                 .color(theme::muted(ui)),
             );
         });
+        ui.label(
+            RichText::new("客户端使用三种协议中的任意一种，YoyoRelay 会自动转换成上游协议。")
+                .size(10.0)
+                .color(theme::muted(ui)),
+        );
     }
 
-    section(ui, "能力与备选");
+    section(ui, "价格与能力");
     egui::Grid::new("route_more")
         .num_columns(2)
         .spacing([14.0, 8.0])
@@ -1683,26 +1937,8 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
             ui.label("能力标签");
             ui.add(
                 TextEdit::singleline(&mut draft.capabilities_text)
-                    .desired_width(380.0)
+                    .desired_width(360.0)
                     .hint_text("chat,tools,vision（逗号分隔）"),
-            );
-            ui.end_row();
-            ui.label("上下文上限");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut draft.max_context_enabled, "限制");
-                ui.add_enabled(
-                    draft.max_context_enabled,
-                    egui::DragValue::new(&mut draft.max_context)
-                        .range(0..=10_000_000)
-                        .suffix(" tokens"),
-                );
-            });
-            ui.end_row();
-            ui.label("映射级兜底");
-            ui.add(
-                TextEdit::singleline(&mut draft.fallback_text)
-                    .desired_width(380.0)
-                    .hint_text("另一个客户端模型名（可选，默认关闭）"),
             );
             ui.end_row();
             ui.label("输入价格");
@@ -1723,9 +1959,141 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
             ui.end_row();
         });
     ui.label(
-        RichText::new("价格用于概览页预估花费与手动余额递减；留 0 表示不估算。")
-            .size(10.5)
-            .color(theme::muted(ui)),
+        RichText::new(
+            "价格按 USD/Mtok 记录。上下文窗口、最大输出与思考等级在「路由模型」中统一设置。",
+        )
+        .size(10.5)
+        .color(theme::muted(ui)),
+    );
+}
+
+fn modality_toggle(ui: &mut egui::Ui, values: &mut Vec<String>, value: &str, label: &str) -> bool {
+    let mut enabled = values.iter().any(|m| m == value);
+    if ui.checkbox(&mut enabled, label).changed() {
+        if enabled {
+            if !values.iter().any(|m| m == value) {
+                values.push(value.to_string());
+            }
+        } else {
+            values.retain(|m| m != value);
+        }
+        return true;
+    }
+    false
+}
+
+fn route_model_form(ui: &mut egui::Ui, draft: &mut RouteModelDraft) {
+    let profile = &mut draft.profile;
+    section(ui, "模型标识");
+    egui::Grid::new("route_model_basic")
+        .num_columns(2)
+        .spacing([14.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("客户端模型名");
+            ui.add(
+                TextEdit::singleline(&mut profile.client_model)
+                    .desired_width(360.0)
+                    .hint_text("客户端请求里看到的 model，例如 gpt-5-codex"),
+            );
+            ui.end_row();
+            ui.label("显示名称");
+            ui.add(
+                TextEdit::singleline(&mut profile.display_name)
+                    .desired_width(360.0)
+                    .hint_text("模型列表里展示的名称（可选）"),
+            );
+            ui.end_row();
+            ui.label("归属");
+            ui.add(
+                TextEdit::singleline(&mut profile.owned_by)
+                    .desired_width(200.0)
+                    .hint_text("yoyo-relay"),
+            );
+            ui.end_row();
+            ui.label("描述");
+            ui.add(
+                TextEdit::singleline(&mut profile.description)
+                    .desired_width(360.0)
+                    .hint_text("一句话说明（可选）"),
+            );
+            ui.end_row();
+            ui.label("启用");
+            ui.checkbox(&mut profile.enabled, "在模型列表与路由页展示");
+            ui.end_row();
+        });
+
+    section(ui, "上下文与输出");
+    let mut context_enabled = profile.context_window.is_some();
+    let mut context = profile.context_window.unwrap_or(0);
+    let mut output_enabled = profile.max_output_tokens.is_some();
+    let mut max_output = profile.max_output_tokens.unwrap_or(0);
+    egui::Grid::new("route_model_limits")
+        .num_columns(2)
+        .spacing([14.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("上下文窗口");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut context_enabled, "设置");
+                ui.add_enabled(
+                    context_enabled,
+                    egui::DragValue::new(&mut context)
+                        .range(0..=10_000_000)
+                        .suffix(" tokens"),
+                );
+            });
+            ui.end_row();
+            ui.label("最大输出");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut output_enabled, "设置");
+                ui.add_enabled(
+                    output_enabled,
+                    egui::DragValue::new(&mut max_output)
+                        .range(0..=10_000_000)
+                        .suffix(" tokens"),
+                );
+            });
+            ui.end_row();
+        });
+    profile.context_window = context_enabled.then_some(context).filter(|v| *v > 0);
+    profile.max_output_tokens = output_enabled.then_some(max_output).filter(|v| *v > 0);
+
+    section(ui, "能力（模型列表会返回）");
+    ui.label(RichText::new("输入模态").size(10.5).color(theme::muted(ui)));
+    ui.horizontal_wrapped(|ui| {
+        modality_toggle(ui, &mut profile.input_modalities, "text", "文本");
+        modality_toggle(ui, &mut profile.input_modalities, "image", "图片");
+        modality_toggle(ui, &mut profile.input_modalities, "audio", "音频");
+        modality_toggle(ui, &mut profile.input_modalities, "file", "文件");
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut profile.supports_tools, "支持工具调用");
+        ui.checkbox(&mut profile.supports_streaming, "支持流式输出");
+    });
+    ui.add_space(4.0);
+    ui.label("思考等级");
+    ui.add(
+        TextEdit::singleline(&mut draft.reasoning_text)
+            .desired_width(f32::INFINITY)
+            .hint_text("逗号分隔，例如 off,low,medium,high；留空表示不支持思考等级"),
+    );
+    ui.add_space(4.0);
+    ui.label("映射级兜底（可选）");
+    ui.add(
+        TextEdit::singleline(
+            profile
+                .fallback_client_model
+                .get_or_insert_with(String::new),
+        )
+        .desired_width(f32::INFINITY)
+        .hint_text("所有上游都失败后，改用另一个客户端模型名"),
+    );
+    ui.label(
+        RichText::new(
+            "保存后可在卡片里逐条添加上游模型；没有上游的路由模型不会出现在 /v1/models。",
+        )
+        .size(10.5)
+        .color(theme::muted(ui)),
     );
 }
 
@@ -1796,17 +2164,31 @@ fn manual_balance_form(app: &App, ui: &mut egui::Ui, draft: &mut ManualBalanceDr
         .unwrap_or_else(|| "未知账号".into());
     ui.label(RichText::new(label).strong());
     ui.add_space(8.0);
-    ui.label("当前余额");
+    let currency = app
+        .config
+        .account(&draft.account_id)
+        .map(|a| crate::config::normalize_currency(&a.balance.currency))
+        .unwrap_or_else(|| "USD".into());
+    let prefix = if currency == "CNY" {
+        "¥ "
+    } else if currency == "USD" {
+        "$ "
+    } else {
+        ""
+    };
+    ui.label(format!("当前余额（{currency}）"));
     ui.add(
         egui::DragValue::new(&mut draft.amount)
             .speed(0.1)
-            .prefix("$ ")
+            .prefix(prefix)
             .range(0.0..=1_000_000_000.0),
     );
     ui.add_space(6.0);
     ui.label(
-        RichText::new("保存后模式切换为「手动」，并从现在开始按路由价格估算递减。")
-            .size(11.0)
-            .color(theme::muted(ui)),
+        RichText::new(
+            "保存后模式切换为「手动」，并从现在开始按路由价格（USD）与设置中的汇率折算递减。",
+        )
+        .size(11.0)
+        .color(theme::muted(ui)),
     );
 }

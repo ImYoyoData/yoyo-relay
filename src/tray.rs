@@ -12,7 +12,32 @@ use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use crate::instance::Signals;
 
 pub struct Tray {
-    _icon: TrayIcon,
+    icon: TrayIcon,
+    stats_item: MenuItem,
+    detail_item: MenuItem,
+    last_summary: String,
+    last_detail: String,
+}
+
+impl Tray {
+    /// Update the notification-area tooltip and the always-visible menu header
+    /// with live request/token information.
+    pub fn update_stats(&mut self, summary: &str, detail: &str) {
+        if self.last_summary == summary && self.last_detail == detail {
+            return;
+        }
+        self.last_summary = summary.to_string();
+        self.last_detail = detail.to_string();
+        self.stats_item.set_text(summary);
+        self.detail_item.set_text(detail);
+        let tooltip = format!("YoyoRelay\n{summary}\n{detail}");
+        // Windows truncates notifications longer than 127 UTF-16 units.
+        let tooltip: String = tooltip.chars().take(120).collect();
+        let _ = self.icon.set_tooltip(Some(tooltip));
+        // Used by Linux AppIndicator and macOS status items where a title is
+        // rendered next to the icon.
+        self.icon.set_title(Some(summary.to_string()));
+    }
 }
 
 pub fn install(signals: Arc<Signals>) -> Option<Tray> {
@@ -21,10 +46,14 @@ pub fn install(signals: Arc<Signals>) -> Option<Tray> {
     let icon = Icon::from_rgba(RGBA.to_vec(), SIZE, SIZE).ok()?;
 
     let menu = Menu::new();
+    let stats = MenuItem::new("正在加载运行状态…", false, None);
+    let detail = MenuItem::new("打开主窗口查看请求与用量", false, None);
     let show = MenuItem::new("显示主窗口", true, None);
     let quit = MenuItem::new("退出 YoyoRelay", true, None);
     let separator = PredefinedMenuItem::separator();
-    menu.append_items(&[&show, &separator, &quit]).ok()?;
+    let separator2 = PredefinedMenuItem::separator();
+    menu.append_items(&[&stats, &detail, &separator, &show, &separator2, &quit])
+        .ok()?;
 
     let show_id = show.id().clone();
     let quit_id = quit.id().clone();
@@ -53,11 +82,18 @@ pub fn install(signals: Arc<Signals>) -> Option<Tray> {
         }
     }));
 
-    TrayIconBuilder::new()
+    let icon = TrayIconBuilder::new()
         .with_tooltip("YoyoRelay · 本地 LLM 代理")
         .with_icon(icon)
         .with_menu(Box::new(menu))
         .build()
-        .ok()
-        .map(|icon| Tray { _icon: icon })
+        .ok()?;
+
+    Some(Tray {
+        icon,
+        stats_item: stats,
+        detail_item: detail,
+        last_summary: String::new(),
+        last_detail: String::new(),
+    })
 }

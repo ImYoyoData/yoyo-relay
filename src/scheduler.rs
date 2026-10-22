@@ -549,6 +549,12 @@ impl Scheduler {
     ) -> Chain {
         let now = now_ts();
         let mut chain = Chain::default();
+        if !cfg.model_enabled(client_model) {
+            chain
+                .notes
+                .push(format!("客户端模型「{client_model}」已被禁用"));
+            return chain;
+        }
         let routes = cfg.routes_for(client_model);
         if routes.is_empty() {
             chain
@@ -572,10 +578,7 @@ impl Scheduler {
             .extend(primary_attempts.into_iter().take(normal_cap));
 
         // Third layer: another client-model mapping chain, only when explicitly configured.
-        let fallback_model = routes
-            .iter()
-            .find_map(|r| r.fallback_client_model.clone())
-            .filter(|m| !m.trim().is_empty() && m != client_model);
+        let fallback_model = cfg.fallback_for(client_model);
         if let Some(fallback_model) = fallback_model {
             chain.fallback_model = Some(fallback_model.clone());
             if cfg.scheduler.fallback_retries > 0 {

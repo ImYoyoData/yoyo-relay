@@ -97,6 +97,30 @@ class Handler(BaseHTTPRequestHandler):
                     "usage": {"input_tokens": 9, "output_tokens": 4},
                 }))
             return
+        if self.path.endswith("/responses"):
+            if who != "good":
+                self._send(401, json.dumps({"error": {"message": "invalid api key"}}))
+                return
+            if stream:
+                self._sse_responses(body)
+            else:
+                self._send(200, json.dumps({
+                    "id": "resp_mock",
+                    "object": "response",
+                    "created_at": int(time.time()),
+                    "status": "completed",
+                    "model": body.get("model", "mock"),
+                    "output": [{
+                        "id": "msg_mock",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Hello from responses mock", "annotations": []}],
+                    }],
+                    "output_text": "Hello from responses mock",
+                    "usage": {"input_tokens": 8, "output_tokens": 5, "total_tokens": 13},
+                }))
+            return
         self._send(404, json.dumps({"error": {"message": "not found"}}))
 
     def _sse_openai(self, body):
@@ -131,6 +155,41 @@ class Handler(BaseHTTPRequestHandler):
         ev("content_block_stop", {"type": "content_block_stop", "index": 0})
         ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 5}})
         ev("message_stop", {"type": "message_stop"})
+        self._send(200, "".join(frames), "text/event-stream")
+
+    def _sse_responses(self, body):
+        frames = []
+        created = int(time.time())
+        response_id = "resp_mock"
+        item_id = "msg_mock"
+        model = body.get("model", "mock")
+
+        def ev(name, obj):
+            frames.append(f"event: {name}\ndata: " + json.dumps(obj, ensure_ascii=False) + "\n\n")
+
+        ev("response.created", {"type": "response.created", "response": {
+            "id": response_id, "object": "response", "created_at": created,
+            "status": "in_progress", "model": model, "output": []}})
+        ev("response.output_item.added", {"type": "response.output_item.added", "output_index": 0, "item": {
+            "id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
+        ev("response.content_part.added", {"type": "response.content_part.added", "item_id": item_id,
+            "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
+        ev("response.output_text.delta", {"type": "response.output_text.delta", "item_id": item_id,
+            "output_index": 0, "content_index": 0, "delta": "Hello "})
+        ev("response.output_text.delta", {"type": "response.output_text.delta", "item_id": item_id,
+            "output_index": 0, "content_index": 0, "delta": "from responses stream"})
+        text = "Hello from responses stream"
+        ev("response.output_text.done", {"type": "response.output_text.done", "item_id": item_id,
+            "output_index": 0, "content_index": 0, "text": text})
+        ev("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": {
+            "id": item_id, "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]}})
+        ev("response.completed", {"type": "response.completed", "response": {
+            "id": response_id, "object": "response", "created_at": created, "status": "completed",
+            "model": model, "output_text": text,
+            "output": [{"id": item_id, "type": "message", "status": "completed", "role": "assistant",
+                        "content": [{"type": "output_text", "text": text, "annotations": []}]}],
+            "usage": {"input_tokens": 8, "output_tokens": 5, "total_tokens": 13}}})
         self._send(200, "".join(frames), "text/event-stream")
 
 

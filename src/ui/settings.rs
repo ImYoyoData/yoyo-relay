@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use egui::{Align, Layout, RichText, Ui, Vec2};
 use egui_phosphor::regular as icons;
 
@@ -73,6 +75,16 @@ impl App {
     }
 
     // -- General ------------------------------------------------------------
+
+    fn balance_currencies(&self) -> Vec<String> {
+        let mut currencies: BTreeSet<String> = BTreeSet::new();
+        currencies.insert("USD".into());
+        currencies.insert("CNY".into());
+        for account in &self.config.accounts {
+            currencies.insert(crate::config::normalize_currency(&account.balance.currency));
+        }
+        currencies.into_iter().collect()
+    }
 
     fn settings_general(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
@@ -223,22 +235,80 @@ impl App {
                     },
                 );
                 ui.horizontal(|ui| {
-                    setting_label(ui, icons::WARNING_CIRCLE, "低余额阈值");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut self.config.ui.low_balance_threshold)
-                                    .speed(0.1)
-                                    .range(0.0..=1_000_000.0)
-                                    .prefix("$ "),
-                            )
-                            .changed()
-                        {
-                            changed = true;
+                    setting_label(ui, icons::WARNING_CIRCLE, "低余额阈值与汇率");
+                });
+                setting_desc(
+                    ui,
+                    "按币种分别设置；余额合计不会把 CNY 与 USD 直接相加。汇率用于把按 USD 计价的花费折算到手动余额。",
+                );
+                let currencies = self.balance_currencies();
+                let mut thresholds = self.config.ui.low_balance_thresholds.clone();
+                let mut rates = self.config.ui.fx_rates.clone();
+                let mut fx_changed = false;
+                egui::Grid::new("balance_currency_settings")
+                    .num_columns(3)
+                    .spacing([16.0, 7.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("币种").size(10.5).color(theme::muted(ui)));
+                        ui.label(
+                            RichText::new("低余额阈值")
+                                .size(10.5)
+                                .color(theme::muted(ui)),
+                        );
+                        ui.label(
+                            RichText::new("汇率（1 USD =）")
+                                .size(10.5)
+                                .color(theme::muted(ui)),
+                        );
+                        ui.end_row();
+                        for currency in &currencies {
+                            ui.label(RichText::new(currency).monospace().size(11.0));
+                            let default_threshold = if currency == "CNY" { 35.0 } else { 5.0 };
+                            let threshold = thresholds
+                                .entry(currency.clone())
+                                .or_insert(default_threshold);
+                            let prefix = match currency.as_str() {
+                                "CNY" => "¥ ",
+                                "USD" => "$ ",
+                                _ => "",
+                            };
+                            if ui
+                                .add(
+                                    egui::DragValue::new(threshold)
+                                        .speed(0.1)
+                                        .range(0.0..=1_000_000.0)
+                                        .prefix(prefix),
+                                )
+                                .changed()
+                            {
+                                fx_changed = true;
+                            }
+                            if currency == "USD" {
+                                ui.label(RichText::new("1.00").size(10.5).color(theme::muted(ui)));
+                            } else {
+                                let rate = rates
+                                    .entry(currency.clone())
+                                    .or_insert(if currency == "CNY" { 7.2 } else { 1.0 });
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(rate)
+                                            .speed(0.01)
+                                            .range(0.0001..=10_000.0)
+                                            .suffix(format!(" {currency}")),
+                                    )
+                                    .changed()
+                                {
+                                    fx_changed = true;
+                                }
+                            }
+                            ui.end_row();
                         }
                     });
-                });
-                setting_desc(ui, "低于该值时在概览与余额页提示");
+                if fx_changed {
+                    self.config.ui.low_balance_thresholds = thresholds;
+                    self.config.ui.fx_rates = rates;
+                    changed = true;
+                }
                 ui.horizontal(|ui| {
                     setting_label(ui, icons::ARROWS_CLOCKWISE, "余额刷新间隔");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -363,6 +433,13 @@ impl App {
                             });
                         });
                     });
+                ui.label(
+                    RichText::new(format!(
+                        "Base URL 以 /v1 结尾；OpenAI Chat、Anthropic Messages、Responses 三种客户端都填这一地址，模型列表：{endpoint}/models"
+                    ))
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+                );
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
                     if running {

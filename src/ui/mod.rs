@@ -21,7 +21,9 @@ use egui::{
 use egui_phosphor::regular as icons;
 use tokio::sync::mpsc;
 
-use crate::config::{now_ts, Account, AppConfig, ConfigStore, ModelRoute, Provider};
+use crate::config::{
+    now_ts, Account, AppConfig, ClientModelProfile, ConfigStore, ModelRoute, Provider,
+};
 use crate::runtime::UiCommand;
 use crate::snapshot::{NoticeLevel, ProxyStatus, UiSnapshot, UsageDimension};
 
@@ -169,6 +171,7 @@ pub(crate) enum Editor {
     Provider(ProviderDraft),
     Account(AccountDraft),
     Route(RouteDraft),
+    RouteModel(RouteModelDraft),
     LocalKey(LocalKeyDraft),
     ManualBalance(ManualBalanceDraft),
 }
@@ -198,6 +201,13 @@ pub(crate) struct RouteDraft {
     pub max_context: u64,
 }
 
+pub(crate) struct RouteModelDraft {
+    pub is_new: bool,
+    pub original_model: String,
+    pub profile: ClientModelProfile,
+    pub reasoning_text: String,
+}
+
 pub(crate) struct LocalKeyDraft {
     pub name: String,
     pub allowed_models_text: String,
@@ -215,6 +225,7 @@ pub(crate) enum ConfirmAction {
     DeleteProvider(String),
     DeleteAccount(String),
     DeleteRoute(String),
+    DeleteRouteModel(String),
     DeleteLocalKey(String),
     ResetLocalKey(String),
     ImportConfig(String),
@@ -343,7 +354,7 @@ impl App {
             match demo.as_str() {
                 "editor" => app.open_new_provider(),
                 "account_editor" => app.open_new_account(),
-                "route_editor" => app.open_new_route(),
+                "route_editor" | "route_model_editor" => app.open_new_route_model(),
                 "key_editor" => app.open_new_local_key(),
                 "onboarding" => {
                     app.show_onboarding = true;
@@ -450,12 +461,13 @@ impl App {
     /// Closing with "close to tray" enabled removes the window and its taskbar
     /// entry; the tray menu (or a second launch) brings it back.
     pub(crate) fn hide_to_tray(&mut self, ctx: &egui::Context) {
-        // Hiding natively is only safe to restore on Windows: there a hidden
-        // window ignores redraw requests, but Win32 can reveal it directly.
-        // Other platforms fall back to a taskbar minimize.
         self.signals.mark_hidden(true);
         if self.tray.is_some() && cfg!(windows) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Keep the window technically visible (offscreen, toolwindow
+            // style) so egui keeps running and the tray tooltip stays live.
+            if !self.signals.hide_native() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
@@ -516,7 +528,7 @@ impl App {
             match self.page {
                 Page::Providers => self.open_new_provider(),
                 Page::Accounts => self.open_new_account(),
-                Page::Routes => self.open_new_route(),
+                Page::Routes => self.open_new_route_model(),
                 Page::LocalKeys => self.open_new_local_key(),
                 _ => {}
             }
@@ -553,6 +565,38 @@ impl App {
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
+        }
+    }
+
+    fn update_tray_stats(&mut self) {
+        let (summary, detail) = if self.config.ui.show_taskbar_stats {
+            let (_, label) = self.proxy_status();
+            let totals = &self.snapshot.today.totals;
+            let rate = if totals.requests > 0 {
+                (totals.ok as f64 * 100.0 / totals.requests as f64).round() as u64
+            } else {
+                100
+            };
+            (
+                format!(
+                    "{} · {} 活跃 · {} tokens",
+                    label,
+                    self.snapshot.active_requests,
+                    widgets::format_count(totals.total_tokens)
+                ),
+                format!(
+                    "队列 {} · 今日 {} 请求 · 成功率 {}% · {}",
+                    self.snapshot.queued_requests, totals.requests, rate, self.snapshot.endpoint
+                ),
+            )
+        } else {
+            (
+                "本地 LLM 代理".to_string(),
+                "打开主窗口查看请求与用量".to_string(),
+            )
+        };
+        if let Some(tray) = self.tray.as_mut() {
+            tray.update_stats(&summary, &detail);
         }
     }
 
@@ -1241,6 +1285,7 @@ impl eframe::App for App {
         self.apply_theme(ctx);
         self.sync_autostart();
         self.update_window_title(ctx);
+        self.update_tray_stats();
         if let Some(at) = self.startup_minimize_at {
             let now = Instant::now();
             if now >= at {

@@ -248,6 +248,16 @@ impl Gateway {
         format!("http://{host}:{}", cfg.server.port)
     }
 
+    /// API base clients should configure (OpenAI SDK `base_url`, Anthropic
+    /// `base_url`, and Responses clients all use this prefix).
+    pub fn api_base(&self) -> String {
+        format!("{}/v1", self.endpoint())
+    }
+
+    pub fn models_url(&self) -> String {
+        format!("{}/models", self.api_base())
+    }
+
     pub fn router(self: &Arc<Self>) -> Router {
         let cfg = self.config();
         let mut router = Router::new()
@@ -554,7 +564,7 @@ async fn health_handler(State(gw): State<Arc<Gateway>>) -> Response {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": now_ts() - gw.started_at,
-        "models": cfg.client_models(),
+        "models": cfg.servable_models(),
     }))
     .into_response()
 }
@@ -566,20 +576,13 @@ async fn models_handler(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> R
     };
     let cfg = gw.config();
     let models: Vec<String> = cfg
-        .client_models()
+        .servable_models()
         .into_iter()
         .filter(|m| auth.key.as_ref().map(|k| k.allows_model(m)).unwrap_or(true))
         .collect();
     let data: Vec<Value> = models
         .iter()
-        .map(|m| {
-            json!({
-                "id": m,
-                "object": "model",
-                "owned_by": "yoyo-relay",
-                "created": gw.started_at,
-            })
-        })
+        .map(|model| model_object(&cfg, model, gw.started_at))
         .collect();
     Json(json!({
         "object": "list",
@@ -589,6 +592,98 @@ async fn models_handler(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> R
         "last_id": models.last(),
     }))
     .into_response()
+}
+
+/// OpenAI `models` entry plus the metadata gateways commonly expose
+/// (Anthropic-compatible `type` / `created_at` and capability fields).
+fn model_object(cfg: &AppConfig, model: &str, fallback_created: i64) -> Value {
+    let routes = cfg.routes_for(model);
+    let profile = cfg.model_profile(model);
+    let created = profile
+        .map(|p| p.created_at)
+        .filter(|ts| *ts > 0)
+        .or_else(|| {
+            routes
+                .iter()
+                .map(|r| r.created_at)
+                .filter(|ts| *ts > 0)
+                .min()
+        })
+        .unwrap_or(fallback_created);
+    let created_at = chrono::DateTime::from_timestamp(created, 0)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default();
+    let context = profile
+        .and_then(|p| p.context_window)
+        .or_else(|| routes.iter().filter_map(|r| r.max_context_tokens).max());
+    let max_output = profile.and_then(|p| p.max_output_tokens);
+    let mut input_modalities = profile
+        .map(|p| p.input_modalities.clone())
+        .unwrap_or_else(|| vec!["text".to_string()]);
+    if input_modalities.is_empty() {
+        input_modalities.push("text".to_string());
+    }
+    let route_vision = routes.iter().any(|r| {
+        r.capabilities
+            .iter()
+            .any(|c| matches!(c.as_str(), "vision" | "image" | "images" | "multimodal"))
+    });
+    if route_vision && !input_modalities.iter().any(|m| m == "image") {
+        input_modalities.push("image".to_string());
+    }
+    let output_modalities = profile
+        .map(|p| p.output_modalities.clone())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| vec!["text".to_string()]);
+    let reasoning_levels = profile
+        .map(|p| p.reasoning_levels.clone())
+        .unwrap_or_default();
+    let route_tools = routes.iter().any(|r| {
+        r.capabilities
+            .iter()
+            .any(|c| matches!(c.as_str(), "tools" | "tool" | "function_calling"))
+    });
+    let supports_tools = profile.map(|p| p.supports_tools).unwrap_or(true) || route_tools;
+    let supports_streaming = profile.map(|p| p.supports_streaming).unwrap_or(true);
+    let vision = input_modalities.iter().any(|m| m == "image");
+    let display_name = profile
+        .map(|p| p.display_name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| model.to_string());
+    let description = profile.map(|p| p.description.clone()).unwrap_or_default();
+    let owned_by = profile
+        .map(|p| p.owned_by.clone())
+        .filter(|owner| !owner.trim().is_empty())
+        .unwrap_or_else(|| "yoyo-relay".to_string());
+    json!({
+        "id": model,
+        "object": "model",
+        "type": "model",
+        "created": created,
+        "created_at": created_at,
+        "owned_by": owned_by,
+        "display_name": display_name,
+        "description": description,
+        "context_window": context,
+        "context_length": context,
+        "max_output_tokens": max_output,
+        "max_tokens": max_output,
+        "input_modalities": input_modalities,
+        "output_modalities": output_modalities,
+        "architecture": {
+            "input_modalities": input_modalities.clone(),
+            "output_modalities": output_modalities.clone(),
+        },
+        "capabilities": {
+            "chat": true,
+            "streaming": supports_streaming,
+            "tools": supports_tools,
+            "vision": vision,
+            "reasoning": !reasoning_levels.is_empty(),
+        },
+        "reasoning_levels": reasoning_levels.clone(),
+        "supported_reasoning_levels": reasoning_levels,
+    })
 }
 
 async fn chat_handler(
