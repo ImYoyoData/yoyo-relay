@@ -13,6 +13,7 @@ use crate::balance;
 use crate::config::{now_ts, AppConfig, BalanceMode, ConfigStore};
 use crate::db::{self, Db, UsageFilter};
 use crate::gateway::Gateway;
+use crate::plugins::{PluginHost, PluginUiAnswer};
 use crate::probe::{self, TestLevel, TestResult};
 use crate::scheduler::{AccountState as SchedState, Scheduler};
 use crate::snapshot::*;
@@ -65,6 +66,24 @@ pub enum UiCommand {
     CheckUpdate {
         manual: bool,
     },
+    ReloadPlugins,
+    SetPluginEnabled {
+        id: String,
+        enabled: bool,
+    },
+    LoadPlugin(String),
+    UnloadPlugin(String),
+    ReloadPlugin(String),
+    InvokePlugin {
+        id: String,
+        method: String,
+    },
+    AnswerPluginUi {
+        id: u64,
+        accepted: bool,
+        text: String,
+    },
+    InstallSamplePlugins,
     CleanupNow,
     Shutdown,
 }
@@ -245,6 +264,7 @@ pub struct Runtime {
     scheduler: Arc<Scheduler>,
     db: Arc<Db>,
     shared: Arc<Shared>,
+    plugins: Arc<PluginHost>,
     cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     snapshot_tx: std::sync::mpsc::Sender<Arc<UiSnapshot>>,
     proxy: Option<ProxyHandle>,
@@ -270,12 +290,16 @@ impl Runtime {
         for account in &config.accounts {
             scheduler.runtime_for(&account.id);
         }
+        let plugins = PluginHost::new(&store.paths.config_dir, tokio::runtime::Handle::current());
+        plugins.apply_settings(config.plugins.clone());
         let gateway = Gateway::new(
             Arc::new(config.clone()),
             store.master().clone(),
             db.clone(),
             scheduler.clone(),
+            plugins.clone(),
         );
+        plugins.set_runtime_info(gateway.api_base(), config.servable_models());
         let shared = Arc::new(Shared::new(warnings));
         Ok(Self {
             store,
@@ -283,6 +307,7 @@ impl Runtime {
             scheduler,
             db,
             shared,
+            plugins,
             cmd_rx,
             snapshot_tx,
             proxy: None,
@@ -306,6 +331,7 @@ impl Runtime {
 
     async fn run(mut self) {
         self.start_proxy().await;
+        self.plugins.load_all_enabled().await;
         self.emit_snapshot();
         // Emit twice as often while requests are in flight so the live
         // tokens-per-second badge stays responsive; fall back to a slower
@@ -342,6 +368,7 @@ impl Runtime {
                 }
             }
         }
+        self.plugins.unload_all().await;
         self.stop_proxy().await;
     }
 
@@ -382,6 +409,12 @@ impl Runtime {
                     new.ui.fx_updated_at = old.ui.fx_updated_at;
                     new.ui.fx_source = old.ui.fx_source.clone();
                 }
+                if new.ui.update_checked_at < old.ui.update_checked_at {
+                    new.ui.update_latest_version = old.ui.update_latest_version.clone();
+                    new.ui.update_latest_url = old.ui.update_latest_url.clone();
+                    new.ui.update_latest_notes = old.ui.update_latest_notes.clone();
+                    new.ui.update_checked_at = old.ui.update_checked_at;
+                }
                 let new = Arc::new(new);
                 let restart = old.server.bind != new.server.bind
                     || old.server.port != new.server.port
@@ -397,7 +430,17 @@ impl Runtime {
                     }
                 }
                 self.scheduler.remove_missing_accounts(&new);
-                self.gateway.update_config(new);
+                let permissions_changed = old.plugins.allow_network != new.plugins.allow_network
+                    || old.plugins.allow_process != new.plugins.allow_process;
+                self.gateway.update_config(new.clone());
+                self.plugins.apply_settings(new.plugins.clone());
+                let host = self.plugins.clone();
+                tokio::spawn(async move {
+                    if permissions_changed {
+                        host.reload_all().await;
+                    }
+                    host.sync_enabled().await;
+                });
                 if restart && self.proxy.is_some() {
                     self.shared
                         .push_notice(NoticeLevel::Info, "监听设置已变更，正在重启代理…");
@@ -467,6 +510,108 @@ impl Runtime {
             UiCommand::RefreshFxRates { manual } => self.spawn_fx_refresh(manual),
             UiCommand::RefreshBalance(only) => self.spawn_balance_refresh(only, true),
             UiCommand::CheckUpdate { manual } => self.spawn_update_check(manual),
+            UiCommand::ReloadPlugins => {
+                self.plugins.scan();
+                let host = self.plugins.clone();
+                tokio::spawn(async move {
+                    host.sync_enabled().await;
+                });
+                self.shared
+                    .push_notice(NoticeLevel::Info, "已重新扫描插件目录。");
+            }
+            UiCommand::SetPluginEnabled { id, enabled } => {
+                let mut cfg = (*self.gateway.config()).clone();
+                cfg.plugins.disabled.retain(|plugin| plugin != &id);
+                if !enabled {
+                    cfg.plugins.disabled.push(id.clone());
+                }
+                match self.store.save(&mut cfg) {
+                    Ok(()) => {
+                        self.gateway.update_config(Arc::new(cfg.clone()));
+                        self.plugins.apply_settings(cfg.plugins.clone());
+                        if enabled {
+                            if let Err(err) = self.plugins.load(&id, &cfg.plugins).await {
+                                self.shared.push_notice(
+                                    NoticeLevel::Error,
+                                    format!("启用插件失败：{err}"),
+                                );
+                            } else {
+                                self.plugins
+                                    .notify("onEnable", serde_json::json!({"event": "onEnable"}));
+                            }
+                        } else {
+                            self.plugins
+                                .notify("onDisable", serde_json::json!({"event": "onDisable"}));
+                            self.plugins.unload(&id).await;
+                        }
+                    }
+                    Err(err) => self
+                        .shared
+                        .push_notice(NoticeLevel::Error, format!("保存插件设置失败：{err}")),
+                }
+            }
+            UiCommand::LoadPlugin(id) => {
+                let settings = self.gateway.config().plugins.clone();
+                if let Err(err) = self.plugins.load(&id, &settings).await {
+                    self.shared
+                        .push_notice(NoticeLevel::Error, format!("加载插件失败：{err}"));
+                }
+            }
+            UiCommand::UnloadPlugin(id) => {
+                self.plugins.unload(&id).await;
+            }
+            UiCommand::ReloadPlugin(id) => {
+                let settings = self.gateway.config().plugins.clone();
+                match self.plugins.reload(&id).await {
+                    Ok(()) => self
+                        .shared
+                        .push_notice(NoticeLevel::Success, "插件已重新加载。"),
+                    Err(err) => self
+                        .shared
+                        .push_notice(NoticeLevel::Error, format!("重载失败：{err}")),
+                }
+                let _ = settings;
+            }
+            UiCommand::InvokePlugin { id, method } => {
+                match self
+                    .plugins
+                    .invoke(&id, &method, serde_json::json!({"event": method}))
+                    .await
+                {
+                    Ok(value) => {
+                        let text = value
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "undefined".to_string());
+                        self.plugins
+                            .log(&id, "info", format!("{method} 返回：{text}"));
+                        self.shared.push_notice(
+                            NoticeLevel::Success,
+                            format!("插件 {id} · {method}：{text}"),
+                        );
+                    }
+                    Err(err) => {
+                        self.plugins.log(&id, "error", &err);
+                        self.shared
+                            .push_notice(NoticeLevel::Error, format!("插件调用失败：{err}"));
+                    }
+                }
+            }
+            UiCommand::AnswerPluginUi { id, accepted, text } => {
+                self.plugins
+                    .answer_ui(id, PluginUiAnswer { accepted, text });
+            }
+            UiCommand::InstallSamplePlugins => match self.plugins.install_samples() {
+                Ok(dirs) => {
+                    self.plugins.scan();
+                    self.shared.push_notice(
+                        NoticeLevel::Success,
+                        format!("已写入示例插件：{}", dirs.join("、")),
+                    );
+                }
+                Err(err) => self
+                    .shared
+                    .push_notice(NoticeLevel::Error, format!("安装示例失败：{err}")),
+            },
             UiCommand::CleanupNow => match self.db.cleanup(self.gateway.config().ui.retention_days)
             {
                 Ok(n) => self.shared.push_notice(
@@ -1203,6 +1348,9 @@ impl Runtime {
         alerts.sort_by(|a, b| b.level.cmp(&a.level));
         alerts.dedup_by(|a, b| a.text == b.text);
 
+        for (level, text) in self.plugins.drain_notices() {
+            self.shared.push_notice(level, text);
+        }
         let (active_requests, queued_requests) = self.gateway.queue_depth();
         let snapshot = UiSnapshot {
             proxy: proxy_status,
@@ -1250,6 +1398,9 @@ impl Runtime {
                 .lock()
                 .map(|set| set.clone())
                 .unwrap_or_default(),
+            plugins: self.plugins.views(),
+            plugin_ui: self.plugins.ui_request(),
+            plugin_settings: cfg.plugins.clone(),
             update: UpdateView {
                 current: env!("CARGO_PKG_VERSION").to_string(),
                 latest: cfg.ui.update_latest_version.clone(),

@@ -372,6 +372,11 @@ fn migrate_value(mut value: Value) -> Value {
         // moves.
         obj.insert("schema_version".into(), Value::from(5));
     }
+    if version < 6 {
+        // v5 -> v6: plugin host settings. Plugin code lives in
+        // `<config_dir>/plugins`, so only default settings are added.
+        obj.insert("schema_version".into(), Value::from(6));
+    }
     value
 }
 

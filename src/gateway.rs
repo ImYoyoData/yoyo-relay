@@ -18,6 +18,7 @@ use crate::config::{
     now_ts, AppConfig, AuthConfig, AuthMode, LocalKey, ModelRoute, Protocol, Provider,
 };
 use crate::db::{Db, UsageRecord};
+use crate::plugins::PluginHost;
 use crate::protocol::{
     self, build_upstream_body, convert_nonstream_response, extract_nonstream_usage, is_stream,
     Ingress, SseDecoder, StreamTranslator, Usage,
@@ -239,6 +240,7 @@ pub struct Gateway {
     pub(crate) master: Arc<crate::config::secret::MasterKey>,
     pub db: Arc<Db>,
     pub scheduler: Arc<Scheduler>,
+    pub plugins: Arc<PluginHost>,
     pub(crate) http: reqwest::Client,
     pub(crate) http_local: reqwest::Client,
     gate: Arc<ConcurrencyGate>,
@@ -260,6 +262,7 @@ impl Gateway {
         master: Arc<crate::config::secret::MasterKey>,
         db: Arc<Db>,
         scheduler: Arc<Scheduler>,
+        plugins: Arc<PluginHost>,
     ) -> Arc<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
@@ -282,6 +285,7 @@ impl Gateway {
             master,
             db,
             scheduler,
+            plugins,
             http,
             http_local,
             gate,
@@ -855,7 +859,7 @@ async fn chat_handler(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let payload: Value = match serde_json::from_slice(&body) {
+    let mut payload: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(err) => {
             return gw.error_response(
@@ -866,7 +870,7 @@ async fn chat_handler(
             )
         }
     };
-    let Some(client_model) = protocol::extract_client_model(&payload) else {
+    let Some(mut client_model) = protocol::extract_client_model(&payload) else {
         return gw.error_response(
             ingress,
             StatusCode::BAD_REQUEST,
@@ -874,15 +878,54 @@ async fn chat_handler(
             "请求体缺少 model 字段。",
         );
     };
-    if let Some(key) = &auth.key {
-        if !key.allows_model(&client_model) {
+    if !model_allowed(&auth, &client_model) {
+        return gw.error_response(
+            ingress,
+            StatusCode::FORBIDDEN,
+            "model_not_allowed",
+            &format!("本地 Key 无权访问模型 {client_model}。"),
+        );
+    }
+
+    // Plugins see the request before it reaches the scheduler and can modify
+    // the payload or answer it directly.
+    let stream_requested = is_stream(&payload);
+    let plugin_meta = serde_json::json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "model": client_model,
+        "stream": stream_requested,
+        "protocol": ingress.protocol().map(|p| p.label()).unwrap_or("generic"),
+        "path": uri.path(),
+        "localKey": auth.key.as_ref().map(|key| serde_json::json!({
+            "id": key.id,
+            "name": key.name,
+        })),
+        "payload": payload.clone(),
+    });
+    let plugin_outcome = gw.plugins.before_request(plugin_meta.clone()).await;
+    if let Some(block) = plugin_outcome.block {
+        let status = StatusCode::from_u16(block.status).unwrap_or(StatusCode::FORBIDDEN);
+        return (status, Json(block.body)).into_response();
+    }
+    if let Some(modified) = plugin_outcome.payload {
+        payload = modified;
+        let Some(model) = protocol::extract_client_model(&payload) else {
+            return gw.error_response(
+                ingress,
+                StatusCode::BAD_REQUEST,
+                "plugin_removed_model",
+                "插件修改后的请求体缺少 model 字段。",
+            );
+        };
+        if !model_allowed(&auth, &model) {
             return gw.error_response(
                 ingress,
                 StatusCode::FORBIDDEN,
                 "model_not_allowed",
-                &format!("本地 Key「{}」无权访问模型 {client_model}。", key.name),
+                &format!("本地 Key 无权访问模型 {model}。"),
             );
         }
+        client_model = model;
     }
 
     let cfg = gw.config();
@@ -1207,6 +1250,9 @@ async fn chat_handler(
                     local_key_id: auth.key.as_ref().map(|k| k.id.clone()),
                     request_id: request_id.clone(),
                     usage: usage_cell.clone(),
+                    plugins: gw.plugins.clone(),
+                    account_name: attempt.account.name.clone(),
+                    provider_name: attempt.provider.name.clone(),
                     fx_units_per_usd: cfg
                         .ui
                         .fx_rate(attempt.route.effective_pricing().currency.code()),
@@ -1353,6 +1399,14 @@ async fn chat_handler(
                     }
                     gw.scheduler.on_success(&attempt.account.id);
                     gw.scheduler.breaker.record_success();
+                    let cost_micros = attempt.route.cost_micros_with_fx(
+                        usage.input_tokens,
+                        usage.cached_tokens,
+                        usage.output_tokens,
+                        chrono::Local::now(),
+                        cfg.ui
+                            .fx_rate(attempt.route.effective_pricing().currency.code()),
+                    );
                     gw.record_usage(UsageRecord {
                         ts: now_ts(),
                         request_id: request_id.clone(),
@@ -1370,17 +1424,42 @@ async fn chat_handler(
                         cached_tokens: usage.cached_tokens,
                         completion_tokens: usage.output_tokens,
                         total_tokens: usage.total(),
-                        cost_micros: attempt.route.cost_micros_with_fx(
-                            usage.input_tokens,
-                            usage.cached_tokens,
-                            usage.output_tokens,
-                            chrono::Local::now(),
-                            cfg.ui
-                                .fx_rate(attempt.route.effective_pricing().currency.code()),
-                        ),
+                        cost_micros,
                         latency_ms: latency,
                         kind: "chat".into(),
                     });
+                    gw.plugins.notify(
+                        "onRequestCompleted",
+                        serde_json::json!({
+                            "event": "onRequestCompleted",
+                            "request": {
+                                "id": request_id,
+                                "model": client_model,
+                                "upstreamModel": attempt.route.upstream_model,
+                                "account": attempt.account.name,
+                                "provider": attempt.provider.name,
+                                "protocol": attempt.upstream_protocol.label(),
+                                "status": 200,
+                                "ok": true,
+                                "stream": false,
+                            },
+                            "usage": {
+                                "promptTokens": usage.input_tokens,
+                                "cachedTokens": usage.cached_tokens,
+                                "completionTokens": usage.output_tokens,
+                                "totalTokens": usage.total(),
+                                "costMicros": cost_micros,
+                                "latencyMs": latency,
+                            }
+                        }),
+                    );
+                    if let Some(modified) = gw
+                        .plugins
+                        .after_response(plugin_meta.clone(), value.clone())
+                        .await
+                    {
+                        value = modified;
+                    }
                     let mut response = Json(value).into_response();
                     let h = response.headers_mut();
                     h.insert(
@@ -1418,6 +1497,7 @@ async fn chat_handler(
             401 | 403 => {
                 gw.scheduler
                     .on_failure(&attempt.account, FailureKind::Auth, &cfg.scheduler);
+                notify_account_failure(&gw, attempt, status.as_u16(), "auth", &summary);
                 errors.push(format!(
                     "账号「{}」鉴权失败（HTTP {}）：{}",
                     attempt.account.name, status, summary
@@ -1427,6 +1507,7 @@ async fn chat_handler(
                 let kind = classify_429(&err_text);
                 gw.scheduler
                     .on_failure(&attempt.account, kind, &cfg.scheduler);
+                notify_account_failure(&gw, attempt, 429, "rate_limited", &summary);
                 errors.push(format!(
                     "账号「{}」被上游限流（HTTP 429）：{}",
                     attempt.account.name, summary
@@ -1486,6 +1567,7 @@ async fn chat_handler(
             500..=599 => {
                 gw.scheduler
                     .on_failure(&attempt.account, FailureKind::Server, &cfg.scheduler);
+                notify_account_failure(&gw, attempt, status.as_u16(), "server", &summary);
                 errors.push(format!(
                     "账号「{}」上游错误（HTTP {}）：{}",
                     attempt.account.name, status, summary
@@ -1577,6 +1659,9 @@ struct StreamFinalizer {
     local_key_id: Option<String>,
     request_id: String,
     usage: Arc<Mutex<Usage>>,
+    plugins: Arc<PluginHost>,
+    account_name: String,
+    provider_name: String,
     /// Currency units per 1 USD for this route's pricing currency.
     fx_units_per_usd: f64,
     _slot: Option<AccountSlot>,
@@ -1635,6 +1720,31 @@ impl StreamFinalizer {
         if let Err(err) = self.db.record_usage(&rec) {
             tracing::error!("failed to record stream usage: {err}");
         }
+        self.plugins.notify(
+            "onRequestCompleted",
+            serde_json::json!({
+                "event": "onRequestCompleted",
+                "request": {
+                    "id": self.request_id,
+                    "model": self.client_model,
+                    "upstreamModel": self.route.upstream_model,
+                    "account": self.account_name,
+                    "provider": self.provider_name,
+                    "protocol": rec.protocol,
+                    "status": rec.status,
+                    "ok": ok,
+                    "stream": true,
+                },
+                "usage": {
+                    "promptTokens": rec.prompt_tokens,
+                    "cachedTokens": rec.cached_tokens,
+                    "completionTokens": rec.completion_tokens,
+                    "totalTokens": rec.total_tokens,
+                    "costMicros": rec.cost_micros,
+                    "latencyMs": rec.latency_ms,
+                }
+            }),
+        );
         self.scheduler
             .note_account_usage(&self.account.id, rec.total_tokens, 1);
         if ok {
@@ -1750,6 +1860,37 @@ where
         finalizer.finish();
     };
     Body::from_stream(stream)
+}
+
+fn model_allowed(auth: &AuthContext, model: &str) -> bool {
+    auth.key
+        .as_ref()
+        .map(|key| key.allows_model(model))
+        .unwrap_or(true)
+}
+
+fn notify_account_failure(
+    gw: &Gateway,
+    attempt: &crate::scheduler::Attempt,
+    status: u16,
+    kind: &str,
+    message: &str,
+) {
+    gw.plugins.notify(
+        "onAccountFailure",
+        serde_json::json!({
+            "event": "onAccountFailure",
+            "account": attempt.account.name,
+            "accountId": attempt.account.id,
+            "provider": attempt.provider.name,
+            "providerId": attempt.provider.id,
+            "model": attempt.route.client_model,
+            "upstreamModel": attempt.route.upstream_model,
+            "status": status,
+            "kind": kind,
+            "message": message,
+        }),
+    );
 }
 
 fn is_error_event(ev: &protocol::SseEvent) -> bool {

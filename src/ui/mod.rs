@@ -6,6 +6,7 @@ pub mod editors;
 pub mod keys;
 pub mod kit;
 pub mod overview;
+pub mod plugins;
 pub mod providers;
 pub mod routes;
 pub mod settings;
@@ -88,6 +89,7 @@ pub enum Page {
     Providers,
     Accounts,
     Routes,
+    Plugins,
     LocalKeys,
     Usage,
     Calls,
@@ -96,12 +98,13 @@ pub enum Page {
 }
 
 impl Page {
-    pub fn all() -> [Page; 9] {
+    pub fn all() -> [Page; 10] {
         [
             Page::Overview,
             Page::Providers,
             Page::Accounts,
             Page::Routes,
+            Page::Plugins,
             Page::LocalKeys,
             Page::Usage,
             Page::Calls,
@@ -116,6 +119,7 @@ impl Page {
             Page::Providers => "供应商",
             Page::Accounts => "账号",
             Page::Routes => "路由",
+            Page::Plugins => "插件",
             Page::LocalKeys => "本地 Key",
             Page::Usage => "用量",
             Page::Calls => "调用明细",
@@ -130,6 +134,7 @@ impl Page {
             Page::Providers => icons::HARD_DRIVES,
             Page::Accounts => icons::USERS,
             Page::Routes => icons::GIT_BRANCH,
+            Page::Plugins => icons::PUZZLE_PIECE,
             Page::LocalKeys => icons::KEY,
             Page::Usage => icons::CHART_BAR,
             Page::Calls => icons::LIST_BULLETS,
@@ -144,6 +149,7 @@ impl Page {
             Page::Providers => "Configuration · 供应商",
             Page::Accounts => "Configuration · 账号",
             Page::Routes => "Configuration · 路由",
+            Page::Plugins => "Configuration · 插件",
             Page::LocalKeys => "Configuration · 本地 Key",
             Page::Usage => "Observability · 用量",
             Page::Calls => "Observability · 调用明细",
@@ -158,6 +164,7 @@ impl Page {
             "providers" => Some(Page::Providers),
             "accounts" => Some(Page::Accounts),
             "routes" => Some(Page::Routes),
+            "plugins" => Some(Page::Plugins),
             "keys" | "local_keys" => Some(Page::LocalKeys),
             "usage" => Some(Page::Usage),
             "calls" | "details" => Some(Page::Calls),
@@ -170,7 +177,7 @@ impl Page {
     pub fn needs_search(self) -> bool {
         matches!(
             self,
-            Page::Providers | Page::Accounts | Page::Routes | Page::LocalKeys
+            Page::Providers | Page::Accounts | Page::Routes | Page::Plugins | Page::LocalKeys
         )
     }
 }
@@ -307,6 +314,9 @@ pub struct App {
     pub(crate) update_modal: bool,
     pub(crate) update_waiting: bool,
     pub(crate) update_prompted: Option<String>,
+    pub(crate) plugin_docs_open: bool,
+    pub(crate) plugin_ui_id: u64,
+    pub(crate) plugin_ui_text: String,
     pub(crate) closing: bool,
     pub(crate) last_zoom: f32,
     pub(crate) signals: Arc<crate::instance::Signals>,
@@ -378,6 +388,9 @@ impl App {
             update_modal: false,
             update_waiting: false,
             update_prompted: None,
+            plugin_docs_open: false,
+            plugin_ui_id: 0,
+            plugin_ui_text: String::new(),
             closing: false,
             last_zoom: 1.0,
             signals,
@@ -687,6 +700,15 @@ impl App {
     /// The runtime owns live-rate refreshes and persists them itself. Adopt its
     /// newer table so an unrelated "save settings" cannot overwrite it with a
     /// stale copy.
+    fn sync_plugin_settings(&mut self) {
+        if self.snapshot.plugin_settings.disabled != self.config.plugins.disabled
+            || self.snapshot.plugin_settings.allow_network != self.config.plugins.allow_network
+            || self.snapshot.plugin_settings.allow_process != self.config.plugins.allow_process
+        {
+            self.config.plugins = self.snapshot.plugin_settings.clone();
+        }
+    }
+
     fn sync_live_fx(&mut self) {
         if self.snapshot.fx_updated_at > self.config.ui.fx_updated_at
             && !self.snapshot.fx_rates.is_empty()
@@ -1359,6 +1381,18 @@ impl App {
             }
             if kit::nav_item(
                 ui,
+                icons::PUZZLE_PIECE,
+                "插件",
+                self.page == Page::Plugins,
+                Some(self.snapshot.plugins.len().to_string()),
+            )
+            .clicked()
+            {
+                self.page = Page::Plugins;
+                self.search.clear();
+            }
+            if kit::nav_item(
+                ui,
                 icons::KEY,
                 "本地 Key",
                 self.page == Page::LocalKeys,
@@ -1622,6 +1656,7 @@ impl App {
                                     Page::Providers => self.page_providers(ui),
                                     Page::Accounts => self.page_accounts(ui),
                                     Page::Routes => self.page_routes(ui),
+                                    Page::Plugins => self.page_plugins(ui),
                                     Page::LocalKeys => self.page_local_keys(ui),
                                     Page::Usage => self.page_usage(ui),
                                     Page::Calls => self.page_calls(ui),
@@ -1714,6 +1749,7 @@ impl eframe::App for App {
         }
         self.poll_snapshot(ctx);
         self.prompt_update_if_needed();
+        self.sync_plugin_settings();
         self.sync_live_fx();
         self.apply_theme(ctx);
         self.sync_autostart();
@@ -1775,6 +1811,8 @@ impl eframe::App for App {
         self.show_editor(ctx);
         self.show_price_plan_modal(ctx);
         self.show_update_modal(ctx);
+        self.show_plugin_ui(ctx);
+        self.show_plugin_docs(ctx);
         self.show_confirm(ctx);
         self.show_test_modal(ctx);
         self.show_onboarding(ctx);

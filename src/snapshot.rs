@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::db::{RecentRequest, SeriesPoint, Totals, UsageDetail, UsageFilter};
+use crate::plugins::{PluginInfo, PluginUiRequest};
 use crate::probe::TestResult;
 use crate::scheduler::{AccountState, BreakerSnapshot, QuotaSnapshot};
 
@@ -316,6 +317,9 @@ pub struct UiSnapshot {
     /// Live completion throughput over the last few seconds.
     pub tokens_per_sec: f64,
     pub update: UpdateView,
+    pub plugins: Vec<PluginInfo>,
+    pub plugin_ui: Option<PluginUiRequest>,
+    pub plugin_settings: crate::config::PluginSettings,
     pub providers: Vec<ProviderHealth>,
     pub accounts: Vec<AccountView>,
     pub route_groups: Vec<RouteGroupView>,
@@ -361,6 +365,9 @@ impl Default for UiSnapshot {
             queued_requests: 0,
             tokens_per_sec: 0.0,
             update: UpdateView::default(),
+            plugins: Vec::new(),
+            plugin_ui: None,
+            plugin_settings: crate::config::PluginSettings::default(),
             providers: Vec::new(),
             accounts: Vec::new(),
             route_groups: Vec::new(),
