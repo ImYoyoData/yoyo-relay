@@ -3,7 +3,7 @@ use egui_phosphor::regular as icons;
 
 use crate::config::ProviderKind;
 
-use super::{theme, widgets, App, ConfirmAction, Page};
+use super::{brands, theme, widgets, App, ConfirmAction, Page};
 
 impl App {
     pub(crate) fn page_providers(&mut self, ui: &mut egui::Ui) {
@@ -11,7 +11,7 @@ impl App {
             ui,
             super::Page::Providers.eyebrow(),
             "供应商",
-            "上游端点、协议策略、凭据测试与账号入口",
+            "上游端点、品牌预设、协议策略、凭据测试与账号入口",
             |ui| {
                 if super::kit::primary_labeled(ui, icons::PLUS, "新增供应商").clicked() {
                     self.open_new_provider();
@@ -28,16 +28,37 @@ impl App {
             })
             .cloned()
             .collect();
+        if self.config.providers.is_empty() && self.search.trim().is_empty() {
+            super::kit::section_card(
+                ui,
+                icons::HARD_DRIVES,
+                "从品牌预设开始",
+                "内置 12 家常用上游，选择后会自动填好端点、鉴权与协议",
+                |ui| {
+                    super::kit::badge(ui, "推荐", theme::ACCENT);
+                },
+                |ui| {
+                    if let Some(key) = brands::preset_gallery(ui, "") {
+                        self.open_new_provider_with_preset(key);
+                    }
+                },
+            );
+            ui.add_space(12.0);
+            return;
+        }
         if providers.is_empty() {
             if super::kit::empty_state(
                 ui,
-                icons::HARD_DRIVES,
-                "还没有供应商",
-                "先添加一个官方直连、聚合平台或自定义端点，再配置账号。",
+                icons::MAGNIFYING_GLASS,
+                "没有匹配的供应商",
+                "换一个关键词，或清空右上角搜索框。",
                 icons::PLUS,
-                "添加供应商",
+                "新增供应商",
             ) {
                 self.open_new_provider();
+            }
+            if ui.small_button("清空搜索").clicked() {
+                self.search.clear();
             }
             return;
         }
@@ -90,16 +111,18 @@ impl App {
             .iter()
             .filter(|a| a.provider_id == provider.id)
             .count();
+        let catalog = self.snapshot.provider_models.get(&provider.id);
         let test_key = format!("provider:{}", provider.id);
         let running = self.snapshot.running_tests.contains(&test_key);
+        let brand = brands::for_provider(provider);
         let mut action: Option<CardAction> = None;
         super::kit::surface(ui, |ui| {
             ui.horizontal(|ui| {
-                super::kit::icon_tile(ui, icons::HARD_DRIVES, theme::ACCENT, 38.0);
+                brands::tile(ui, &brand, 42.0).on_hover_text(brand.label);
                 ui.add_space(4.0);
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&provider.name).size(15.0).strong());
+                        ui.label(RichText::new(&provider.name).size(15.5).strong());
                         super::kit::badge(ui, provider.kind.label(), theme::BLUE_INFO);
                         if provider.protocol_strategy.mode
                             == crate::config::ProtocolStrategyMode::ModelPrefix
@@ -188,16 +211,28 @@ impl App {
                 };
                 super::kit::badge(ui, provider.static_protocol.label(), theme::MUTED);
                 super::kit::badge(ui, auth, theme::MUTED);
+                if let Some(catalog) = catalog {
+                    super::kit::badge(
+                        ui,
+                        &if catalog.ok {
+                            format!("{} 个模型", catalog.models.len())
+                        } else {
+                            "模型列表不可用".to_string()
+                        },
+                        if catalog.ok {
+                            theme::GREEN
+                        } else {
+                            theme::ORANGE
+                        },
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(health) = &health {
-                        if health.balance_known {
+                        if health.balance_known() {
                             ui.label(
-                                RichText::new(widgets::format_money(
-                                    health.balance,
-                                    &health.currency,
-                                ))
-                                .size(13.0)
-                                .strong(),
+                                RichText::new(widgets::format_currency_totals(&health.balances))
+                                    .size(13.0)
+                                    .strong(),
                             );
                             super::kit::badge(ui, "余额", theme::MUTED);
                         }

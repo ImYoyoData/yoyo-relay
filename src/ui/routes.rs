@@ -3,7 +3,7 @@ use egui_phosphor::regular as icons;
 
 use crate::snapshot::{NoticeLevel, RouteGroupView, RouteRowView};
 
-use super::{theme, widgets, App, ConfirmAction};
+use super::{brands, theme, widgets, App, ConfirmAction};
 
 impl App {
     pub(crate) fn page_routes(&mut self, ui: &mut egui::Ui) {
@@ -11,10 +11,10 @@ impl App {
             ui,
             super::Page::Routes.eyebrow(),
             "模型路由",
-            "客户端模型 → 上游模型的候选链与降级顺序",
+            "先创建路由模型，再为它添加上游供应商与真实模型",
             |ui| {
-                if super::kit::primary_labeled(ui, icons::PLUS, "新增路由").clicked() {
-                    self.open_new_route();
+                if super::kit::primary_labeled(ui, icons::PLUS, "新增路由模型").clicked() {
+                    self.open_new_route_model();
                 }
             },
         );
@@ -23,12 +23,12 @@ impl App {
             if super::kit::empty_state(
                 ui,
                 icons::GIT_BRANCH,
-                "还没有模型路由",
-                "路由把客户端请求的模型名映射到上游供应商与真实模型，并定义降级顺序。",
+                "还没有路由模型",
+                "先定义一个客户端模型（例如 gpt-5），再在它的卡片里添加上游供应商模型和降级顺序。",
                 icons::PLUS,
-                "添加路由",
+                "创建路由模型",
             ) {
-                self.open_new_route();
+                self.open_new_route_model();
             }
             return;
         }
@@ -62,24 +62,69 @@ impl App {
                 })
                 .cloned()
                 .collect();
-            if matching_rows.is_empty() {
+            if !self.matches_search(&group.client_model) && matching_rows.is_empty() {
                 continue;
             }
-            let subtitle = match &group.fallback_model {
-                Some(fallback) => {
-                    format!("{} 条候选 · 映射级兜底 → {}", matching_rows.len(), fallback)
+            let profile = self.config.model_profile(&group.client_model);
+            let enabled_rows = group.rows.iter().filter(|r| r.enabled).count();
+            let mut meta = vec![format!(
+                "{} 个上游 · {} 个参与调度",
+                group.rows.len(),
+                enabled_rows
+            )];
+            if let Some(profile) = profile {
+                if let Some(context) = profile.context_window {
+                    meta.push(format!("上下文 {}", widgets::format_count(context)));
                 }
-                None => format!("{} 条候选路由", matching_rows.len()),
-            };
+                if profile.input_modalities.iter().any(|m| m == "image") {
+                    meta.push("图片输入".into());
+                }
+                if !profile.reasoning_levels.is_empty() {
+                    meta.push(format!("思考 {}", profile.reasoning_levels.join("/")));
+                }
+            }
+            if let Some(fallback) = &group.fallback_model {
+                meta.push(format!("兜底 → {fallback}"));
+            }
+            let subtitle = meta.join(" · ");
+            let client_model = group.client_model.clone();
             super::kit::section_card(
                 ui,
                 icons::GIT_BRANCH,
                 &group.client_model,
                 &subtitle,
                 |ui| {
-                    super::kit::badge(ui, "降级链", theme::ACCENT);
+                    super::kit::badge(ui, "路由模型", theme::ACCENT);
                 },
                 |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if super::kit::secondary_labeled(ui, icons::PLUS, "添加上游模型").clicked()
+                        {
+                            pending.push(RouteAction::AddUpstream(client_model.clone()));
+                        }
+                        if super::kit::icon_button(ui, icons::PENCIL_SIMPLE, "编辑路由模型")
+                            .clicked()
+                        {
+                            pending.push(RouteAction::EditModel(client_model.clone()));
+                        }
+                        if super::kit::danger_icon_button(
+                            ui,
+                            icons::TRASH_SIMPLE,
+                            "删除路由模型及其上游",
+                        )
+                        .clicked()
+                        {
+                            pending.push(RouteAction::DeleteModel(client_model.clone()));
+                        }
+                    });
+                    ui.add_space(6.0);
+                    if matching_rows.is_empty() {
+                        super::kit::tooltip_text(
+                            ui,
+                            icons::INFO,
+                            "这个路由模型还没有上游模型，客户端暂时不会在 /v1/models 中看到它。",
+                        );
+                    }
                     let mut previous_provider: Option<String> = None;
                     for (index, row) in matching_rows.iter().enumerate() {
                         let same_provider =
@@ -112,6 +157,12 @@ impl App {
                 RouteAction::Delete(id) => self.confirm = Some(ConfirmAction::DeleteRoute(id)),
                 RouteAction::Test(id) => self.start_test("route", &id),
                 RouteAction::Priority(id, delta) => self.adjust_route_priority(&id, delta),
+                RouteAction::Toggle(id) => self.toggle_route_enabled(&id),
+                RouteAction::AddUpstream(model) => self.open_new_route(&model),
+                RouteAction::EditModel(model) => self.open_edit_route_model(&model),
+                RouteAction::DeleteModel(model) => {
+                    self.confirm = Some(ConfirmAction::DeleteRouteModel(model))
+                }
             }
         }
 
@@ -148,6 +199,7 @@ impl App {
                             theme::MUTED
                         },
                     );
+                    brands::tile(ui, &brands::for_name(&row.provider_name), 20.0);
                     ui.label(RichText::new(&row.provider_name).size(13.5).strong());
                     ui.label(
                         RichText::new(icons::ARROW_RIGHT)
@@ -167,6 +219,23 @@ impl App {
                         if super::kit::icon_button(ui, icons::PENCIL_SIMPLE, "编辑路由").clicked()
                         {
                             pending.push(RouteAction::Edit(row.route_id.clone()));
+                        }
+                        if super::kit::icon_button(
+                            ui,
+                            if row.enabled {
+                                icons::PAUSE
+                            } else {
+                                icons::PLAY
+                            },
+                            if row.enabled {
+                                "停用该上游（保留在列表，不参与调度）"
+                            } else {
+                                "启用该上游"
+                            },
+                        )
+                        .clicked()
+                        {
+                            pending.push(RouteAction::Toggle(row.route_id.clone()));
                         }
                         if super::kit::icon_button(
                             ui,
@@ -228,6 +297,26 @@ impl App {
             });
     }
 
+    fn toggle_route_enabled(&mut self, id: &str) {
+        let backup = self.config.clone();
+        if let Some(route) = self.config.routes.iter_mut().find(|r| r.id == id) {
+            route.enabled = !route.enabled;
+            let enabled = route.enabled;
+            if self.persist() {
+                self.toast(
+                    NoticeLevel::Success,
+                    if enabled {
+                        "该上游已启用，将参与调度"
+                    } else {
+                        "该上游已停用，仍保留在路由列表中"
+                    },
+                );
+            } else {
+                self.config = backup;
+            }
+        }
+    }
+
     fn adjust_route_priority(&mut self, id: &str, delta: i32) {
         let backup = self.config.clone();
         if let Some(route) = self.config.routes.iter_mut().find(|r| r.id == id) {
@@ -254,4 +343,8 @@ enum RouteAction {
     Delete(String),
     Test(String),
     Priority(String, i32),
+    Toggle(String),
+    AddUpstream(String),
+    EditModel(String),
+    DeleteModel(String),
 }

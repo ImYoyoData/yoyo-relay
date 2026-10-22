@@ -268,14 +268,11 @@ impl App {
                         } else {
                             super::kit::status_badge(ui, "可用", theme::GREEN);
                         }
-                        if provider.balance_known {
+                        if provider.balance_known() {
                             ui.label(
-                                RichText::new(widgets::format_money(
-                                    provider.balance,
-                                    &provider.currency,
-                                ))
-                                .size(12.0)
-                                .strong(),
+                                RichText::new(widgets::format_currency_totals(&provider.balances))
+                                    .size(12.0)
+                                    .strong(),
                             );
                         }
                         ui.label(
@@ -347,6 +344,18 @@ impl App {
                             );
                         });
                     });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("三协议入口")
+                            .size(10.0)
+                            .color(theme::muted(ui)),
+                    );
+                    super::kit::plain_badge(ui, "/chat/completions");
+                    super::kit::plain_badge(ui, "/messages");
+                    super::kit::plain_badge(ui, "/responses");
+                    super::kit::plain_badge(ui, "/models");
+                });
                 ui.add_space(8.0);
                 ui.columns(3, |cols| {
                     super::kit::info_line(
@@ -485,15 +494,20 @@ impl App {
                 "{{\"model\":\"{model}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"stream\":true}}"
             )
         };
+        let url = format!(
+            "{}{}",
+            self.snapshot.endpoint,
+            path.trim_start_matches("/v1")
+        );
         if path == "/v1/messages" {
             format!(
-                "curl -N {}{path} -H 'x-api-key: yr-REPLACE_WITH_YOUR_KEY' -H 'anthropic-version: 2023-06-01' -H 'Content-Type: application/json' -d '{}'",
-                self.snapshot.endpoint, body
+                "curl -N {url} -H 'x-api-key: yr-REPLACE_WITH_YOUR_KEY' -H 'anthropic-version: 2023-06-01' -H 'Content-Type: application/json' -d '{}'",
+                body
             )
         } else {
             format!(
-                "curl -N {}{path} -H 'Authorization: Bearer yr-REPLACE_WITH_YOUR_KEY' -H 'Content-Type: application/json' -d '{}'",
-                self.snapshot.endpoint, body
+                "curl -N {url} -H 'Authorization: Bearer yr-REPLACE_WITH_YOUR_KEY' -H 'Content-Type: application/json' -d '{}'",
+                body
             )
         }
     }

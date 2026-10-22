@@ -228,14 +228,20 @@ impl Db {
     }
 
     pub fn totals_since(&self, since: i64) -> Result<Totals> {
+        self.totals_since_key(since, None)
+    }
+
+    /// Totals for a period, optionally restricted to one local key.
+    /// A `None` key includes every request, including unauthenticated ones.
+    pub fn totals_since_key(&self, since: i64, key: Option<&str>) -> Result<Totals> {
         let conn = self.lock();
         let row = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(ok),0),
                     COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0),
                     COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0)
-             FROM usage_requests WHERE ts >= ?1",
-            params![since],
+             FROM usage_requests WHERE ts >= ?1 AND (?2 IS NULL OR local_key_id = ?2)",
+            params![since, key],
             |r| {
                 Ok(Totals {
                     requests: r.get::<_, i64>(0)? as u64,
@@ -276,6 +282,15 @@ impl Db {
     }
 
     pub fn group_since(&self, dimension: &str, since: i64) -> Result<Vec<GroupRow>> {
+        self.group_since_key(dimension, since, None)
+    }
+
+    pub fn group_since_key(
+        &self,
+        dimension: &str,
+        since: i64,
+        key: Option<&str>,
+    ) -> Result<Vec<GroupRow>> {
         let column = match dimension {
             "provider" => "provider_id",
             "account" => "account_id",
@@ -287,12 +302,12 @@ impl Db {
                     COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0),
                     COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0)
-             FROM usage_requests WHERE ts >= ?1
+             FROM usage_requests WHERE ts >= ?1 AND (?2 IS NULL OR local_key_id = ?2)
              GROUP BY {column} ORDER BY SUM(total_tokens) DESC"
         );
         let conn = self.lock();
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![since], |r| {
+        let rows = stmt.query_map(params![since, key], |r| {
             Ok(GroupRow {
                 key: r.get::<_, String>(0)?,
                 totals: Totals {
@@ -310,16 +325,24 @@ impl Db {
     }
 
     pub fn model_upstream_since(&self, since: i64) -> Result<Vec<ModelPairRow>> {
+        self.model_upstream_since_key(since, None)
+    }
+
+    pub fn model_upstream_since_key(
+        &self,
+        since: i64,
+        key: Option<&str>,
+    ) -> Result<Vec<ModelPairRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT client_model, upstream_model, COUNT(*), COALESCE(SUM(ok),0),
                     COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0)
-             FROM usage_requests WHERE ts >= ?1
+             FROM usage_requests WHERE ts >= ?1 AND (?2 IS NULL OR local_key_id = ?2)
              GROUP BY client_model, upstream_model
              ORDER BY SUM(total_tokens) DESC",
         )?;
-        let rows = stmt.query_map(params![since], |r| {
+        let rows = stmt.query_map(params![since, key], |r| {
             Ok(ModelPairRow {
                 client_model: r.get(0)?,
                 upstream_model: r.get(1)?,
@@ -338,16 +361,25 @@ impl Db {
     }
 
     pub fn series_since(&self, since: i64, bucket_secs: i64) -> Result<Vec<SeriesPoint>> {
+        self.series_since_key(since, bucket_secs, None)
+    }
+
+    pub fn series_since_key(
+        &self,
+        since: i64,
+        bucket_secs: i64,
+        key: Option<&str>,
+    ) -> Result<Vec<SeriesPoint>> {
         let bucket_secs = bucket_secs.max(60);
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT ((ts - ?1) / ?2) * ?2 + ?1 AS bucket,
                     COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(total_tokens),0),
                     COALESCE(SUM(cost_micros),0)
-             FROM usage_requests WHERE ts >= ?1
+             FROM usage_requests WHERE ts >= ?1 AND (?3 IS NULL OR local_key_id = ?3)
              GROUP BY bucket ORDER BY bucket",
         )?;
-        let rows = stmt.query_map(params![since, bucket_secs], |r| {
+        let rows = stmt.query_map(params![since, bucket_secs, key], |r| {
             Ok(SeriesPoint {
                 bucket: r.get::<_, i64>(0)?,
                 totals: Totals {
@@ -525,6 +557,34 @@ mod tests {
         assert_eq!(groups.len(), 2);
         let series = db.series_since(0, 3600).unwrap();
         assert!(!series.is_empty());
+    }
+
+    #[test]
+    fn filters_usage_by_local_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let mut first = sample("a1", 10, true);
+        first.local_key_id = Some("k1".into());
+        let mut second = sample("a1", 20, true);
+        second.local_key_id = Some("k2".into());
+        let mut third = sample("a2", 30, true);
+        third.local_key_id = None;
+        db.record_usage(&first).unwrap();
+        db.record_usage(&second).unwrap();
+        db.record_usage(&third).unwrap();
+
+        let totals = db.totals_since_key(0, Some("k1")).unwrap();
+        assert_eq!(totals.requests, 1);
+        assert_eq!(totals.total_tokens, 10);
+        let totals = db.totals_since_key(0, None).unwrap();
+        assert_eq!(totals.requests, 3);
+        assert_eq!(totals.total_tokens, 60);
+        let groups = db.group_since_key("model", 0, Some("k2")).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].totals.total_tokens, 20);
+        let pairs = db.model_upstream_since_key(0, Some("k1")).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert!(!db.series_since_key(0, 3600, Some("k1")).unwrap().is_empty());
     }
 
     #[test]

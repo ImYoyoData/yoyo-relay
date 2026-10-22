@@ -834,7 +834,7 @@ pub async fn test_local_key(gw: &Gateway, key_id: &str) -> TestResult {
             return result;
         }
     };
-    let endpoint = format!("{}/v1/models", gw.endpoint());
+    let endpoint = gw.models_url();
     let started = Instant::now();
     let resp = gw
         .client_for(&endpoint)
@@ -939,6 +939,338 @@ pub async fn test_local_key(gw: &Gateway, key_id: &str) -> TestResult {
     result.detail = detail;
     result.models = models;
     result
+}
+
+/// Metadata read from one upstream model's `/models` entry. Every field is
+/// optional because most providers only return an id.
+#[derive(Clone, Debug, Default)]
+pub struct FetchedModel {
+    pub ok: bool,
+    pub message: String,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+    pub reasoning_levels: Vec<String>,
+    pub supports_tools: Option<bool>,
+    pub supports_streaming: Option<bool>,
+    pub models_seen: usize,
+}
+
+fn pointer_u64(value: &Value, pointers: &[&str]) -> Option<u64> {
+    pointers.iter().find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+    })
+}
+
+fn string_array(value: &Value, pointers: &[&str]) -> Vec<String> {
+    for pointer in pointers {
+        let Some(entry) = value.pointer(pointer) else {
+            continue;
+        };
+        let items = match entry {
+            Value::Array(items) => items.clone(),
+            Value::String(text) => text
+                .split(',')
+                .map(|part| Value::String(part.trim().to_string()))
+                .collect(),
+            _ => continue,
+        };
+        let mut out: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .or_else(|| item.get("name").and_then(Value::as_str).map(str::to_string))
+                    .or_else(|| {
+                        item.get("effort")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        out.dedup();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    Vec::new()
+}
+
+fn pointer_bool(value: &Value, pointers: &[&str]) -> Option<bool> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_bool))
+}
+
+fn parse_modalities(item: &Value, direction: &str) -> Vec<String> {
+    let mut out = if direction == "input" {
+        string_array(
+            item,
+            &[
+                "/input_modalities",
+                "/architecture/input_modalities",
+                "/modalities/input",
+                "/capabilities/input_modalities",
+            ],
+        )
+    } else {
+        string_array(
+            item,
+            &[
+                "/output_modalities",
+                "/architecture/output_modalities",
+                "/modalities/output",
+                "/capabilities/output_modalities",
+            ],
+        )
+    };
+    // OpenRouter-style "text+image->text".
+    if let Some(spec) = item
+        .pointer("/architecture/modality")
+        .and_then(Value::as_str)
+    {
+        let (input, output) = spec.split_once("->").unwrap_or((spec, spec));
+        let side = if direction == "input" { input } else { output };
+        for part in side.split('+') {
+            let part = part.trim().to_ascii_lowercase();
+            if !part.is_empty() && !out.contains(&part) {
+                out.push(part);
+            }
+        }
+    }
+    if direction == "input"
+        && pointer_bool(
+            item,
+            &[
+                "/supports_vision",
+                "/vision",
+                "/capabilities/vision",
+                "/supports_image_input",
+            ],
+        )
+        .unwrap_or(false)
+        && !out.iter().any(|m| m == "image")
+    {
+        out.push("image".to_string());
+    }
+    if out.is_empty() && direction == "input" {
+        out.push("text".to_string());
+    }
+    out
+}
+
+fn extract_fetched_model(item: &Value) -> FetchedModel {
+    let context_window = pointer_u64(
+        item,
+        &[
+            "/context_window",
+            "/context_length",
+            "/max_context_tokens",
+            "/max_context_length",
+            "/max_input_tokens",
+            "/limits/context_window",
+            "/top_provider/context_length",
+            "/metadata/context_window",
+        ],
+    );
+    let max_output_tokens = pointer_u64(
+        item,
+        &[
+            "/max_output_tokens",
+            "/max_completion_tokens",
+            "/max_tokens",
+            "/limits/max_output_tokens",
+            "/top_provider/max_completion_tokens",
+            "/metadata/max_output_tokens",
+        ],
+    );
+    let input_modalities = parse_modalities(item, "input");
+    let output_modalities = parse_modalities(item, "output");
+    let reasoning_levels = string_array(
+        item,
+        &[
+            "/reasoning_levels",
+            "/supported_reasoning_levels",
+            "/reasoning/efforts",
+            "/capabilities/reasoning_levels",
+        ],
+    );
+    let supports_tools = pointer_bool(
+        item,
+        &[
+            "/capabilities/tools",
+            "/supports_tools",
+            "/supports_function_calling",
+            "/tools",
+        ],
+    );
+    let supports_streaming =
+        pointer_bool(item, &["/capabilities/streaming", "/supports_streaming"]);
+    FetchedModel {
+        ok: true,
+        message: String::new(),
+        context_window,
+        max_output_tokens,
+        input_modalities,
+        output_modalities,
+        reasoning_levels,
+        supports_tools,
+        supports_streaming,
+        models_seen: 0,
+    }
+}
+
+/// Query the provider's `/models` endpoint and read metadata for one model.
+/// This is a diagnostics call and never writes usage records.
+pub async fn fetch_model_info(
+    gw: &Gateway,
+    provider_id: &str,
+    upstream_model: &str,
+) -> FetchedModel {
+    let items = match load_model_items(gw, provider_id).await {
+        Ok(items) => items,
+        Err(message) => {
+            return FetchedModel {
+                message,
+                ..FetchedModel::default()
+            }
+        }
+    };
+    let wanted = upstream_model.trim().to_ascii_lowercase();
+    let item = items
+        .iter()
+        .find(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .map(|id| id.eq_ignore_ascii_case(&wanted))
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            items.iter().find(|item| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| {
+                        let id = id.to_ascii_lowercase();
+                        id.contains(&wanted) || wanted.contains(&id)
+                    })
+                    .unwrap_or(false)
+            })
+        });
+    let Some(item) = item else {
+        return FetchedModel {
+            message: format!(
+                "上游返回 {} 个模型，但没有找到「{upstream_model}」。请核对模型名或供应商协议。",
+                items.len()
+            ),
+            models_seen: items.len(),
+            ..FetchedModel::default()
+        };
+    };
+    let mut fetched = extract_fetched_model(item);
+    fetched.models_seen = items.len();
+    let found_any = fetched.context_window.is_some()
+        || fetched.max_output_tokens.is_some()
+        || !fetched.reasoning_levels.is_empty()
+        || fetched.supports_tools.is_some()
+        || fetched.input_modalities.iter().any(|m| m != "text");
+    fetched.message = if found_any {
+        format!("已从上游读取「{upstream_model}」的模型信息。")
+    } else {
+        format!("上游确认存在「{upstream_model}」，但没有返回上下文/输出等元数据，请手动填写。")
+    };
+    fetched
+}
+
+/// Cached list of model ids advertised by a provider.
+#[derive(Clone, Debug, Default)]
+pub struct FetchedModelList {
+    pub ok: bool,
+    pub message: String,
+    pub models: Vec<String>,
+}
+
+/// Read every model id from the provider's `/models` endpoint. Used by the
+/// route editor to offer a picker while still allowing free-form input.
+pub async fn fetch_model_list(gw: &Gateway, provider_id: &str) -> FetchedModelList {
+    let items = match load_model_items(gw, provider_id).await {
+        Ok(items) => items,
+        Err(message) => {
+            return FetchedModelList {
+                message,
+                ..FetchedModelList::default()
+            }
+        }
+    };
+    let mut models: Vec<String> = items
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    models.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    models.dedup();
+    FetchedModelList {
+        ok: true,
+        message: if models.is_empty() {
+            "上游模型列表为空，请手动填写模型名。".into()
+        } else {
+            format!("已获取 {} 个上游模型。", models.len())
+        },
+        models,
+    }
+}
+
+/// Fetch and unwrap `data` / `models` arrays from a provider's `/models`
+/// endpoint, returning readable diagnostics on failure.
+async fn load_model_items(gw: &Gateway, provider_id: &str) -> Result<Vec<Value>, String> {
+    let cfg = gw.config();
+    let provider = cfg
+        .provider(provider_id)
+        .cloned()
+        .ok_or_else(|| "供应商不存在。".to_string())?;
+    let accounts = cfg.accounts_of(provider_id);
+    let key = accounts
+        .iter()
+        .find(|account| account.enabled && !account.api_key.is_empty())
+        .or_else(|| accounts.iter().find(|account| !account.api_key.is_empty()))
+        .and_then(|account| gw.master.decrypt(&account.api_key).ok())
+        .unwrap_or_default();
+    let url = models_endpoint(&provider);
+    let timeout = provider.timeout_secs.unwrap_or(20).max(5);
+    let resp = send_probe(gw, &provider, &key, "GET", &url, None, timeout).await;
+    if let Some(err) = resp.error {
+        return Err(format!("无法连接上游：{err}"));
+    }
+    let Some(status) = resp.status else {
+        return Err("上游没有返回 HTTP 状态。".into());
+    };
+    if status == 401 || status == 403 {
+        return Err(format!("上游鉴权失败（HTTP {status}），请先检查账号 Key。"));
+    }
+    if status != 200 {
+        return Err(format!("上游模型列表返回 HTTP {status}。"));
+    }
+    let value: Value = serde_json::from_str(&resp.body)
+        .map_err(|err| format!("上游模型列表不是合法 JSON：{err}"))?;
+    let items = value
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| value.get("models").and_then(Value::as_array))
+        .cloned()
+        .or_else(|| value.as_array().cloned())
+        .unwrap_or_default();
+    Ok(items)
 }
 
 /// Minimal side-effect-free probe used by the half-open recovery task.

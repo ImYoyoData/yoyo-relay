@@ -6,7 +6,7 @@ use crate::config::{now_ts, Account};
 use crate::scheduler::AccountState;
 use crate::snapshot::NoticeLevel;
 
-use super::{theme, widgets, App, ConfirmAction, Page};
+use super::{brands, theme, widgets, App, ConfirmAction, Page};
 
 impl App {
     pub(crate) fn page_accounts(&mut self, ui: &mut egui::Ui) {
@@ -95,13 +95,14 @@ impl App {
             let healthy = health.as_ref().map(|h| h.healthy).unwrap_or(0);
             let balance_text = health
                 .as_ref()
-                .filter(|h| h.balance_known)
-                .map(|h| widgets::format_money(h.balance, &h.currency));
+                .filter(|h| h.balance_known())
+                .map(|h| widgets::format_currency_totals(&h.balances));
             let mut add_for_provider = None;
             let provider_id = provider.id.clone();
+            let provider_brand = brands::for_provider(&provider);
             super::kit::surface(ui, |ui| {
                 ui.horizontal(|ui| {
-                    super::kit::icon_chip(ui, icons::HARD_DRIVES, theme::ACCENT, 34.0);
+                    brands::tile(ui, &provider_brand, 34.0).on_hover_text(&provider.name);
                     ui.add_space(2.0);
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {

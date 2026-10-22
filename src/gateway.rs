@@ -10,7 +10,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -22,7 +22,7 @@ use crate::protocol::{
     self, build_upstream_body, convert_nonstream_response, extract_nonstream_usage, is_stream,
     Ingress, SseDecoder, StreamTranslator, Usage,
 };
-use crate::scheduler::{AccountSlot, FailureKind, Scheduler};
+use crate::scheduler::{AccountSlot, AccountState, FailureKind, Scheduler};
 
 // ---------------------------------------------------------------------------
 // Concurrency gate (queue with bounded capacity)
@@ -220,22 +220,16 @@ impl Gateway {
     /// Loopback upstreams (local mock servers, LM Studio, Ollama, ...) must not
     /// be sent through the system HTTP proxy.
     pub(crate) fn client_for(&self, url: &str) -> &reqwest::Client {
-        let loopback = reqwest::Url::parse(url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
-            .map(|host| {
-                host.eq_ignore_ascii_case("localhost")
-                    || host
-                        .parse::<std::net::IpAddr>()
-                        .map(|ip| ip.is_loopback())
-                        .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        if loopback {
+        if is_loopback_url(url) {
             &self.http_local
         } else {
             &self.http
         }
+    }
+
+    /// A client that always bypasses the system HTTP proxy.
+    pub(crate) fn direct_client(&self) -> &reqwest::Client {
+        &self.http_local
     }
 
     pub fn endpoint(&self) -> String {
@@ -246,6 +240,16 @@ impl Gateway {
             cfg.server.bind.as_str()
         };
         format!("http://{host}:{}", cfg.server.port)
+    }
+
+    /// API base clients should configure (OpenAI SDK `base_url`, Anthropic
+    /// `base_url`, and Responses clients all use this prefix).
+    pub fn api_base(&self) -> String {
+        format!("{}/v1", self.endpoint())
+    }
+
+    pub fn models_url(&self) -> String {
+        format!("{}/models", self.api_base())
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -446,6 +450,53 @@ pub(crate) fn upstream_url_public(provider: &Provider, protocol: Protocol) -> St
     upstream_url(provider, protocol)
 }
 
+/// Is this URL a loopback/LAN-local endpoint that must bypass the proxy?
+pub(crate) fn is_loopback_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .map(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// Build one upstream request. Used twice when the proxy attempt fails and a
+/// direct retry is enabled, so both attempts share identical headers/body.
+fn build_upstream_request(
+    client: &reqwest::Client,
+    provider: &Provider,
+    api_key: &str,
+    url: &str,
+    body: &Value,
+    stream_requested: bool,
+    upstream_protocol: Protocol,
+) -> Result<reqwest::RequestBuilder> {
+    let mut req = client
+        .post(url)
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(body);
+    if stream_requested {
+        req = req.header(header::ACCEPT, "text/event-stream");
+    }
+    req = apply_auth(req, &provider.auth, api_key)?;
+    for h in &provider.extra_headers {
+        if !h.name.trim().is_empty() {
+            req = req.header(h.name.trim(), h.value.as_str());
+        }
+    }
+    if upstream_protocol == Protocol::AnthropicMessages
+        && !has_header(&provider.extra_headers, "anthropic-version")
+    {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+    Ok(req)
+}
+
 pub(crate) fn apply_auth(
     mut req: reqwest::RequestBuilder,
     auth: &AuthConfig,
@@ -502,6 +553,27 @@ pub(crate) fn readable_reqwest_error(err: &reqwest::Error) -> String {
     }
 }
 
+enum FirstChunkError {
+    Slow,
+    Closed,
+    Network(String),
+}
+
+/// Wait for the first body chunk (or first SSE chunk) with a dedicated
+/// deadline. Returns the chunk plus the response so the rest can be streamed
+/// without buffering the whole body.
+async fn read_first_chunk(
+    mut resp: reqwest::Response,
+    deadline_secs: u64,
+) -> std::result::Result<(Bytes, reqwest::Response), FirstChunkError> {
+    match tokio::time::timeout(Duration::from_secs(deadline_secs.max(1)), resp.chunk()).await {
+        Err(_) => Err(FirstChunkError::Slow),
+        Ok(Err(err)) => Err(FirstChunkError::Network(readable_reqwest_error(&err))),
+        Ok(Ok(None)) => Err(FirstChunkError::Closed),
+        Ok(Ok(Some(bytes))) => Ok((bytes, resp)),
+    }
+}
+
 fn truncate_text(text: &str, max: usize) -> String {
     let mut out = String::new();
     for (i, ch) in text.chars().enumerate() {
@@ -554,7 +626,7 @@ async fn health_handler(State(gw): State<Arc<Gateway>>) -> Response {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": now_ts() - gw.started_at,
-        "models": cfg.client_models(),
+        "models": cfg.servable_models(),
     }))
     .into_response()
 }
@@ -566,20 +638,13 @@ async fn models_handler(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> R
     };
     let cfg = gw.config();
     let models: Vec<String> = cfg
-        .client_models()
+        .servable_models()
         .into_iter()
         .filter(|m| auth.key.as_ref().map(|k| k.allows_model(m)).unwrap_or(true))
         .collect();
     let data: Vec<Value> = models
         .iter()
-        .map(|m| {
-            json!({
-                "id": m,
-                "object": "model",
-                "owned_by": "yoyo-relay",
-                "created": gw.started_at,
-            })
-        })
+        .map(|model| model_object(&cfg, model, gw.started_at))
         .collect();
     Json(json!({
         "object": "list",
@@ -589,6 +654,98 @@ async fn models_handler(State(gw): State<Arc<Gateway>>, headers: HeaderMap) -> R
         "last_id": models.last(),
     }))
     .into_response()
+}
+
+/// OpenAI `models` entry plus the metadata gateways commonly expose
+/// (Anthropic-compatible `type` / `created_at` and capability fields).
+fn model_object(cfg: &AppConfig, model: &str, fallback_created: i64) -> Value {
+    let routes = cfg.routes_for(model);
+    let profile = cfg.model_profile(model);
+    let created = profile
+        .map(|p| p.created_at)
+        .filter(|ts| *ts > 0)
+        .or_else(|| {
+            routes
+                .iter()
+                .map(|r| r.created_at)
+                .filter(|ts| *ts > 0)
+                .min()
+        })
+        .unwrap_or(fallback_created);
+    let created_at = chrono::DateTime::from_timestamp(created, 0)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default();
+    let context = profile
+        .and_then(|p| p.context_window)
+        .or_else(|| routes.iter().filter_map(|r| r.max_context_tokens).max());
+    let max_output = profile.and_then(|p| p.max_output_tokens);
+    let mut input_modalities = profile
+        .map(|p| p.input_modalities.clone())
+        .unwrap_or_else(|| vec!["text".to_string()]);
+    if input_modalities.is_empty() {
+        input_modalities.push("text".to_string());
+    }
+    let route_vision = routes.iter().any(|r| {
+        r.capabilities
+            .iter()
+            .any(|c| matches!(c.as_str(), "vision" | "image" | "images" | "multimodal"))
+    });
+    if route_vision && !input_modalities.iter().any(|m| m == "image") {
+        input_modalities.push("image".to_string());
+    }
+    let output_modalities = profile
+        .map(|p| p.output_modalities.clone())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| vec!["text".to_string()]);
+    let reasoning_levels = profile
+        .map(|p| p.reasoning_levels.clone())
+        .unwrap_or_default();
+    let route_tools = routes.iter().any(|r| {
+        r.capabilities
+            .iter()
+            .any(|c| matches!(c.as_str(), "tools" | "tool" | "function_calling"))
+    });
+    let supports_tools = profile.map(|p| p.supports_tools).unwrap_or(true) || route_tools;
+    let supports_streaming = profile.map(|p| p.supports_streaming).unwrap_or(true);
+    let vision = input_modalities.iter().any(|m| m == "image");
+    let display_name = profile
+        .map(|p| p.display_name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| model.to_string());
+    let description = profile.map(|p| p.description.clone()).unwrap_or_default();
+    let owned_by = profile
+        .map(|p| p.owned_by.clone())
+        .filter(|owner| !owner.trim().is_empty())
+        .unwrap_or_else(|| "yoyo-relay".to_string());
+    json!({
+        "id": model,
+        "object": "model",
+        "type": "model",
+        "created": created,
+        "created_at": created_at,
+        "owned_by": owned_by,
+        "display_name": display_name,
+        "description": description,
+        "context_window": context,
+        "context_length": context,
+        "max_output_tokens": max_output,
+        "max_tokens": max_output,
+        "input_modalities": input_modalities,
+        "output_modalities": output_modalities,
+        "architecture": {
+            "input_modalities": input_modalities.clone(),
+            "output_modalities": output_modalities.clone(),
+        },
+        "capabilities": {
+            "chat": true,
+            "streaming": supports_streaming,
+            "tools": supports_tools,
+            "vision": vision,
+            "reasoning": !reasoning_levels.is_empty(),
+        },
+        "reasoning_levels": reasoning_levels.clone(),
+        "supported_reasoning_levels": reasoning_levels,
+    })
 }
 
 async fn chat_handler(
@@ -709,6 +866,18 @@ async fn chat_handler(
 
     for attempt in &chain.attempts {
         attempts_made += 1;
+        // The chain is built before the first request. If an earlier attempt
+        // in this same request cooled the account, do not try it again for a
+        // second route — move on to the next account/provider.
+        let attempt_state = gw.scheduler.state_of(&attempt.account, now_ts());
+        if !matches!(attempt_state, AccountState::Healthy) {
+            errors.push(format!(
+                "账号「{}」当前不可用（{}），已跳过",
+                attempt.account.name,
+                attempt_state.badge()
+            ));
+            continue;
+        }
         let Some(slot) = gw
             .scheduler
             .try_acquire_slot(&attempt.account.id, attempt.account.max_concurrency)
@@ -744,15 +913,25 @@ async fn chat_handler(
             }
         };
         let url = upstream_url(&attempt.provider, attempt.upstream_protocol);
-        let mut req = gw
-            .client_for(&url)
-            .post(&url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(&upstream_body);
-        if stream_requested {
-            req = req.header(header::ACCEPT, "text/event-stream");
-        }
-        req = match apply_auth(req, &attempt.provider.auth, &api_key) {
+        let timeout_secs = attempt
+            .provider
+            .timeout_secs
+            .unwrap_or(cfg.server.upstream_timeout_secs)
+            .max(5);
+        let slow_secs = if cfg.scheduler.slow_switch {
+            cfg.scheduler.slow_first_byte_secs.clamp(3, timeout_secs)
+        } else {
+            0
+        };
+        let request = match build_upstream_request(
+            gw.client_for(&url),
+            &attempt.provider,
+            &api_key,
+            &url,
+            &upstream_body,
+            stream_requested,
+            attempt.upstream_protocol,
+        ) {
             Ok(r) => r,
             Err(err) => {
                 errors.push(format!(
@@ -762,23 +941,36 @@ async fn chat_handler(
                 continue;
             }
         };
-        for h in &attempt.provider.extra_headers {
-            if !h.name.trim().is_empty() {
-                req = req.header(h.name.trim(), h.value.as_str());
+        let mut send_result =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), request.send()).await;
+        let transport_failed = match &send_result {
+            // Overall request timeout: do not double the wait with a direct
+            // retry, the slow-switch path handles it.
+            Err(_) => false,
+            Ok(Err(err)) => err.is_connect() || err.is_request(),
+            Ok(Ok(_)) => false,
+        };
+        // If the system proxy cannot reach the upstream, retry the same
+        // account directly before burning a switch.
+        if transport_failed && cfg.server.direct_fallback && !is_loopback_url(&url) {
+            if let Ok(direct_req) = build_upstream_request(
+                gw.direct_client(),
+                &attempt.provider,
+                &api_key,
+                &url,
+                &upstream_body,
+                stream_requested,
+                attempt.upstream_protocol,
+            ) {
+                errors.push(format!(
+                    "账号「{}」代理连接失败，已尝试直连",
+                    attempt.account.name
+                ));
+                send_result =
+                    tokio::time::timeout(Duration::from_secs(timeout_secs), direct_req.send())
+                        .await;
             }
         }
-        if attempt.upstream_protocol == Protocol::AnthropicMessages
-            && !has_header(&attempt.provider.extra_headers, "anthropic-version")
-        {
-            req = req.header("anthropic-version", "2023-06-01");
-        }
-        let timeout_secs = attempt
-            .provider
-            .timeout_secs
-            .unwrap_or(cfg.server.upstream_timeout_secs)
-            .max(5);
-
-        let send_result = tokio::time::timeout(Duration::from_secs(timeout_secs), req.send()).await;
 
         let resp = match send_result {
             Err(_) => {
@@ -817,6 +1009,85 @@ async fn chat_handler(
                 .to_string();
             let is_sse = content_type.contains("text/event-stream");
             if stream_requested && is_sse {
+                let first_deadline = if slow_secs > 0 {
+                    slow_secs
+                } else {
+                    timeout_secs
+                };
+                let (first, resp) = match read_first_chunk(resp, first_deadline).await {
+                    Ok(value) => value,
+                    Err(FirstChunkError::Slow) => {
+                        errors.push(format!(
+                            "账号「{}」{}超过 {}s，自动切换",
+                            attempt.account.name,
+                            if slow_secs > 0 {
+                                "首包"
+                            } else {
+                                "读取首包"
+                            },
+                            first_deadline
+                        ));
+                        gw.scheduler.on_failure(
+                            &attempt.account,
+                            if slow_secs > 0 {
+                                FailureKind::Slow
+                            } else {
+                                FailureKind::Timeout
+                            },
+                            &cfg.scheduler,
+                        );
+                        last_failure =
+                            Some((attempt.account.id.clone(), attempt.provider.id.clone()));
+                        last_status = StatusCode::GATEWAY_TIMEOUT;
+                        continue;
+                    }
+                    Err(FirstChunkError::Closed) => {
+                        errors.push(format!(
+                            "账号「{}」在返回首包前关闭了连接",
+                            attempt.account.name
+                        ));
+                        gw.scheduler.on_failure(
+                            &attempt.account,
+                            FailureKind::Server,
+                            &cfg.scheduler,
+                        );
+                        last_failure =
+                            Some((attempt.account.id.clone(), attempt.provider.id.clone()));
+                        last_status = StatusCode::BAD_GATEWAY;
+                        continue;
+                    }
+                    Err(FirstChunkError::Network(err)) => {
+                        errors.push(format!(
+                            "账号「{}」读取首包失败：{err}",
+                            attempt.account.name
+                        ));
+                        gw.scheduler.on_failure(
+                            &attempt.account,
+                            FailureKind::Network,
+                            &cfg.scheduler,
+                        );
+                        last_failure =
+                            Some((attempt.account.id.clone(), attempt.provider.id.clone()));
+                        last_status = StatusCode::BAD_GATEWAY;
+                        continue;
+                    }
+                };
+                // Re-attach the already-read chunk so the translator sees the
+                // complete stream without dropping the first SSE event.
+                let upstream = async_stream::stream! {
+                    yield Ok::<Bytes, reqwest::Error>(first);
+                    let mut resp = resp;
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => yield Ok(chunk),
+                            Ok(None) => break,
+                            Err(err) => {
+                                yield Err(err);
+                                break;
+                            }
+                        }
+                    }
+                };
                 let translator = StreamTranslator::new(
                     ingress.protocol().unwrap_or(Protocol::OpenAiChat),
                     attempt.upstream_protocol,
@@ -841,7 +1112,7 @@ async fn chat_handler(
                     failed: false,
                 };
                 let body = build_sse_body(
-                    resp,
+                    upstream,
                     translator,
                     finalizer,
                     usage_cell,
@@ -873,8 +1144,63 @@ async fn chat_handler(
             }
 
             // Non-streaming (or the upstream ignored `stream`).
+            let first_deadline = if slow_secs > 0 {
+                slow_secs
+            } else {
+                timeout_secs
+            };
+            let (first, resp) = match read_first_chunk(resp, first_deadline).await {
+                Ok(value) => value,
+                Err(FirstChunkError::Slow) => {
+                    errors.push(format!(
+                        "账号「{}」{}超过 {}s，自动切换",
+                        attempt.account.name,
+                        if slow_secs > 0 {
+                            "首包"
+                        } else {
+                            "读取首包"
+                        },
+                        first_deadline
+                    ));
+                    gw.scheduler.on_failure(
+                        &attempt.account,
+                        if slow_secs > 0 {
+                            FailureKind::Slow
+                        } else {
+                            FailureKind::Timeout
+                        },
+                        &cfg.scheduler,
+                    );
+                    last_failure = Some((attempt.account.id.clone(), attempt.provider.id.clone()));
+                    last_status = StatusCode::GATEWAY_TIMEOUT;
+                    continue;
+                }
+                Err(FirstChunkError::Closed) => {
+                    errors.push(format!(
+                        "账号「{}」返回了空响应（首包前关闭）",
+                        attempt.account.name
+                    ));
+                    gw.scheduler
+                        .on_failure(&attempt.account, FailureKind::Server, &cfg.scheduler);
+                    last_failure = Some((attempt.account.id.clone(), attempt.provider.id.clone()));
+                    last_status = StatusCode::BAD_GATEWAY;
+                    continue;
+                }
+                Err(FirstChunkError::Network(err)) => {
+                    errors.push(format!(
+                        "账号「{}」读取首包失败：{err}",
+                        attempt.account.name
+                    ));
+                    gw.scheduler
+                        .on_failure(&attempt.account, FailureKind::Network, &cfg.scheduler);
+                    last_failure = Some((attempt.account.id.clone(), attempt.provider.id.clone()));
+                    last_status = StatusCode::BAD_GATEWAY;
+                    continue;
+                }
+            };
             let read = tokio::time::timeout(Duration::from_secs(timeout_secs), resp.bytes()).await;
-            let bytes = match read {
+            let mut bytes = first.to_vec();
+            match read {
                 Err(_) => {
                     errors.push(format!("账号「{}」读取响应超时", attempt.account.name));
                     gw.scheduler
@@ -892,8 +1218,8 @@ async fn chat_handler(
                     last_status = StatusCode::BAD_GATEWAY;
                     continue;
                 }
-                Ok(Ok(b)) => b,
-            };
+                Ok(Ok(rest)) => bytes.extend_from_slice(&rest),
+            }
             let upstream_json: Value = match serde_json::from_slice(&bytes) {
                 Ok(v) => v,
                 Err(err) => {
@@ -1199,15 +1525,18 @@ impl Drop for StreamFinalizer {
     }
 }
 
-fn build_sse_body(
-    resp: reqwest::Response,
+fn build_sse_body<S>(
+    upstream: S,
     mut translator: StreamTranslator,
     mut finalizer: StreamFinalizer,
     usage_cell: Arc<Mutex<Usage>>,
     idle_timeout: Duration,
-) -> Body {
+) -> Body
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+{
     let stream = async_stream::stream! {
-        let mut upstream = resp.bytes_stream();
+        futures_util::pin_mut!(upstream);
         let mut decoder = SseDecoder::default();
         let mut hard_failed = false;
         loop {
@@ -1427,6 +1756,11 @@ async fn generic_handler(
             .timeout_secs
             .unwrap_or(cfg.server.upstream_timeout_secs)
             .max(5);
+        let slow_secs = if cfg.scheduler.slow_switch {
+            cfg.scheduler.slow_first_byte_secs.clamp(3, timeout)
+        } else {
+            0
+        };
         let resp = match tokio::time::timeout(Duration::from_secs(timeout), req.send()).await {
             Err(_) => {
                 gw.scheduler
@@ -1454,14 +1788,51 @@ async fn generic_handler(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
-            let bytes = match tokio::time::timeout(Duration::from_secs(timeout), resp.bytes()).await
-            {
-                Ok(Ok(b)) => b,
-                _ => {
-                    errors.push(format!("账号「{}」读取响应失败", attempt.account.name));
+            let first_deadline = if slow_secs > 0 { slow_secs } else { timeout };
+            let (first, resp) = match read_first_chunk(resp, first_deadline).await {
+                Ok(value) => value,
+                Err(FirstChunkError::Slow) => {
+                    gw.scheduler.on_failure(
+                        &attempt.account,
+                        if slow_secs > 0 {
+                            FailureKind::Slow
+                        } else {
+                            FailureKind::Timeout
+                        },
+                        &cfg.scheduler,
+                    );
+                    errors.push(format!(
+                        "账号「{}」首包超过 {}s，自动切换",
+                        attempt.account.name, first_deadline
+                    ));
+                    continue;
+                }
+                Err(FirstChunkError::Closed) => {
+                    gw.scheduler
+                        .on_failure(&attempt.account, FailureKind::Server, &cfg.scheduler);
+                    errors.push(format!("账号「{}」返回空响应", attempt.account.name));
+                    continue;
+                }
+                Err(FirstChunkError::Network(err)) => {
+                    gw.scheduler
+                        .on_failure(&attempt.account, FailureKind::Network, &cfg.scheduler);
+                    errors.push(format!(
+                        "账号「{}」读取首包失败：{err}",
+                        attempt.account.name
+                    ));
                     continue;
                 }
             };
+            let mut bytes = first.to_vec();
+            match tokio::time::timeout(Duration::from_secs(timeout), resp.bytes()).await {
+                Ok(Ok(rest)) => bytes.extend_from_slice(&rest),
+                _ => {
+                    gw.scheduler
+                        .on_failure(&attempt.account, FailureKind::Network, &cfg.scheduler);
+                    errors.push(format!("账号「{}」读取响应失败", attempt.account.name));
+                    continue;
+                }
+            }
             let usage = extract_generic_usage(&bytes);
             let latency = started.elapsed().as_millis() as u64;
             gw.scheduler.on_success(&attempt.account.id);

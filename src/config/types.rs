@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Top-level configuration
@@ -16,6 +18,8 @@ pub struct AppConfig {
     pub providers: Vec<Provider>,
     pub accounts: Vec<Account>,
     pub routes: Vec<ModelRoute>,
+    /// Client-facing model metadata. Routes reference these by client model name.
+    pub model_profiles: Vec<ClientModelProfile>,
     pub local_keys: Vec<LocalKey>,
 }
 
@@ -29,6 +33,7 @@ impl Default for AppConfig {
             providers: Vec::new(),
             accounts: Vec::new(),
             routes: Vec::new(),
+            model_profiles: Vec::new(),
             local_keys: Vec::new(),
         }
     }
@@ -67,17 +72,76 @@ impl AppConfig {
         routes
     }
 
-    /// All distinct client models exposed by enabled routes.
+    /// All routes for a client model, including disabled ones. Used by the UI
+    /// so disabling an upstream never hides it from the route page.
+    pub fn all_routes_for(&self, client_model: &str) -> Vec<ModelRoute> {
+        let mut routes: Vec<_> = self
+            .routes
+            .iter()
+            .filter(|r| r.client_model == client_model)
+            .cloned()
+            .collect();
+        routes.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        routes
+    }
+
+    /// All distinct client models known to the configuration, including
+    /// disabled routes and profile-only entries.
     pub fn client_models(&self) -> Vec<String> {
         let mut models: Vec<String> = self
             .routes
             .iter()
-            .filter(|r| r.enabled)
+            .map(|r| r.client_model.clone())
+            .chain(self.model_profiles.iter().map(|p| p.client_model.clone()))
+            .collect();
+        models.sort();
+        models.dedup();
+        models
+    }
+
+    /// Models that can actually receive traffic (at least one enabled route
+    /// and, when present, an enabled model profile).
+    pub fn servable_models(&self) -> Vec<String> {
+        let mut models: Vec<String> = self
+            .routes
+            .iter()
+            .filter(|r| r.enabled && self.model_enabled(&r.client_model))
             .map(|r| r.client_model.clone())
             .collect();
         models.sort();
         models.dedup();
         models
+    }
+
+    pub fn model_enabled(&self, client_model: &str) -> bool {
+        self.model_profile(client_model)
+            .map(|profile| profile.enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn model_profile(&self, client_model: &str) -> Option<&ClientModelProfile> {
+        self.model_profiles
+            .iter()
+            .find(|p| p.client_model == client_model)
+    }
+
+    /// Mapping-level fallback configured on the model profile first, then on
+    /// any route (legacy layout).
+    pub fn fallback_for(&self, client_model: &str) -> Option<String> {
+        self.model_profile(client_model)
+            .and_then(|p| p.fallback_client_model.clone())
+            .filter(|m| !m.trim().is_empty() && m != client_model)
+            .or_else(|| {
+                self.routes
+                    .iter()
+                    .find(|r| r.client_model == client_model)
+                    .and_then(|r| r.fallback_client_model.clone())
+                    .filter(|m| !m.trim().is_empty() && m != client_model)
+            })
     }
 
     pub fn accounts_of(&self, provider_id: &str) -> Vec<Account> {
@@ -104,6 +168,9 @@ pub struct ServerConfig {
     pub queue_timeout_secs: u64,
     pub upstream_timeout_secs: u64,
     pub stream_idle_timeout_secs: u64,
+    /// Retry the same account through a direct (no proxy) client when the
+    /// system-proxy connection fails.
+    pub direct_fallback: bool,
     pub cors: bool,
 }
 
@@ -118,6 +185,7 @@ impl Default for ServerConfig {
             queue_timeout_secs: 30,
             upstream_timeout_secs: 120,
             stream_idle_timeout_secs: 120,
+            direct_fallback: true,
             cors: true,
         }
     }
@@ -138,6 +206,13 @@ pub struct SchedulerConfig {
     pub breaker_cooldown_secs: u64,
     pub half_open_probe_secs: u64,
     pub quota_cache_secs: u64,
+    /// Detect slow first bytes / first SSE chunks and switch to the next
+    /// account (same provider first, then other providers).
+    pub slow_switch: bool,
+    /// Deadline for the first byte of a response (or first SSE chunk).
+    pub slow_first_byte_secs: u64,
+    /// Cooldown applied to an account that exceeded the slow deadline.
+    pub slow_cooldown_secs: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -153,6 +228,9 @@ impl Default for SchedulerConfig {
             breaker_cooldown_secs: 30,
             half_open_probe_secs: 10,
             quota_cache_secs: 10,
+            slow_switch: true,
+            slow_first_byte_secs: 20,
+            slow_cooldown_secs: 30,
         }
     }
 }
@@ -164,6 +242,82 @@ pub enum ThemeMode {
     Light,
     Dark,
     System,
+}
+
+/// Live taskbar badge composition and placement (Windows).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct TaskbarBadgeConfig {
+    /// Show the proxy status text (running/stopped) as the first fragment.
+    pub show_status: bool,
+    /// Show the colored status dot.
+    pub show_dot: bool,
+    pub show_active: bool,
+    pub show_tokens: bool,
+    pub show_requests: bool,
+    pub show_queued: bool,
+    pub show_success: bool,
+    pub show_cost: bool,
+    /// Overall scale of the badge (text, padding and height).
+    pub scale: f32,
+    /// Horizontal nudge in physical pixels, relative to the default anchor.
+    pub offset_x: i32,
+    /// Vertical nudge in physical pixels, relative to the taskbar center.
+    pub offset_y: i32,
+    /// Distance in physical pixels between the badge and the notification area.
+    pub gap: i32,
+    /// Whole-badge opacity, 0.25 – 1.0.
+    pub opacity: f32,
+}
+
+impl Default for TaskbarBadgeConfig {
+    fn default() -> Self {
+        Self {
+            show_status: false,
+            show_dot: true,
+            show_active: true,
+            show_tokens: true,
+            show_requests: false,
+            show_queued: false,
+            show_success: true,
+            show_cost: false,
+            scale: 1.0,
+            offset_x: 0,
+            offset_y: 0,
+            gap: 10,
+            opacity: 0.95,
+        }
+    }
+}
+
+impl TaskbarBadgeConfig {
+    pub fn normalized(&self) -> Self {
+        let mut copy = self.clone();
+        copy.scale = if copy.scale.is_finite() {
+            copy.scale.clamp(0.6, 2.2)
+        } else {
+            1.0
+        };
+        copy.opacity = if copy.opacity.is_finite() {
+            copy.opacity.clamp(0.25, 1.0)
+        } else {
+            1.0
+        };
+        copy.offset_x = copy.offset_x.clamp(-400, 400);
+        copy.offset_y = copy.offset_y.clamp(-80, 80);
+        copy.gap = copy.gap.clamp(0, 80);
+        copy
+    }
+
+    pub fn has_content(&self) -> bool {
+        self.show_status
+            || self.show_active
+            || self.show_tokens
+            || self.show_requests
+            || self.show_queued
+            || self.show_success
+            || self.show_cost
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -184,8 +338,58 @@ pub struct UiConfig {
     pub sidebar_width: f32,
     pub ui_scale: f32,
     pub balance_refresh_mins: u64,
+    /// Legacy/global fallback threshold. Per-currency values in
+    /// `low_balance_thresholds` take precedence.
     pub low_balance_threshold: f64,
+    /// Currency-specific low-balance thresholds, keyed by ISO code.
+    pub low_balance_thresholds: BTreeMap<String, f64>,
+    /// Currency units per 1 USD, used to estimate manual balances from
+    /// USD-priced route costs and to show a CNY-converted total. Missing
+    /// entries are treated as 1.0.
+    pub fx_rates: BTreeMap<String, f64>,
+    /// Fetch live exchange rates instead of relying only on the manual values.
+    pub fx_auto: bool,
+    /// How often live rates are refreshed, in hours.
+    pub fx_refresh_hours: u64,
+    /// Unix timestamp of the last successful live-rate refresh.
+    pub fx_updated_at: i64,
+    /// Human-readable source of the last live-rate refresh.
+    pub fx_source: String,
+    /// Windows taskbar badge composition and placement.
+    pub taskbar: TaskbarBadgeConfig,
     pub onboarding_done: bool,
+}
+
+impl UiConfig {
+    pub fn threshold_for(&self, currency: &str) -> f64 {
+        self.low_balance_thresholds
+            .get(&normalize_currency(currency))
+            .copied()
+            .unwrap_or(self.low_balance_threshold)
+    }
+
+    /// Units of `currency` per 1 USD.
+    pub fn fx_rate(&self, currency: &str) -> f64 {
+        let currency = normalize_currency(currency);
+        if currency == "USD" {
+            return 1.0;
+        }
+        self.fx_rates
+            .get(&currency)
+            .copied()
+            .filter(|rate| *rate > 0.0)
+            .unwrap_or(1.0)
+    }
+
+    /// Convert between two currencies using the USD-based rate table.
+    pub fn fx_convert(&self, amount: f64, from: &str, to: &str) -> f64 {
+        let from = self.fx_rate(from);
+        let to = self.fx_rate(to);
+        if from <= 0.0 {
+            return amount;
+        }
+        amount * to / from
+    }
 }
 
 impl Default for UiConfig {
@@ -203,6 +407,16 @@ impl Default for UiConfig {
             ui_scale: 0.0,
             balance_refresh_mins: 10,
             low_balance_threshold: 5.0,
+            low_balance_thresholds: BTreeMap::from([
+                ("USD".to_string(), 5.0),
+                ("CNY".to_string(), 35.0),
+            ]),
+            fx_rates: BTreeMap::from([("USD".to_string(), 1.0), ("CNY".to_string(), 7.2)]),
+            fx_auto: true,
+            fx_refresh_hours: 12,
+            fx_updated_at: 0,
+            fx_source: String::new(),
+            taskbar: TaskbarBadgeConfig::default(),
             onboarding_done: false,
         }
     }
@@ -583,6 +797,10 @@ pub struct BalanceConfig {
     pub manual_updated_at: i64,
     pub url: Option<String>,
     pub json_path: String,
+    /// Optional arithmetic expression over JSON paths, e.g.
+    /// `data.balance / 100` or `data.total - data.used`. When empty the value
+    /// at `json_path` is used as-is.
+    pub formula: String,
     pub scale: f64,
     pub currency: String,
 }
@@ -595,6 +813,7 @@ impl Default for BalanceConfig {
             manual_updated_at: 0,
             url: None,
             json_path: "balance".to_string(),
+            formula: String::new(),
             scale: 1.0,
             currency: "USD".to_string(),
         }
@@ -710,6 +929,53 @@ impl ModelRoute {
 }
 
 // ---------------------------------------------------------------------------
+// Client-facing model metadata
+// ---------------------------------------------------------------------------
+
+/// Metadata advertised by `GET /v1/models` for one client model.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct ClientModelProfile {
+    pub client_model: String,
+    pub display_name: String,
+    pub description: String,
+    pub owned_by: String,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    /// text / image / audio / file
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+    /// Free-form effort names such as off, low, medium, high.
+    pub reasoning_levels: Vec<String>,
+    pub supports_tools: bool,
+    pub supports_streaming: bool,
+    pub fallback_client_model: Option<String>,
+    pub enabled: bool,
+    pub created_at: i64,
+}
+
+impl Default for ClientModelProfile {
+    fn default() -> Self {
+        Self {
+            client_model: String::new(),
+            display_name: String::new(),
+            description: String::new(),
+            owned_by: "yoyo-relay".to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+            reasoning_levels: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            fallback_client_model: None,
+            enabled: true,
+            created_at: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Local keys
 // ---------------------------------------------------------------------------
 
@@ -795,5 +1061,14 @@ pub fn fmt_duration_secs(secs: i64) -> String {
         format!("{m}m{s:02}s")
     } else {
         format!("{s}s")
+    }
+}
+
+pub fn normalize_currency(currency: &str) -> String {
+    let value = currency.trim().to_ascii_uppercase();
+    match value.as_str() {
+        "" => "USD".to_string(),
+        "RMB" => "CNY".to_string(),
+        _ => value,
     }
 }

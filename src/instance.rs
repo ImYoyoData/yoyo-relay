@@ -29,6 +29,8 @@ pub struct Signals {
     /// Native window handle, used because a hidden window on Windows stops
     /// receiving redraw requests (so viewport commands alone cannot restore it).
     window: AtomicIsize,
+    hidden_style: AtomicIsize,
+    hidden_rect: Mutex<Option<(i32, i32, i32, i32)>>,
     quit_tx: Mutex<Option<mpsc::UnboundedSender<UiCommand>>>,
     info_path: Mutex<Option<PathBuf>>,
 }
@@ -108,14 +110,33 @@ impl Signals {
     #[cfg(windows)]
     fn show_native(&self) -> bool {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+            IsIconic, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+            GWL_EXSTYLE, HWND_TOP, SWP_FRAMECHANGED, SWP_NOACTIVATE, SW_RESTORE, SW_SHOW,
         };
         let hwnd = self.window.load(Ordering::SeqCst);
         if hwnd == 0 {
             return false;
         }
         let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        let rect = self
+            .hidden_rect
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let style = self.hidden_style.load(Ordering::SeqCst);
         unsafe {
+            if let Some((x, y, width, height)) = rect {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOP,
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
             ShowWindow(hwnd, SW_SHOW);
             if IsIconic(hwnd) != 0 {
                 ShowWindow(hwnd, SW_RESTORE);
@@ -125,8 +146,70 @@ impl Signals {
         true
     }
 
+    /// Hide the window from the taskbar while keeping it visible to Windows so
+    /// the egui loop keeps painting (and tray stats keep updating). A fully
+    /// hidden window stops receiving redraw requests.
+    #[cfg(windows)]
+    pub fn hide_native(&self) -> bool {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+            GWL_EXSTYLE, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+            WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        };
+        let raw = self.window.load(Ordering::SeqCst);
+        if raw == 0 {
+            return false;
+        }
+        let hwnd = raw as windows_sys::Win32::Foundation::HWND;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe {
+            if GetWindowRect(hwnd, &mut rect) == 0 {
+                return false;
+            }
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if let Ok(mut slot) = self.hidden_rect.lock() {
+                if slot.is_none() {
+                    self.hidden_style.store(style, Ordering::SeqCst);
+                    *slot = Some((
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                    ));
+                }
+            }
+            let hidden_style = (style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, hidden_style);
+            // Toggling visibility makes Explorer rebuild the taskbar entry with
+            // the new extended style; the window stays paintable afterwards.
+            ShowWindow(hwnd, SW_HIDE);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                HWND_BOTTOM,
+                -32000,
+                -32000,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        true
+    }
+
     #[cfg(not(windows))]
     fn show_native(&self) -> bool {
+        false
+    }
+
+    #[cfg(not(windows))]
+    pub fn hide_native(&self) -> bool {
         false
     }
 }

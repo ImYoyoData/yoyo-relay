@@ -31,7 +31,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="$(python3 .github/scripts/version.py)"
+          # Version source: Cargo.toml. Release notes source: CHANGELOG.md.
+          VERSION="$(python3 .github/scripts/version.py Cargo.toml)"
           TAG="v${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
@@ -47,7 +48,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 .github/scripts/release_notes.py "${{ steps.meta.outputs.version }}"
+          python3 .github/scripts/release_notes.py "${{ steps.meta.outputs.version }}" CHANGELOG.md
 
       - uses: actions/upload-artifact@v4
         if: steps.meta.outputs.skip != 'true'

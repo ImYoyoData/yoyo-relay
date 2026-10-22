@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::db::{RecentRequest, SeriesPoint, Totals};
 use crate::probe::TestResult;
@@ -93,6 +93,12 @@ pub struct TodayView {
     pub series: Vec<SeriesPoint>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CurrencyTotal {
+    pub currency: String,
+    pub amount: f64,
+}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct ProviderHealth {
@@ -106,14 +112,17 @@ pub struct ProviderHealth {
     pub exhausted: usize,
     pub disabled: usize,
     pub half_open: usize,
-    pub balance: f64,
-    pub balance_known: bool,
-    pub currency: String,
+    /// Balances are never summed across currencies.
+    pub balances: Vec<CurrencyTotal>,
 }
 
 impl ProviderHealth {
     pub fn all_unavailable(&self) -> bool {
         self.account_count > 0 && self.healthy == 0 && self.half_open == 0
+    }
+
+    pub fn balance_known(&self) -> bool {
+        !self.balances.is_empty()
     }
 }
 
@@ -209,6 +218,8 @@ pub struct UsageGroupView {
 pub struct UsageView {
     pub days: u32,
     pub dimension: UsageDimension,
+    /// Optional local-key filter (`None` means every key plus unauthenticated).
+    pub local_key: Option<String>,
     pub totals: Totals,
     pub groups: Vec<UsageGroupView>,
     pub model_pairs: Vec<(String, String, Totals)>,
@@ -222,6 +233,7 @@ impl Default for UsageView {
         Self {
             days: 7,
             dimension: UsageDimension::Global,
+            local_key: None,
             totals: Totals::default(),
             groups: Vec::new(),
             model_pairs: Vec::new(),
@@ -230,6 +242,36 @@ impl Default for UsageView {
             bucket_secs: 86_400,
         }
     }
+}
+
+/// Cached `/models` catalogue for one provider, fetched on demand by the route
+/// editor so upstream model names can be picked instead of typed.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderModelsView {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub models: Vec<String>,
+    pub ok: bool,
+    pub message: String,
+    pub at: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FetchedModelView {
+    pub id: u64,
+    pub client_model: String,
+    pub provider_name: String,
+    pub upstream_model: String,
+    pub ok: bool,
+    pub message: String,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+    pub reasoning_levels: Vec<String>,
+    pub supports_tools: Option<bool>,
+    pub supports_streaming: Option<bool>,
+    pub models_seen: usize,
 }
 
 #[derive(Clone)]
@@ -256,6 +298,16 @@ pub struct UiSnapshot {
     pub alerts: Vec<Alert>,
     pub warnings: Vec<String>,
     pub balance_refreshing: bool,
+    pub fetched_model: Option<FetchedModelView>,
+    pub model_fetch_running: bool,
+    /// Latest `/models` catalogue per provider id.
+    pub provider_models: HashMap<String, ProviderModelsView>,
+    pub models_fetching: HashSet<String>,
+    /// Live USD-based rate table plus refresh metadata.
+    pub fx_rates: BTreeMap<String, f64>,
+    pub fx_updated_at: i64,
+    pub fx_source: String,
+    pub fx_refreshing: bool,
     pub updated_at: i64,
 }
 
@@ -288,6 +340,14 @@ impl Default for UiSnapshot {
             alerts: Vec::new(),
             warnings: Vec::new(),
             balance_refreshing: false,
+            fetched_model: None,
+            model_fetch_running: false,
+            provider_models: HashMap::new(),
+            models_fetching: HashSet::new(),
+            fx_rates: BTreeMap::new(),
+            fx_updated_at: 0,
+            fx_source: String::new(),
+            fx_refreshing: false,
             updated_at: 0,
         }
     }

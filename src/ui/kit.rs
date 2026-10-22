@@ -431,19 +431,48 @@ pub fn kpi_card(ui: &mut Ui, icon: &str, label: &str, value: &str, sub: &str, co
         .inner_margin(egui::Margin::symmetric(16, 13))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(label).size(10.5).color(t.muted));
-                    ui.add_space(1.0);
-                    ui.label(RichText::new(value).size(25.0).strong().color(t.text));
-                });
+            let icon_size = 33.0;
+            let gap = 8.0;
+            let text_width = (ui.available_width() - icon_size - gap).max(54.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(text_width, 0.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(text_width);
+                        ui.label(RichText::new(label).size(10.5).color(t.muted));
+                        ui.add_space(1.0);
+                        fitted_value_label(ui, value, 25.0, 10.5, t.text);
+                    },
+                );
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                    icon_chip(ui, icon, color, 33.0);
+                    icon_chip(ui, icon, color, icon_size);
                 });
             });
             ui.add_space(2.0);
-            ui.label(RichText::new(sub).size(9.5).color(t.muted));
+            ui.add(egui::Label::new(RichText::new(sub).size(9.5).color(t.muted)).truncate());
         });
+}
+
+/// Draw a KPI value that shrinks until it fits the reserved text column. This
+/// keeps long multi-currency totals (e.g. `¥7.64 + $141.58`) from running under
+/// the card icon on narrow layouts.
+fn fitted_value_label(ui: &mut Ui, text: &str, base: f32, min: f32, color: Color32) {
+    let available = ui.available_width().max(24.0);
+    let mut size = base;
+    loop {
+        let fits = ui
+            .painter()
+            .layout_no_wrap(text.to_string(), FontId::proportional(size), color)
+            .size()
+            .x
+            <= available;
+        if fits || size <= min {
+            break;
+        }
+        size = (size - 1.0).max(min);
+    }
+    ui.add(egui::Label::new(RichText::new(text).size(size).strong().color(color)).truncate());
 }
 
 pub fn kpi_cards_from_snapshot(ui: &mut Ui, snapshot: &crate::snapshot::UiSnapshot) {
@@ -687,6 +716,7 @@ pub fn modal_shell(
                 ui.set_width(inner_width);
                 egui::ScrollArea::vertical()
                     .max_height(max_body)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .id_salt(id.with("body"))
                     .show(ui, body);
             });

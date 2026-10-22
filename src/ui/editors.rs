@@ -2,25 +2,29 @@ use egui::{ComboBox, Id, RichText, TextEdit};
 use egui_phosphor::regular as icons;
 
 use crate::config::{
-    new_id, now_ts, Account, AuthMode, BalanceConfig, BalanceMode, ModelRoute, PrefixRule,
-    Protocol, ProtocolStrategyMode, ProviderKind, QuotaConfig, QuotaWindow, RouteMode,
+    new_id, now_ts, Account, AuthMode, BalanceConfig, BalanceMode, ClientModelProfile, ModelRoute,
+    PrefixRule, Protocol, ProtocolStrategyMode, ProviderKind, QuotaConfig, QuotaWindow, RouteMode,
 };
 use crate::snapshot::NoticeLevel;
 
-use super::{theme, widgets};
+use super::{brands, theme, widgets};
 use super::{
     AccountDraft, App, ConfirmAction, Editor, LocalKeyDraft, ManualBalanceDraft, Page,
-    ProviderDraft, RouteDraft,
+    ProviderDraft, RouteDraft, RouteModelDraft,
 };
 
 impl App {
     // -- openers ------------------------------------------------------------
 
     pub(crate) fn open_new_provider(&mut self) {
-        let provider = self.store.preset_provider("openai");
+        self.open_new_provider_with_preset("openai");
+    }
+
+    pub(crate) fn open_new_provider_with_preset(&mut self, key: &str) {
+        let provider = self.store.preset_provider(key);
         self.editor = Some(Editor::Provider(ProviderDraft {
             is_new: true,
-            preset: "openai".into(),
+            preset: key.to_string(),
             provider,
         }));
     }
@@ -89,21 +93,71 @@ impl App {
         }
     }
 
-    pub(crate) fn open_new_route(&mut self) {
+    pub(crate) fn open_new_route_model(&mut self) {
+        let profile = ClientModelProfile {
+            created_at: now_ts(),
+            ..ClientModelProfile::default()
+        };
+        self.editor = Some(Editor::RouteModel(RouteModelDraft {
+            is_new: true,
+            original_model: String::new(),
+            reasoning_text: String::new(),
+            profile,
+        }));
+    }
+
+    pub(crate) fn open_edit_route_model(&mut self, client_model: &str) {
+        let profile = self
+            .config
+            .model_profile(client_model)
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut profile = ClientModelProfile {
+                    client_model: client_model.to_string(),
+                    created_at: now_ts(),
+                    ..ClientModelProfile::default()
+                };
+                if let Some(route) = self
+                    .config
+                    .routes
+                    .iter()
+                    .find(|r| r.client_model == client_model)
+                {
+                    profile.context_window = route.max_context_tokens;
+                    profile.fallback_client_model = route.fallback_client_model.clone();
+                    if route.capabilities.iter().any(|c| c == "vision") {
+                        profile.input_modalities.push("image".into());
+                    }
+                    if route
+                        .capabilities
+                        .iter()
+                        .any(|c| c == "reasoning" || c == "thinking")
+                    {
+                        profile.reasoning_levels =
+                            vec!["low".into(), "medium".into(), "high".into()];
+                    }
+                }
+                profile
+            });
+        let reasoning_text = profile.reasoning_levels.join(",");
+        self.editor = Some(Editor::RouteModel(RouteModelDraft {
+            is_new: false,
+            original_model: client_model.to_string(),
+            profile,
+            reasoning_text,
+        }));
+    }
+
+    /// Add an upstream model (provider + model id) inside an existing route model.
+    pub(crate) fn open_new_route(&mut self, client_model: &str) {
         let Some(provider) = self.config.providers.first().cloned() else {
-            self.toast(NoticeLevel::Warning, "请先添加供应商。");
+            self.toast(NoticeLevel::Warning, "请先添加供应商，再添加上游模型。");
             self.page = Page::Providers;
             return;
         };
-        let client_model = self
-            .config
-            .client_models()
-            .into_iter()
-            .next()
-            .unwrap_or_default();
         let route = ModelRoute {
             id: new_id(),
-            client_model,
+            client_model: client_model.to_string(),
             provider_id: provider.id,
             upstream_model: provider.test_model.clone().unwrap_or_default(),
             priority: 10,
@@ -220,6 +274,19 @@ impl App {
             self.toast(NoticeLevel::Error, "请选择所属供应商。");
             return false;
         }
+        if account.balance.mode == BalanceMode::Auto {
+            let formula = account.balance.formula.trim();
+            if !formula.is_empty() {
+                if let Err(err) = crate::balance::validate_formula(formula) {
+                    self.toast(NoticeLevel::Error, format!("余额公式无效：{err}"));
+                    return false;
+                }
+            }
+            if !account.balance.scale.is_finite() || account.balance.scale <= 0.0 {
+                account.balance.scale = 1.0;
+            }
+            account.balance.formula = formula.to_string();
+        }
         account.quota = if draft.quota_enabled {
             Some(QuotaConfig {
                 window: account
@@ -326,6 +393,143 @@ impl App {
         true
     }
 
+    fn save_route_model(&mut self, draft: &RouteModelDraft) -> bool {
+        let mut profile = draft.profile.clone();
+        profile.client_model = profile.client_model.trim().to_string();
+        if profile.client_model.is_empty() {
+            self.toast(NoticeLevel::Error, "路由模型名不能为空。");
+            return false;
+        }
+        if profile.display_name.trim().is_empty() {
+            profile.display_name = profile.client_model.clone();
+        }
+        if profile.owned_by.trim().is_empty() {
+            profile.owned_by = "yoyo-relay".into();
+        }
+        profile.reasoning_levels = draft
+            .reasoning_text
+            .split(',')
+            .map(|level| level.trim().to_ascii_lowercase())
+            .filter(|level| !level.is_empty())
+            .collect();
+        profile.reasoning_levels.dedup();
+        profile.input_modalities = profile
+            .input_modalities
+            .iter()
+            .map(|m| m.trim().to_ascii_lowercase())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if profile.input_modalities.is_empty() {
+            profile.input_modalities.push("text".into());
+        }
+        profile.input_modalities.dedup();
+        profile.output_modalities = profile
+            .output_modalities
+            .iter()
+            .map(|m| m.trim().to_ascii_lowercase())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if profile.output_modalities.is_empty() {
+            profile.output_modalities.push("text".into());
+        }
+        profile.output_modalities.dedup();
+        profile.fallback_client_model = profile
+            .fallback_client_model
+            .take()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty() && m != &profile.client_model);
+        profile.context_window = profile.context_window.filter(|v| *v > 0);
+        profile.max_output_tokens = profile.max_output_tokens.filter(|v| *v > 0);
+        if let (Some(context), Some(max_output)) =
+            (profile.context_window, profile.max_output_tokens)
+        {
+            if max_output > context {
+                self.toast(NoticeLevel::Error, "最大输出不能大于上下文窗口。");
+                return false;
+            }
+        }
+        if draft.is_new
+            && self
+                .config
+                .model_profiles
+                .iter()
+                .any(|p| p.client_model == profile.client_model)
+        {
+            self.toast(NoticeLevel::Error, "该路由模型已存在。");
+            return false;
+        }
+        if profile.created_at == 0 {
+            profile.created_at = now_ts();
+        }
+
+        let backup = self.config.clone();
+        if !draft.is_new && !draft.original_model.is_empty() {
+            let old = draft.original_model.clone();
+            if old != profile.client_model
+                && self
+                    .config
+                    .model_profiles
+                    .iter()
+                    .any(|p| p.client_model == profile.client_model && p.client_model != old)
+            {
+                self.toast(NoticeLevel::Error, "该路由模型名已被占用。");
+                return false;
+            }
+            if let Some(existing) = self
+                .config
+                .model_profiles
+                .iter_mut()
+                .find(|p| p.client_model == old)
+            {
+                *existing = profile.clone();
+            } else {
+                self.config.model_profiles.push(profile.clone());
+            }
+            if old != profile.client_model {
+                for route in &mut self.config.routes {
+                    if route.client_model == old {
+                        route.client_model = profile.client_model.clone();
+                    }
+                    if route.fallback_client_model.as_deref() == Some(old.as_str()) {
+                        route.fallback_client_model = Some(profile.client_model.clone());
+                    }
+                }
+                for other in &mut self.config.model_profiles {
+                    if other.fallback_client_model.as_deref() == Some(old.as_str()) {
+                        other.fallback_client_model = Some(profile.client_model.clone());
+                    }
+                }
+                for key in &mut self.config.local_keys {
+                    for allowed in &mut key.allowed_models {
+                        if allowed == &old {
+                            *allowed = profile.client_model.clone();
+                        }
+                    }
+                }
+            }
+        } else {
+            self.config.model_profiles.push(profile.clone());
+        }
+        if !self.persist() {
+            self.config = backup;
+            return false;
+        }
+        let has_upstream = self
+            .config
+            .routes
+            .iter()
+            .any(|r| r.client_model == profile.client_model);
+        if has_upstream {
+            self.toast(NoticeLevel::Success, "路由模型已保存");
+        } else {
+            self.toast(
+                NoticeLevel::Info,
+                "路由模型已创建，请继续为它添加上游模型。",
+            );
+        }
+        true
+    }
+
     fn create_local_key(&mut self, draft: &LocalKeyDraft) -> bool {
         let name = draft.name.trim();
         if name.is_empty() {
@@ -392,6 +596,7 @@ impl App {
             Provider,
             Account,
             Route,
+            RouteModel,
             Key,
             Balance,
         }
@@ -417,11 +622,20 @@ impl App {
             Editor::Route(d) => (
                 EditorKind::Route,
                 if d.is_new {
-                    "新增路由"
+                    "添加上游模型"
                 } else {
-                    "编辑路由"
+                    "编辑上游模型"
                 },
-                "定义客户端模型到上游模型的映射与降级优先级。",
+                "选择供应商与真实模型名，并设置它在降级链中的优先级。",
+            ),
+            Editor::RouteModel(d) => (
+                EditorKind::RouteModel,
+                if d.is_new {
+                    "新增路由模型"
+                } else {
+                    "编辑路由模型"
+                },
+                "先定义客户端看到的模型与能力，再在卡片里添加上游供应商模型。",
             ),
             Editor::LocalKey(_) => (
                 EditorKind::Key,
@@ -449,6 +663,7 @@ impl App {
                         Editor::Provider(draft) => provider_form(self, ui, draft),
                         Editor::Account(draft) => account_form(self, ui, draft),
                         Editor::Route(draft) => route_form(self, ui, draft),
+                        Editor::RouteModel(draft) => route_model_form(self, ui, draft),
                         Editor::LocalKey(draft) => local_key_form(ui, draft),
                         Editor::ManualBalance(draft) => manual_balance_form(self, ui, draft),
                     });
@@ -466,6 +681,11 @@ impl App {
                     }
                     EditorKind::Key => {
                         if super::kit::primary_button(ui, icons::CHECK, "创建").clicked() {
+                            action = Some(EditorAction::Save);
+                        }
+                    }
+                    EditorKind::RouteModel => {
+                        if super::kit::primary_button(ui, icons::CHECK, "保存模型").clicked() {
                             action = Some(EditorAction::Save);
                         }
                     }
@@ -492,6 +712,7 @@ impl App {
                     Editor::Provider(draft) => self.save_provider(draft, test),
                     Editor::Account(draft) => self.save_account(draft, test),
                     Editor::Route(draft) => self.save_route(draft, test),
+                    Editor::RouteModel(draft) => self.save_route_model(draft),
                     Editor::LocalKey(draft) => self.create_local_key(draft),
                     Editor::ManualBalance(draft) => self.save_manual_balance(draft),
                 };
@@ -616,6 +837,22 @@ impl App {
                     .unwrap_or_else(|| "将删除该路由。".into());
                 ("删除路由", desc, true, "确认删除")
             }
+            ConfirmAction::DeleteRouteModel(model) => {
+                let upstreams = self
+                    .config
+                    .routes
+                    .iter()
+                    .filter(|r| r.client_model == *model)
+                    .count();
+                (
+                    "删除路由模型",
+                    format!(
+                        "将删除路由模型「{model}」及其 {upstreams} 个上游模型。历史用量记录会保留。"
+                    ),
+                    true,
+                    "确认删除",
+                )
+            }
             ConfirmAction::DeleteLocalKey(id) => {
                 let name = self
                     .config
@@ -686,6 +923,26 @@ impl App {
                 self.config.routes.retain(|r| r.id != id);
                 if self.persist() {
                     self.toast(NoticeLevel::Success, "路由已删除");
+                } else {
+                    self.config = backup;
+                }
+            }
+            ConfirmAction::DeleteRouteModel(model) => {
+                let backup = self.config.clone();
+                self.config.routes.retain(|r| r.client_model != model);
+                self.config
+                    .model_profiles
+                    .retain(|p| p.client_model != model);
+                for profile in &mut self.config.model_profiles {
+                    if profile.fallback_client_model.as_deref() == Some(model.as_str()) {
+                        profile.fallback_client_model = None;
+                    }
+                }
+                if self.persist() {
+                    self.toast(
+                        NoticeLevel::Success,
+                        format!("路由模型「{model}」及其上游已删除"),
+                    );
                 } else {
                     self.config = backup;
                 }
@@ -1013,38 +1270,19 @@ fn section(ui: &mut egui::Ui, title: &str) {
 fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
     let provider = &mut draft.provider;
     if draft.is_new {
-        ui.horizontal(|ui| {
-            ui.label("从预设开始");
-            let current_label = crate::config::presets::PRESETS
-                .iter()
-                .find(|p| p.key == draft.preset)
-                .map(|p| p.name)
-                .unwrap_or("自定义");
-            ComboBox::from_id_salt("provider_preset")
-                .selected_text(current_label)
-                .show_ui(ui, |ui| {
-                    for preset in crate::config::presets::PRESETS {
-                        if ui
-                            .selectable_label(draft.preset == preset.key, preset.name)
-                            .clicked()
-                        {
-                            let id = provider.id.clone();
-                            let created = provider.created_at;
-                            *provider = app.store.preset_provider(preset.key);
-                            provider.id = id;
-                            provider.created_at = created;
-                            draft.preset = preset.key.to_string();
-                        }
-                    }
-                });
-        });
-        if let Some(preset) = crate::config::presets::PRESETS
-            .iter()
-            .find(|p| p.key == draft.preset)
-        {
+        section(ui, "品牌预设");
+        if let Some(key) = brands::preset_gallery(ui, &draft.preset) {
+            let id = provider.id.clone();
+            let created = provider.created_at;
+            *provider = app.store.preset_provider(key);
+            provider.id = id;
+            provider.created_at = created;
+            draft.preset = key.to_string();
+        }
+        if let Some(preset) = crate::config::presets::preset(&draft.preset) {
             ui.label(
                 RichText::new(preset.description)
-                    .size(11.0)
+                    .size(10.5)
                     .color(theme::muted(ui)),
             );
         }
@@ -1052,6 +1290,21 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
     }
 
     section(ui, "基本信息");
+    let brand = brands::for_preset(Some(&draft.preset));
+    ui.horizontal(|ui| {
+        brands::tile(ui, &brand, 36.0);
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(&provider.name).size(13.0).strong());
+            ui.label(
+                RichText::new(&provider.base_url)
+                    .monospace()
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+            );
+        });
+    });
+    ui.add_space(4.0);
     egui::Grid::new("provider_basic")
         .num_columns(2)
         .spacing([14.0, 8.0])
@@ -1530,8 +1783,19 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
                             .hint_text("data.balance 或 data[0].credits"),
                     );
                     ui.end_row();
+                    ui.label("换算公式");
+                    ui.add(
+                        TextEdit::singleline(&mut balance.formula)
+                            .desired_width(380.0)
+                            .hint_text("可留空；例如 data.balance / 100"),
+                    );
+                    ui.end_row();
                     ui.label("数值倍率");
-                    ui.add(egui::DragValue::new(&mut balance.scale).speed(0.01));
+                    ui.add(
+                        egui::DragValue::new(&mut balance.scale)
+                            .speed(0.01)
+                            .range(0.0001..=1_000_000.0),
+                    );
                     ui.end_row();
                 }
                 BalanceMode::Manual => {
@@ -1554,6 +1818,45 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
             }
         });
 
+    if balance.mode == BalanceMode::Auto {
+        let path = if balance.json_path.trim().is_empty() {
+            "balance".to_string()
+        } else {
+            balance.json_path.trim().to_string()
+        };
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("快捷换算").size(10.0).color(theme::muted(ui)));
+            if ui.small_button("原始值").clicked() {
+                balance.formula.clear();
+                balance.scale = 1.0;
+            }
+            if ui.small_button("除以 100").clicked() {
+                balance.formula = format!("{path} / 100");
+                balance.scale = 1.0;
+            }
+            if ui.small_button("除以 1000").clicked() {
+                balance.formula = format!("{path} / 1000");
+                balance.scale = 1.0;
+            }
+            if ui.small_button("除以 10000").clicked() {
+                balance.formula = format!("{path} / 10000");
+                balance.scale = 1.0;
+            }
+            if ui.small_button("乘以 100").clicked() {
+                balance.formula = format!("{path} * 100");
+                balance.scale = 1.0;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "公式中的变量直接写 JSON 路径，支持 + - * / 与括号，例如 data.total - data.used；留空时使用 JSON 路径 × 倍率。",
+            )
+            .size(10.0)
+            .color(theme::muted(ui)),
+        );
+    }
+
     if !draft.is_new {
         let masked = app.store.masked_secret(&draft.account.api_key);
         ui.label(
@@ -1567,18 +1870,27 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
 
 fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
     let route = &mut draft.route;
-    section(ui, "模型映射");
+    section(ui, "所属路由模型");
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new("客户端模型")
+                .size(11.0)
+                .color(theme::muted(ui)),
+        );
+        super::kit::badge(ui, &route.client_model, theme::ACCENT);
+        ui.label(
+            RichText::new("在路由模型卡片右上角可修改名称与模型能力")
+                .size(10.0)
+                .color(theme::muted(ui)),
+        );
+    });
+    ui.add_space(4.0);
+
+    section(ui, "上游模型");
     egui::Grid::new("route_basic")
         .num_columns(2)
         .spacing([14.0, 8.0])
         .show(ui, |ui| {
-            ui.label("客户端模型名");
-            ui.add(
-                TextEdit::singleline(&mut route.client_model)
-                    .desired_width(380.0)
-                    .hint_text("客户端请求里看到的 model"),
-            );
-            ui.end_row();
             ui.label("供应商");
             let provider_name = app
                 .config
@@ -1597,17 +1909,71 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
                     }
                 });
             ui.end_row();
+            let fetching = app.snapshot.models_fetching.contains(&route.provider_id);
+            let catalog = app
+                .snapshot
+                .provider_models
+                .get(&route.provider_id)
+                .cloned();
+            if !route.provider_id.is_empty()
+                && catalog.is_none()
+                && !fetching
+                && app.models_requested.insert(route.provider_id.clone())
+            {
+                let _ = app
+                    .cmd_tx
+                    .send(crate::runtime::UiCommand::FetchProviderModels(
+                        route.provider_id.clone(),
+                    ));
+            }
             ui.label("上游模型名");
-            ui.add(
-                TextEdit::singleline(&mut route.upstream_model)
-                    .desired_width(380.0)
-                    .hint_text("发给供应商的真实模型名"),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    TextEdit::singleline(&mut route.upstream_model)
+                        .desired_width(280.0)
+                        .hint_text("发给该供应商的真实模型名"),
+                );
+                if ui
+                    .add_enabled(
+                        !fetching,
+                        egui::Button::new(if fetching {
+                            format!("{} 获取中…", icons::SPINNER)
+                        } else {
+                            format!("{} 拉取列表", icons::LIST_MAGNIFYING_GLASS)
+                        }),
+                    )
+                    .on_hover_text("从该供应商的 /models 端点读取模型名，仍可手动输入")
+                    .clicked()
+                {
+                    let _ = app
+                        .cmd_tx
+                        .send(crate::runtime::UiCommand::FetchProviderModels(
+                            route.provider_id.clone(),
+                        ));
+                }
+                if let Some(catalog) = &catalog {
+                    if !catalog.models.is_empty() {
+                        ComboBox::from_id_salt("route_upstream_model_pick")
+                            .selected_text(format!("{} 个可选", catalog.models.len()))
+                            .width(170.0)
+                            .show_ui(ui, |ui| {
+                                for model in &catalog.models {
+                                    if ui
+                                        .selectable_label(route.upstream_model == *model, model)
+                                        .clicked()
+                                    {
+                                        route.upstream_model = model.clone();
+                                    }
+                                }
+                            });
+                    }
+                }
+            });
             ui.end_row();
             ui.label("优先级");
             ui.add(egui::DragValue::new(&mut route.priority).range(-100..=100));
             ui.label(
-                RichText::new("降序；同一供应商的多条路由视为同一层")
+                RichText::new("降序；同一供应商的多条上游视为同一层")
                     .size(10.5)
                     .color(theme::muted(ui)),
             );
@@ -1654,9 +2020,42 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
             ui.end_row();
         });
 
+    if let Some(catalog) = app
+        .snapshot
+        .provider_models
+        .get(&route.provider_id)
+        .filter(|catalog| catalog.provider_id == route.provider_id)
+    {
+        ui.horizontal_wrapped(|ui| {
+            super::kit::badge(
+                ui,
+                if catalog.ok {
+                    "供应商模型列表"
+                } else {
+                    "获取失败"
+                },
+                if catalog.ok {
+                    theme::GREEN
+                } else {
+                    theme::ORANGE
+                },
+            );
+            ui.label(
+                RichText::new(format!("{} · {}", catalog.provider_name, catalog.message))
+                    .size(10.0)
+                    .color(theme::muted(ui)),
+            );
+            ui.label(
+                RichText::new(widgets::time_ago(catalog.at, crate::config::now_ts()))
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+            );
+        });
+    }
+
     if let Some(provider) = app.config.provider(&route.provider_id) {
         let resolved = provider.protocol_for(&route.upstream_model, route.protocol);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("实际协议").size(11.0).color(theme::muted(ui)));
             super::kit::badge(ui, resolved.label(), theme::BLUE_INFO);
             ui.label(
@@ -1673,9 +2072,14 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
                 .color(theme::muted(ui)),
             );
         });
+        ui.label(
+            RichText::new("客户端使用三种协议中的任意一种，YoyoRelay 会自动转换成上游协议。")
+                .size(10.0)
+                .color(theme::muted(ui)),
+        );
     }
 
-    section(ui, "能力与备选");
+    section(ui, "价格与能力");
     egui::Grid::new("route_more")
         .num_columns(2)
         .spacing([14.0, 8.0])
@@ -1683,26 +2087,8 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
             ui.label("能力标签");
             ui.add(
                 TextEdit::singleline(&mut draft.capabilities_text)
-                    .desired_width(380.0)
+                    .desired_width(360.0)
                     .hint_text("chat,tools,vision（逗号分隔）"),
-            );
-            ui.end_row();
-            ui.label("上下文上限");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut draft.max_context_enabled, "限制");
-                ui.add_enabled(
-                    draft.max_context_enabled,
-                    egui::DragValue::new(&mut draft.max_context)
-                        .range(0..=10_000_000)
-                        .suffix(" tokens"),
-                );
-            });
-            ui.end_row();
-            ui.label("映射级兜底");
-            ui.add(
-                TextEdit::singleline(&mut draft.fallback_text)
-                    .desired_width(380.0)
-                    .hint_text("另一个客户端模型名（可选，默认关闭）"),
             );
             ui.end_row();
             ui.label("输入价格");
@@ -1723,10 +2109,361 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
             ui.end_row();
         });
     ui.label(
-        RichText::new("价格用于概览页预估花费与手动余额递减；留 0 表示不估算。")
-            .size(10.5)
+        RichText::new(
+            "价格按 USD/Mtok 记录。上下文窗口、最大输出与思考等级在「路由模型」中统一设置。",
+        )
+        .size(10.5)
+        .color(theme::muted(ui)),
+    );
+}
+
+fn modality_toggle(ui: &mut egui::Ui, values: &mut Vec<String>, value: &str, label: &str) -> bool {
+    let mut enabled = values.iter().any(|m| m == value);
+    if ui.checkbox(&mut enabled, label).changed() {
+        if enabled {
+            if !values.iter().any(|m| m == value) {
+                values.push(value.to_string());
+            }
+        } else {
+            values.retain(|m| m != value);
+        }
+        return true;
+    }
+    false
+}
+
+fn apply_fetched_model(draft: &mut RouteModelDraft, fetched: &crate::snapshot::FetchedModelView) {
+    if let Some(context) = fetched.context_window {
+        draft.profile.context_window = Some(context);
+    }
+    if let Some(output) = fetched.max_output_tokens {
+        draft.profile.max_output_tokens = Some(output);
+    }
+    if let (Some(context), Some(output)) = (
+        draft.profile.context_window,
+        draft.profile.max_output_tokens,
+    ) {
+        if output > context {
+            draft.profile.max_output_tokens = Some(context);
+        }
+    }
+    if !fetched.input_modalities.is_empty() {
+        draft.profile.input_modalities = fetched.input_modalities.clone();
+    }
+    if !fetched.output_modalities.is_empty() {
+        draft.profile.output_modalities = fetched.output_modalities.clone();
+    }
+    if !fetched.reasoning_levels.is_empty() {
+        draft.reasoning_text = fetched.reasoning_levels.join(",");
+    }
+    if let Some(tools) = fetched.supports_tools {
+        draft.profile.supports_tools = tools;
+    }
+    if let Some(streaming) = fetched.supports_streaming {
+        draft.profile.supports_streaming = streaming;
+    }
+}
+
+fn route_model_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteModelDraft) {
+    let lookup = if draft.is_new {
+        draft.profile.client_model.trim().to_string()
+    } else {
+        draft.original_model.clone()
+    };
+    if let Some(fetched) = app.snapshot.fetched_model.clone() {
+        if app.last_applied_fetch != Some(fetched.id)
+            && !lookup.is_empty()
+            && fetched.client_model == lookup
+        {
+            if fetched.ok {
+                apply_fetched_model(draft, &fetched);
+                app.toast(
+                    NoticeLevel::Success,
+                    format!(
+                        "已从 {} 读取「{}」的模型信息，可检查后保存",
+                        fetched.provider_name, fetched.upstream_model
+                    ),
+                );
+            } else {
+                app.toast(NoticeLevel::Warning, fetched.message.clone());
+            }
+            app.last_applied_fetch = Some(fetched.id);
+        }
+    }
+
+    let upstreams: Vec<(String, String, String)> = app
+        .config
+        .routes
+        .iter()
+        .filter(|route| route.client_model == lookup)
+        .filter_map(|route| {
+            app.config.provider(&route.provider_id).map(|provider| {
+                (
+                    route.provider_id.clone(),
+                    provider.name.clone(),
+                    route.upstream_model.clone(),
+                )
+            })
+        })
+        .collect();
+    let mut request: Option<(String, String)> = None;
+
+    section(ui, "模型标识与上下文");
+    ui.columns(2, |cols| {
+        egui::Grid::new("route_model_basic")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(&mut cols[0], |ui| {
+                ui.label("客户端模型名");
+                ui.add(
+                    TextEdit::singleline(&mut draft.profile.client_model)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("例如 gpt-5-codex"),
+                );
+                ui.end_row();
+                ui.label("显示名称");
+                ui.add(
+                    TextEdit::singleline(&mut draft.profile.display_name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("模型列表展示名称"),
+                );
+                ui.end_row();
+                ui.label("归属");
+                ui.add(
+                    TextEdit::singleline(&mut draft.profile.owned_by)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("yoyo-relay"),
+                );
+                ui.end_row();
+                ui.label("描述");
+                ui.add(
+                    TextEdit::singleline(&mut draft.profile.description)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("一句话说明（可选）"),
+                );
+                ui.end_row();
+                ui.label("启用");
+                ui.checkbox(&mut draft.profile.enabled, "在模型列表与路由页展示");
+                ui.end_row();
+            });
+
+        const DEFAULT_CONTEXT: u64 = 128_000;
+        const DEFAULT_MAX_OUTPUT: u64 = 4_096;
+        let mut context_enabled = draft.profile.context_window.is_some();
+        let mut context = draft.profile.context_window.unwrap_or(DEFAULT_CONTEXT);
+        let mut output_enabled = draft.profile.max_output_tokens.is_some();
+        let mut max_output = draft
+            .profile
+            .max_output_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT);
+        egui::Grid::new("route_model_limits")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(&mut cols[1], |ui| {
+                ui.label("上下文窗口");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut context_enabled, "设置");
+                    ui.add_enabled(
+                        context_enabled,
+                        egui::DragValue::new(&mut context)
+                            .range(1..=10_000_000)
+                            .speed(1000.0)
+                            .suffix(" tokens"),
+                    );
+                });
+                ui.end_row();
+                ui.label("最大输出");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut output_enabled, "设置");
+                    ui.add_enabled(
+                        output_enabled,
+                        egui::DragValue::new(&mut max_output)
+                            .range(1..=10_000_000)
+                            .speed(100.0)
+                            .suffix(" tokens"),
+                    );
+                });
+                ui.end_row();
+            });
+        // Keep the value while the switch is on; filtering zero made the
+        // checkbox appear to snap back off immediately.
+        draft.profile.context_window = context_enabled.then_some(context.max(1));
+        draft.profile.max_output_tokens = output_enabled.then_some(max_output.max(1));
+        if let (Some(context), Some(output)) = (
+            draft.profile.context_window,
+            draft.profile.max_output_tokens,
+        ) {
+            if output > context {
+                draft.profile.max_output_tokens = Some(context);
+            }
+        }
+
+        route_model_fetch_ui(&mut cols[1], app, &upstreams, &mut request);
+    });
+
+    section(ui, "能力（模型列表会返回）");
+    ui.label(RichText::new("输入模态").size(10.5).color(theme::muted(ui)));
+    ui.horizontal_wrapped(|ui| {
+        modality_toggle(ui, &mut draft.profile.input_modalities, "text", "文本");
+        modality_toggle(ui, &mut draft.profile.input_modalities, "image", "图片");
+        modality_toggle(ui, &mut draft.profile.input_modalities, "audio", "音频");
+        modality_toggle(ui, &mut draft.profile.input_modalities, "file", "文件");
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut draft.profile.supports_tools, "支持工具调用");
+        ui.checkbox(&mut draft.profile.supports_streaming, "支持流式输出");
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("思考等级");
+        ui.add(
+            TextEdit::singleline(&mut draft.reasoning_text)
+                .desired_width(f32::INFINITY)
+                .hint_text("off,low,medium,high；留空表示不支持"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("映射级兜底");
+        ui.add(
+            TextEdit::singleline(
+                draft
+                    .profile
+                    .fallback_client_model
+                    .get_or_insert_with(String::new),
+            )
+            .desired_width(f32::INFINITY)
+            .hint_text("所有上游都失败后改用另一个客户端模型（可选）"),
+        );
+    });
+    ui.label(
+        RichText::new("没有上游的路由模型不会出现在 /v1/models。")
+            .size(10.0)
             .color(theme::muted(ui)),
     );
+
+    if let Some((provider_id, upstream_model)) = request {
+        let _ = app.cmd_tx.send(crate::runtime::UiCommand::FetchModelInfo {
+            provider_id,
+            upstream_model,
+            client_model: lookup,
+        });
+    }
+}
+
+fn route_model_fetch_ui(
+    ui: &mut egui::Ui,
+    app: &App,
+    upstreams: &[(String, String, String)],
+    request: &mut Option<(String, String)>,
+) {
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new("从上游读取")
+            .size(11.5)
+            .strong()
+            .color(theme::text(ui)),
+    );
+    ui.label(
+        RichText::new("通过上游 /models 读取上下文、输出、模态与思考等级并自动填入。")
+            .size(9.5)
+            .color(theme::muted(ui)),
+    );
+    if upstreams.is_empty() {
+        ui.label(
+            RichText::new("先保存模型并添加上游模型，再回来获取。")
+                .size(9.5)
+                .color(theme::muted(ui)),
+        );
+        return;
+    }
+    let running = app.snapshot.model_fetch_running;
+    for (provider_id, provider_name, upstream_model) in upstreams {
+        egui::Frame::new()
+            .fill(theme::subtle_fill(ui))
+            .corner_radius(7)
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{provider_name} → {upstream_model}"))
+                            .size(9.8)
+                            .color(theme::text(ui)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if super::kit::secondary_button(
+                            ui,
+                            if running {
+                                icons::SPINNER
+                            } else {
+                                icons::DOWNLOAD_SIMPLE
+                            },
+                            if running { "获取中" } else { "获取" },
+                        )
+                        .clicked()
+                            && !running
+                        {
+                            *request = Some((provider_id.clone(), upstream_model.clone()));
+                        }
+                    });
+                });
+            });
+        ui.add_space(3.0);
+    }
+    if let Some(fetched) = &app.snapshot.fetched_model {
+        if upstreams
+            .iter()
+            .any(|(_, _, model)| model == &fetched.upstream_model)
+        {
+            let color = if fetched.ok {
+                theme::GREEN
+            } else {
+                theme::ORANGE
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if fetched.ok {
+                        icons::CHECK_CIRCLE
+                    } else {
+                        icons::WARNING
+                    })
+                    .size(11.0)
+                    .color(color),
+                );
+                ui.label(
+                    RichText::new(&fetched.message)
+                        .size(9.5)
+                        .color(theme::text(ui)),
+                );
+            });
+            if fetched.ok {
+                let mut facts = Vec::new();
+                if let Some(context) = fetched.context_window {
+                    facts.push(format!("上下文 {}", widgets::format_count(context)));
+                }
+                if let Some(output) = fetched.max_output_tokens {
+                    facts.push(format!("最大输出 {}", widgets::format_count(output)));
+                }
+                if !fetched.input_modalities.is_empty() {
+                    facts.push(format!("输入 {}", fetched.input_modalities.join("/")));
+                }
+                if !facts.is_empty() {
+                    ui.label(
+                        RichText::new(facts.join(" · "))
+                            .size(9.0)
+                            .color(theme::muted(ui)),
+                    );
+                }
+                if fetched.models_seen > 0 {
+                    ui.label(
+                        RichText::new(format!("上游列表共 {} 个模型", fetched.models_seen))
+                            .size(9.0)
+                            .color(theme::muted(ui)),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn local_key_form(ui: &mut egui::Ui, draft: &mut LocalKeyDraft) {
@@ -1796,17 +2533,31 @@ fn manual_balance_form(app: &App, ui: &mut egui::Ui, draft: &mut ManualBalanceDr
         .unwrap_or_else(|| "未知账号".into());
     ui.label(RichText::new(label).strong());
     ui.add_space(8.0);
-    ui.label("当前余额");
+    let currency = app
+        .config
+        .account(&draft.account_id)
+        .map(|a| crate::config::normalize_currency(&a.balance.currency))
+        .unwrap_or_else(|| "USD".into());
+    let prefix = if currency == "CNY" {
+        "¥ "
+    } else if currency == "USD" {
+        "$ "
+    } else {
+        ""
+    };
+    ui.label(format!("当前余额（{currency}）"));
     ui.add(
         egui::DragValue::new(&mut draft.amount)
             .speed(0.1)
-            .prefix("$ ")
+            .prefix(prefix)
             .range(0.0..=1_000_000_000.0),
     );
     ui.add_space(6.0);
     ui.label(
-        RichText::new("保存后模式切换为「手动」，并从现在开始按路由价格估算递减。")
-            .size(11.0)
-            .color(theme::muted(ui)),
+        RichText::new(
+            "保存后模式切换为「手动」，并从现在开始按路由价格（USD）与设置中的汇率折算递减。",
+        )
+        .size(11.0)
+        .color(theme::muted(ui)),
     );
 }

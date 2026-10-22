@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod balances;
+pub mod brands;
 pub mod editors;
 pub mod keys;
 pub mod kit;
@@ -21,13 +22,16 @@ use egui::{
 use egui_phosphor::regular as icons;
 use tokio::sync::mpsc;
 
-use crate::config::{now_ts, Account, AppConfig, ConfigStore, ModelRoute, Provider};
+use crate::config::{
+    now_ts, Account, AppConfig, ClientModelProfile, ConfigStore, ModelRoute, Provider,
+};
 use crate::runtime::UiCommand;
 use crate::snapshot::{NoticeLevel, ProxyStatus, UiSnapshot, UsageDimension};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsTab {
     General,
+    Taskbar,
     Proxy,
     Scheduler,
     Security,
@@ -36,9 +40,10 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub fn all() -> [SettingsTab; 6] {
+    pub fn all() -> [SettingsTab; 7] {
         [
             SettingsTab::General,
+            SettingsTab::Taskbar,
             SettingsTab::Proxy,
             SettingsTab::Scheduler,
             SettingsTab::Security,
@@ -50,6 +55,7 @@ impl SettingsTab {
     pub fn label(self) -> &'static str {
         match self {
             SettingsTab::General => "通用与启动",
+            SettingsTab::Taskbar => "任务栏徽标",
             SettingsTab::Proxy => "代理",
             SettingsTab::Scheduler => "调度与熔断",
             SettingsTab::Security => "安全",
@@ -61,6 +67,7 @@ impl SettingsTab {
     pub fn icon(self) -> &'static str {
         match self {
             SettingsTab::General => icons::SLIDERS_HORIZONTAL,
+            SettingsTab::Taskbar => icons::MONITOR,
             SettingsTab::Proxy => icons::DESKTOP_TOWER,
             SettingsTab::Scheduler => icons::ACTIVITY,
             SettingsTab::Security => icons::SHIELD_CHECK,
@@ -169,6 +176,7 @@ pub(crate) enum Editor {
     Provider(ProviderDraft),
     Account(AccountDraft),
     Route(RouteDraft),
+    RouteModel(RouteModelDraft),
     LocalKey(LocalKeyDraft),
     ManualBalance(ManualBalanceDraft),
 }
@@ -198,6 +206,13 @@ pub(crate) struct RouteDraft {
     pub max_context: u64,
 }
 
+pub(crate) struct RouteModelDraft {
+    pub is_new: bool,
+    pub original_model: String,
+    pub profile: ClientModelProfile,
+    pub reasoning_text: String,
+}
+
 pub(crate) struct LocalKeyDraft {
     pub name: String,
     pub allowed_models_text: String,
@@ -215,6 +230,7 @@ pub(crate) enum ConfirmAction {
     DeleteProvider(String),
     DeleteAccount(String),
     DeleteRoute(String),
+    DeleteRouteModel(String),
     DeleteLocalKey(String),
     ResetLocalKey(String),
     ImportConfig(String),
@@ -253,11 +269,15 @@ pub struct App {
     pub(crate) usage_metric: UsageMetric,
     pub(crate) usage_expanded: HashSet<String>,
     pub(crate) usage_pinned: Option<usize>,
+    pub(crate) usage_local_key: Option<String>,
     pub(crate) show_onboarding: bool,
     pub(crate) onboarding_step: usize,
     pub(crate) import_path: String,
     pub(crate) last_export_path: Option<String>,
     pub(crate) last_dark: Option<bool>,
+    pub(crate) last_applied_fetch: Option<u64>,
+    pub(crate) models_requested: HashSet<String>,
+    pub(crate) taskbar_badge: Option<crate::taskbar::TaskbarBadge>,
     pub(crate) closing: bool,
     pub(crate) last_zoom: f32,
     pub(crate) signals: Arc<crate::instance::Signals>,
@@ -265,6 +285,7 @@ pub struct App {
     pub(crate) tray_ready: bool,
     pub(crate) ctx_attached: bool,
     pub(crate) native_attached: bool,
+    pub(crate) native_frame_applied: bool,
 }
 
 impl App {
@@ -314,11 +335,15 @@ impl App {
             usage_metric: UsageMetric::Tokens,
             usage_expanded: HashSet::new(),
             usage_pinned: None,
+            usage_local_key: None,
             show_onboarding,
             onboarding_step: 0,
             import_path: String::new(),
             last_export_path: None,
             last_dark: None,
+            last_applied_fetch: None,
+            models_requested: HashSet::new(),
+            taskbar_badge: None,
             closing: false,
             last_zoom: 1.0,
             signals,
@@ -326,10 +351,13 @@ impl App {
             tray_ready: false,
             ctx_attached: false,
             native_attached: false,
+            native_frame_applied: false,
         };
         #[cfg(debug_assertions)]
         if let Ok(tab) = std::env::var("YOYO_RELAY_SETTINGS_TAB") {
             app.settings_tab = match tab.as_str() {
+                "general" => SettingsTab::General,
+                "taskbar" => SettingsTab::Taskbar,
                 "proxy" => SettingsTab::Proxy,
                 "scheduler" => SettingsTab::Scheduler,
                 "security" => SettingsTab::Security,
@@ -343,7 +371,51 @@ impl App {
             match demo.as_str() {
                 "editor" => app.open_new_provider(),
                 "account_editor" => app.open_new_account(),
-                "route_editor" => app.open_new_route(),
+                "account_edit" => {
+                    if let Some(account) = app.config.accounts.first() {
+                        let id = account.id.clone();
+                        app.open_edit_account(&id);
+                    }
+                }
+                "route_editor" | "route_model_editor" => app.open_new_route_model(),
+                "route_model_edit" => {
+                    if let Some(model) = app
+                        .config
+                        .model_profiles
+                        .first()
+                        .map(|profile| profile.client_model.clone())
+                    {
+                        app.open_edit_route_model(&model);
+                    }
+                }
+                "route_fetch" => {
+                    if let Some(model) = app
+                        .config
+                        .model_profiles
+                        .first()
+                        .map(|profile| profile.client_model.clone())
+                    {
+                        if let Some(route) = app
+                            .config
+                            .routes
+                            .iter()
+                            .find(|route| route.client_model == model)
+                        {
+                            let _ = app.cmd_tx.send(UiCommand::FetchModelInfo {
+                                provider_id: route.provider_id.clone(),
+                                upstream_model: route.upstream_model.clone(),
+                                client_model: model.clone(),
+                            });
+                        }
+                        app.open_edit_route_model(&model);
+                    }
+                }
+                "route_upstream_editor" => {
+                    if let Some(route) = app.config.routes.first() {
+                        let client_model = route.client_model.clone();
+                        app.open_new_route(&client_model);
+                    }
+                }
                 "key_editor" => app.open_new_local_key(),
                 "onboarding" => {
                     app.show_onboarding = true;
@@ -450,12 +522,13 @@ impl App {
     /// Closing with "close to tray" enabled removes the window and its taskbar
     /// entry; the tray menu (or a second launch) brings it back.
     pub(crate) fn hide_to_tray(&mut self, ctx: &egui::Context) {
-        // Hiding natively is only safe to restore on Windows: there a hidden
-        // window ignores redraw requests, but Win32 can reveal it directly.
-        // Other platforms fall back to a taskbar minimize.
         self.signals.mark_hidden(true);
         if self.tray.is_some() && cfg!(windows) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Keep the window technically visible (offscreen, toolwindow
+            // style) so egui keeps running and the tray tooltip stays live.
+            if !self.signals.hide_native() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
@@ -516,7 +589,7 @@ impl App {
             match self.page {
                 Page::Providers => self.open_new_provider(),
                 Page::Accounts => self.open_new_account(),
-                Page::Routes => self.open_new_route(),
+                Page::Routes => self.open_new_route_model(),
                 Page::LocalKeys => self.open_new_local_key(),
                 _ => {}
             }
@@ -538,6 +611,19 @@ impl App {
         }
     }
 
+    /// The runtime owns live-rate refreshes and persists them itself. Adopt its
+    /// newer table so an unrelated "save settings" cannot overwrite it with a
+    /// stale copy.
+    fn sync_live_fx(&mut self) {
+        if self.snapshot.fx_updated_at > self.config.ui.fx_updated_at
+            && !self.snapshot.fx_rates.is_empty()
+        {
+            self.config.ui.fx_rates = self.snapshot.fx_rates.clone();
+            self.config.ui.fx_updated_at = self.snapshot.fx_updated_at;
+            self.config.ui.fx_source = self.snapshot.fx_source.clone();
+        }
+    }
+
     fn update_window_title(&mut self, ctx: &egui::Context) {
         let title = if self.config.ui.show_taskbar_stats {
             let (_, label) = self.proxy_status();
@@ -553,6 +639,121 @@ impl App {
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
+        }
+    }
+
+    fn update_tray_stats(&mut self) {
+        let (summary, detail) = if self.config.ui.show_taskbar_stats {
+            let (_, label) = self.proxy_status();
+            let totals = &self.snapshot.today.totals;
+            let rate = if totals.requests > 0 {
+                (totals.ok as f64 * 100.0 / totals.requests as f64).round() as u64
+            } else {
+                100
+            };
+            (
+                format!(
+                    "{} · {} 活跃 · {} tokens",
+                    label,
+                    self.snapshot.active_requests,
+                    widgets::format_count(totals.total_tokens)
+                ),
+                format!(
+                    "队列 {} · 今日 {} 请求 · 成功率 {}% · {}",
+                    self.snapshot.queued_requests, totals.requests, rate, self.snapshot.endpoint
+                ),
+            )
+        } else {
+            (
+                "本地 LLM 代理".to_string(),
+                "打开主窗口查看请求与用量".to_string(),
+            )
+        };
+        if let Some(tray) = self.tray.as_mut() {
+            tray.update_stats(&summary, &detail);
+        }
+    }
+
+    fn taskbar_stats_widget(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            if !self.config.ui.show_taskbar_stats {
+                self.taskbar_badge = None;
+                return;
+            }
+            let badge_cfg = self.config.ui.taskbar.normalized();
+            let (status_color, status_label) = self.proxy_status();
+            let running = self.snapshot.proxy.is_running();
+            let totals = &self.snapshot.today.totals;
+            let rate = if totals.requests > 0 {
+                (totals.ok as f64 * 100.0 / totals.requests as f64).round() as u64
+            } else {
+                100
+            };
+            let mut parts: Vec<String> = Vec::new();
+            if badge_cfg.show_status {
+                parts.push(if running {
+                    format!("代理{status_label}")
+                } else {
+                    "代理未运行".to_string()
+                });
+            }
+            if badge_cfg.show_active {
+                parts.push(format!("{} 活跃", self.snapshot.active_requests));
+            }
+            if badge_cfg.show_tokens {
+                parts.push(format!(
+                    "{} tok",
+                    widgets::format_count(totals.total_tokens)
+                ));
+            }
+            if badge_cfg.show_requests {
+                parts.push(format!("{} 请求", widgets::format_count(totals.requests)));
+            }
+            if badge_cfg.show_queued {
+                parts.push(format!("队列 {}", self.snapshot.queued_requests));
+            }
+            if badge_cfg.show_success {
+                parts.push(format!("{rate}%"));
+            }
+            if badge_cfg.show_cost {
+                parts.push(widgets::format_cost(totals.cost_micros));
+            }
+            let text = if !badge_cfg.has_content() || parts.is_empty() {
+                "YoyoRelay".to_string()
+            } else {
+                parts.join(" · ")
+            };
+            let dark = ctx
+                .system_theme()
+                .map(|theme| theme == egui::Theme::Dark)
+                .unwrap_or(false);
+            if self.taskbar_badge.is_none() {
+                self.taskbar_badge = crate::taskbar::TaskbarBadge::new();
+            }
+            if let Some(badge) = self.taskbar_badge.as_mut() {
+                let dpi = ctx
+                    .input(|i| i.viewport().native_pixels_per_point)
+                    .unwrap_or(1.0);
+                badge.update(
+                    &text,
+                    (status_color.r(), status_color.g(), status_color.b()),
+                    dark,
+                    dpi,
+                    &crate::taskbar::BadgeStyle {
+                        scale: badge_cfg.scale,
+                        offset_x: badge_cfg.offset_x,
+                        offset_y: badge_cfg.offset_y,
+                        gap: badge_cfg.gap,
+                        opacity: badge_cfg.opacity,
+                        show_dot: badge_cfg.show_dot,
+                    },
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = ctx;
         }
     }
 
@@ -581,14 +782,13 @@ impl App {
     fn title_bar(&mut self, ctx: &egui::Context) {
         let t = theme::tokens_ctx(ctx);
         let sidebar_w = self.sidebar_width(ctx);
-        let height = 46.0;
+        let height = 60.0;
         egui::TopBottomPanel::top("title_bar")
             .exact_height(height)
             .frame(
                 egui::Frame::new()
                     .fill(t.sidebar)
-                    .inner_margin(egui::Margin::ZERO)
-                    .stroke(Stroke::new(1.0_f32, t.card_border)),
+                    .inner_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
@@ -597,36 +797,50 @@ impl App {
                     egui::CornerRadius::ZERO,
                     t.bg,
                 );
-                // Brand zone
-                ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .max_rect(Rect::from_min_size(rect.min, Vec2::new(sidebar_w, height))),
-                    |ui| {
-                        ui.horizontal_centered(|ui| {
-                            ui.add_space(12.0);
-                            kit::brand_logo(ui, &self.logo, 28.0);
-                            if sidebar_w > 100.0 {
-                                ui.add_space(4.0);
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new("YoyoRelay")
-                                            .size(13.5)
-                                            .strong()
-                                            .color(t.text),
-                                    );
-                                    ui.label(RichText::new("本地代理").size(9.0).color(t.muted));
-                                });
-                            }
-                        });
-                    },
+                // Brand zone. Painted directly so the mark and the two text
+                // lines are always optically centered in the title bar,
+                // independent of layout cross-axis quirks.
+                let brand_rect = Rect::from_min_size(rect.min, Vec2::new(sidebar_w, height));
+                // A tiny optical lift compensates for the cap-height of the
+                // name so the lockup reads as centered, not top-aligned.
+                let center_y = brand_rect.center().y + 2.0;
+                let logo_size = 32.0;
+                let logo_rect = Rect::from_center_size(
+                    Pos2::new(brand_rect.left() + 15.0 + logo_size / 2.0, center_y),
+                    Vec2::splat(logo_size),
                 );
+                ui.painter().image(
+                    self.logo.id(),
+                    logo_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                if sidebar_w > 100.0 {
+                    let text_x = logo_rect.right() + 9.0;
+                    ui.painter().text(
+                        Pos2::new(text_x, center_y - 8.5),
+                        Align2::LEFT_CENTER,
+                        "YoyoRelay",
+                        egui::FontId::proportional(14.5),
+                        t.text,
+                    );
+                    ui.painter().text(
+                        Pos2::new(text_x, center_y + 9.0),
+                        Align2::LEFT_CENTER,
+                        "本地多上游代理",
+                        egui::FontId::proportional(9.5),
+                        t.muted,
+                    );
+                }
                 // Content zone
                 let content_rect =
                     Rect::from_min_max(Pos2::new(rect.left() + sidebar_w, rect.top()), rect.max);
-                ui.scope_builder(
-                    egui::UiBuilder::new().max_rect(content_rect.shrink2(Vec2::new(16.0, 0.0))),
-                    |ui| {
-                        ui.horizontal_centered(|ui| {
+                let content_inner = content_rect.shrink2(Vec2::new(16.0, 0.0));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(content_inner), |ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(content_inner.width(), height),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
                             ui.label(RichText::new("工作台").size(11.0).color(t.muted));
                             ui.label(RichText::new("/").size(10.5).color(t.muted));
                             ui.label(
@@ -719,8 +933,17 @@ impl App {
                                     );
                                 }
                             });
-                        });
-                    },
+                        },
+                    );
+                });
+
+                // A single hairline keeps the header crisp without boxing it in.
+                ui.painter().line_segment(
+                    [
+                        Pos2::new(rect.left(), rect.bottom() - 0.5),
+                        Pos2::new(rect.right(), rect.bottom() - 0.5),
+                    ],
+                    Stroke::new(1.0_f32, t.card_border),
                 );
 
                 // Drag region excludes the right-side controls.
@@ -1218,6 +1441,10 @@ impl eframe::App for App {
                 if let Ok(handle) = frame.window_handle() {
                     if let RawWindowHandle::Win32(win) = handle.as_raw() {
                         self.signals.attach_window(win.hwnd.get());
+                        if !self.native_frame_applied {
+                            crate::windowfx::apply_native_frame(win.hwnd.get() as isize);
+                            self.native_frame_applied = true;
+                        }
                     }
                 }
             }
@@ -1238,9 +1465,11 @@ impl eframe::App for App {
             self.signals.mark_hidden(false);
         }
         self.poll_snapshot(ctx);
+        self.sync_live_fx();
         self.apply_theme(ctx);
         self.sync_autostart();
         self.update_window_title(ctx);
+        self.update_tray_stats();
         if let Some(at) = self.startup_minimize_at {
             let now = Instant::now();
             if now >= at {
@@ -1267,6 +1496,7 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
+        self.taskbar_stats_widget(ctx);
         self.handle_close(ctx);
         self.handle_shortcuts(ctx);
 

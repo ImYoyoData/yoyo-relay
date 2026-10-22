@@ -186,11 +186,23 @@ pub fn format_cost(cost_micros: u64) -> String {
 }
 
 pub fn format_money(amount: f64, currency: &str) -> String {
-    match currency {
-        "CNY" | "RMB" => format!("¥{amount:.2}"),
-        "USD" | "" => format!("${amount:.2}"),
+    match crate::config::normalize_currency(currency).as_str() {
+        "CNY" => format!("¥{amount:.2}"),
+        "USD" => format!("${amount:.2}"),
         other => format!("{amount:.2} {other}"),
     }
+}
+
+/// Join per-currency totals without adding unlike currencies together.
+pub fn format_currency_totals(totals: &[crate::snapshot::CurrencyTotal]) -> String {
+    if totals.is_empty() {
+        return "—".to_string();
+    }
+    totals
+        .iter()
+        .map(|total| format_money(total.amount, &total.currency))
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 pub fn format_time(ts: i64) -> String {
