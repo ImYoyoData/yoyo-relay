@@ -646,7 +646,7 @@ impl App {
                         Editor::Provider(draft) => provider_form(self, ui, draft),
                         Editor::Account(draft) => account_form(self, ui, draft),
                         Editor::Route(draft) => route_form(self, ui, draft),
-                        Editor::RouteModel(draft) => route_model_form(ui, draft),
+                        Editor::RouteModel(draft) => route_model_form(self, ui, draft),
                         Editor::LocalKey(draft) => local_key_form(ui, draft),
                         Editor::ManualBalance(draft) => manual_balance_form(self, ui, draft),
                     });
@@ -1982,119 +1982,338 @@ fn modality_toggle(ui: &mut egui::Ui, values: &mut Vec<String>, value: &str, lab
     false
 }
 
-fn route_model_form(ui: &mut egui::Ui, draft: &mut RouteModelDraft) {
-    let profile = &mut draft.profile;
-    section(ui, "模型标识");
-    egui::Grid::new("route_model_basic")
-        .num_columns(2)
-        .spacing([14.0, 8.0])
-        .show(ui, |ui| {
-            ui.label("客户端模型名");
-            ui.add(
-                TextEdit::singleline(&mut profile.client_model)
-                    .desired_width(360.0)
-                    .hint_text("客户端请求里看到的 model，例如 gpt-5-codex"),
-            );
-            ui.end_row();
-            ui.label("显示名称");
-            ui.add(
-                TextEdit::singleline(&mut profile.display_name)
-                    .desired_width(360.0)
-                    .hint_text("模型列表里展示的名称（可选）"),
-            );
-            ui.end_row();
-            ui.label("归属");
-            ui.add(
-                TextEdit::singleline(&mut profile.owned_by)
-                    .desired_width(200.0)
-                    .hint_text("yoyo-relay"),
-            );
-            ui.end_row();
-            ui.label("描述");
-            ui.add(
-                TextEdit::singleline(&mut profile.description)
-                    .desired_width(360.0)
-                    .hint_text("一句话说明（可选）"),
-            );
-            ui.end_row();
-            ui.label("启用");
-            ui.checkbox(&mut profile.enabled, "在模型列表与路由页展示");
-            ui.end_row();
-        });
+fn apply_fetched_model(draft: &mut RouteModelDraft, fetched: &crate::snapshot::FetchedModelView) {
+    if let Some(context) = fetched.context_window {
+        draft.profile.context_window = Some(context);
+    }
+    if let Some(output) = fetched.max_output_tokens {
+        draft.profile.max_output_tokens = Some(output);
+    }
+    if let (Some(context), Some(output)) = (
+        draft.profile.context_window,
+        draft.profile.max_output_tokens,
+    ) {
+        if output > context {
+            draft.profile.max_output_tokens = Some(context);
+        }
+    }
+    if !fetched.input_modalities.is_empty() {
+        draft.profile.input_modalities = fetched.input_modalities.clone();
+    }
+    if !fetched.output_modalities.is_empty() {
+        draft.profile.output_modalities = fetched.output_modalities.clone();
+    }
+    if !fetched.reasoning_levels.is_empty() {
+        draft.reasoning_text = fetched.reasoning_levels.join(",");
+    }
+    if let Some(tools) = fetched.supports_tools {
+        draft.profile.supports_tools = tools;
+    }
+    if let Some(streaming) = fetched.supports_streaming {
+        draft.profile.supports_streaming = streaming;
+    }
+}
 
-    section(ui, "上下文与输出");
-    let mut context_enabled = profile.context_window.is_some();
-    let mut context = profile.context_window.unwrap_or(0);
-    let mut output_enabled = profile.max_output_tokens.is_some();
-    let mut max_output = profile.max_output_tokens.unwrap_or(0);
-    egui::Grid::new("route_model_limits")
-        .num_columns(2)
-        .spacing([14.0, 8.0])
-        .show(ui, |ui| {
-            ui.label("上下文窗口");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut context_enabled, "设置");
-                ui.add_enabled(
-                    context_enabled,
-                    egui::DragValue::new(&mut context)
-                        .range(0..=10_000_000)
-                        .suffix(" tokens"),
+fn route_model_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteModelDraft) {
+    let lookup = if draft.is_new {
+        draft.profile.client_model.trim().to_string()
+    } else {
+        draft.original_model.clone()
+    };
+    if let Some(fetched) = app.snapshot.fetched_model.clone() {
+        if app.last_applied_fetch != Some(fetched.id)
+            && !lookup.is_empty()
+            && fetched.client_model == lookup
+        {
+            if fetched.ok {
+                apply_fetched_model(draft, &fetched);
+                app.toast(
+                    NoticeLevel::Success,
+                    format!(
+                        "已从 {} 读取「{}」的模型信息，可检查后保存",
+                        fetched.provider_name, fetched.upstream_model
+                    ),
                 );
-            });
-            ui.end_row();
-            ui.label("最大输出");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut output_enabled, "设置");
-                ui.add_enabled(
-                    output_enabled,
-                    egui::DragValue::new(&mut max_output)
-                        .range(0..=10_000_000)
-                        .suffix(" tokens"),
+            } else {
+                app.toast(NoticeLevel::Warning, fetched.message.clone());
+            }
+            app.last_applied_fetch = Some(fetched.id);
+        }
+    }
+
+    let upstreams: Vec<(String, String, String)> = app
+        .config
+        .routes
+        .iter()
+        .filter(|route| route.client_model == lookup)
+        .filter_map(|route| {
+            app.config.provider(&route.provider_id).map(|provider| {
+                (
+                    route.provider_id.clone(),
+                    provider.name.clone(),
+                    route.upstream_model.clone(),
+                )
+            })
+        })
+        .collect();
+    let mut request: Option<(String, String)> = None;
+
+    section(ui, "模型标识与上下文");
+    ui.columns(2, |cols| {
+        egui::Grid::new("route_model_basic")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(&mut cols[0], |ui| {
+                ui.label("客户端模型名");
+                ui.add(
+                    TextEdit::singleline(&mut draft.profile.client_model)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("例如 gpt-5-codex"),
                 );
+                ui.end_row();
+                ui.label("显示名称");
+                ui.add(
+                    TextEdit::singleline(&mut draft.profile.display_name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("模型列表展示名称"),
+                );
+                ui.end_row();
+                ui.label("归属");
+                ui.add(
+                    TextEdit::singleline(&mut draft.profile.owned_by)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("yoyo-relay"),
+                );
+                ui.end_row();
+                ui.label("描述");
+                ui.add(
+                    TextEdit::singleline(&mut draft.profile.description)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("一句话说明（可选）"),
+                );
+                ui.end_row();
+                ui.label("启用");
+                ui.checkbox(&mut draft.profile.enabled, "在模型列表与路由页展示");
+                ui.end_row();
             });
-            ui.end_row();
-        });
-    profile.context_window = context_enabled.then_some(context).filter(|v| *v > 0);
-    profile.max_output_tokens = output_enabled.then_some(max_output).filter(|v| *v > 0);
+
+        const DEFAULT_CONTEXT: u64 = 128_000;
+        const DEFAULT_MAX_OUTPUT: u64 = 4_096;
+        let mut context_enabled = draft.profile.context_window.is_some();
+        let mut context = draft.profile.context_window.unwrap_or(DEFAULT_CONTEXT);
+        let mut output_enabled = draft.profile.max_output_tokens.is_some();
+        let mut max_output = draft
+            .profile
+            .max_output_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT);
+        egui::Grid::new("route_model_limits")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(&mut cols[1], |ui| {
+                ui.label("上下文窗口");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut context_enabled, "设置");
+                    ui.add_enabled(
+                        context_enabled,
+                        egui::DragValue::new(&mut context)
+                            .range(1..=10_000_000)
+                            .speed(1000.0)
+                            .suffix(" tokens"),
+                    );
+                });
+                ui.end_row();
+                ui.label("最大输出");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut output_enabled, "设置");
+                    ui.add_enabled(
+                        output_enabled,
+                        egui::DragValue::new(&mut max_output)
+                            .range(1..=10_000_000)
+                            .speed(100.0)
+                            .suffix(" tokens"),
+                    );
+                });
+                ui.end_row();
+            });
+        // Keep the value while the switch is on; filtering zero made the
+        // checkbox appear to snap back off immediately.
+        draft.profile.context_window = context_enabled.then_some(context.max(1));
+        draft.profile.max_output_tokens = output_enabled.then_some(max_output.max(1));
+        if let (Some(context), Some(output)) = (
+            draft.profile.context_window,
+            draft.profile.max_output_tokens,
+        ) {
+            if output > context {
+                draft.profile.max_output_tokens = Some(context);
+            }
+        }
+
+        route_model_fetch_ui(&mut cols[1], app, &upstreams, &mut request);
+    });
 
     section(ui, "能力（模型列表会返回）");
     ui.label(RichText::new("输入模态").size(10.5).color(theme::muted(ui)));
     ui.horizontal_wrapped(|ui| {
-        modality_toggle(ui, &mut profile.input_modalities, "text", "文本");
-        modality_toggle(ui, &mut profile.input_modalities, "image", "图片");
-        modality_toggle(ui, &mut profile.input_modalities, "audio", "音频");
-        modality_toggle(ui, &mut profile.input_modalities, "file", "文件");
+        modality_toggle(ui, &mut draft.profile.input_modalities, "text", "文本");
+        modality_toggle(ui, &mut draft.profile.input_modalities, "image", "图片");
+        modality_toggle(ui, &mut draft.profile.input_modalities, "audio", "音频");
+        modality_toggle(ui, &mut draft.profile.input_modalities, "file", "文件");
     });
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.checkbox(&mut profile.supports_tools, "支持工具调用");
-        ui.checkbox(&mut profile.supports_streaming, "支持流式输出");
+        ui.checkbox(&mut draft.profile.supports_tools, "支持工具调用");
+        ui.checkbox(&mut draft.profile.supports_streaming, "支持流式输出");
     });
     ui.add_space(4.0);
-    ui.label("思考等级");
-    ui.add(
-        TextEdit::singleline(&mut draft.reasoning_text)
+    ui.horizontal(|ui| {
+        ui.label("思考等级");
+        ui.add(
+            TextEdit::singleline(&mut draft.reasoning_text)
+                .desired_width(f32::INFINITY)
+                .hint_text("off,low,medium,high；留空表示不支持"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("映射级兜底");
+        ui.add(
+            TextEdit::singleline(
+                draft
+                    .profile
+                    .fallback_client_model
+                    .get_or_insert_with(String::new),
+            )
             .desired_width(f32::INFINITY)
-            .hint_text("逗号分隔，例如 off,low,medium,high；留空表示不支持思考等级"),
+            .hint_text("所有上游都失败后改用另一个客户端模型（可选）"),
+        );
+    });
+    ui.label(
+        RichText::new("没有上游的路由模型不会出现在 /v1/models。")
+            .size(10.0)
+            .color(theme::muted(ui)),
     );
-    ui.add_space(4.0);
-    ui.label("映射级兜底（可选）");
-    ui.add(
-        TextEdit::singleline(
-            profile
-                .fallback_client_model
-                .get_or_insert_with(String::new),
-        )
-        .desired_width(f32::INFINITY)
-        .hint_text("所有上游都失败后，改用另一个客户端模型名"),
+
+    if let Some((provider_id, upstream_model)) = request {
+        let _ = app.cmd_tx.send(crate::runtime::UiCommand::FetchModelInfo {
+            provider_id,
+            upstream_model,
+            client_model: lookup,
+        });
+    }
+}
+
+fn route_model_fetch_ui(
+    ui: &mut egui::Ui,
+    app: &App,
+    upstreams: &[(String, String, String)],
+    request: &mut Option<(String, String)>,
+) {
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new("从上游读取")
+            .size(11.5)
+            .strong()
+            .color(theme::text(ui)),
     );
     ui.label(
-        RichText::new(
-            "保存后可在卡片里逐条添加上游模型；没有上游的路由模型不会出现在 /v1/models。",
-        )
-        .size(10.5)
-        .color(theme::muted(ui)),
+        RichText::new("通过上游 /models 读取上下文、输出、模态与思考等级并自动填入。")
+            .size(9.5)
+            .color(theme::muted(ui)),
     );
+    if upstreams.is_empty() {
+        ui.label(
+            RichText::new("先保存模型并添加上游模型，再回来获取。")
+                .size(9.5)
+                .color(theme::muted(ui)),
+        );
+        return;
+    }
+    let running = app.snapshot.model_fetch_running;
+    for (provider_id, provider_name, upstream_model) in upstreams {
+        egui::Frame::new()
+            .fill(theme::subtle_fill(ui))
+            .corner_radius(7)
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{provider_name} → {upstream_model}"))
+                            .size(9.8)
+                            .color(theme::text(ui)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if super::kit::secondary_button(
+                            ui,
+                            if running {
+                                icons::SPINNER
+                            } else {
+                                icons::DOWNLOAD_SIMPLE
+                            },
+                            if running { "获取中" } else { "获取" },
+                        )
+                        .clicked()
+                            && !running
+                        {
+                            *request = Some((provider_id.clone(), upstream_model.clone()));
+                        }
+                    });
+                });
+            });
+        ui.add_space(3.0);
+    }
+    if let Some(fetched) = &app.snapshot.fetched_model {
+        if upstreams
+            .iter()
+            .any(|(_, _, model)| model == &fetched.upstream_model)
+        {
+            let color = if fetched.ok {
+                theme::GREEN
+            } else {
+                theme::ORANGE
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(if fetched.ok {
+                        icons::CHECK_CIRCLE
+                    } else {
+                        icons::WARNING
+                    })
+                    .size(11.0)
+                    .color(color),
+                );
+                ui.label(
+                    RichText::new(&fetched.message)
+                        .size(9.5)
+                        .color(theme::text(ui)),
+                );
+            });
+            if fetched.ok {
+                let mut facts = Vec::new();
+                if let Some(context) = fetched.context_window {
+                    facts.push(format!("上下文 {}", widgets::format_count(context)));
+                }
+                if let Some(output) = fetched.max_output_tokens {
+                    facts.push(format!("最大输出 {}", widgets::format_count(output)));
+                }
+                if !fetched.input_modalities.is_empty() {
+                    facts.push(format!("输入 {}", fetched.input_modalities.join("/")));
+                }
+                if !facts.is_empty() {
+                    ui.label(
+                        RichText::new(facts.join(" · "))
+                            .size(9.0)
+                            .color(theme::muted(ui)),
+                    );
+                }
+                if fetched.models_seen > 0 {
+                    ui.label(
+                        RichText::new(format!("上游列表共 {} 个模型", fetched.models_seen))
+                            .size(9.0)
+                            .color(theme::muted(ui)),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn local_key_form(ui: &mut egui::Ui, draft: &mut LocalKeyDraft) {

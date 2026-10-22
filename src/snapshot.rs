@@ -241,6 +241,24 @@ impl Default for UsageView {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct FetchedModelView {
+    pub id: u64,
+    pub client_model: String,
+    pub provider_name: String,
+    pub upstream_model: String,
+    pub ok: bool,
+    pub message: String,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub input_modalities: Vec<String>,
+    pub output_modalities: Vec<String>,
+    pub reasoning_levels: Vec<String>,
+    pub supports_tools: Option<bool>,
+    pub supports_streaming: Option<bool>,
+    pub models_seen: usize,
+}
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct UiSnapshot {
@@ -265,6 +283,8 @@ pub struct UiSnapshot {
     pub alerts: Vec<Alert>,
     pub warnings: Vec<String>,
     pub balance_refreshing: bool,
+    pub fetched_model: Option<FetchedModelView>,
+    pub model_fetch_running: bool,
     pub updated_at: i64,
 }
 
@@ -297,6 +317,8 @@ impl Default for UiSnapshot {
             alerts: Vec::new(),
             warnings: Vec::new(),
             balance_refreshing: false,
+            fetched_model: None,
+            model_fetch_running: false,
             updated_at: 0,
         }
     }

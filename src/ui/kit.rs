@@ -687,6 +687,7 @@ pub fn modal_shell(
                 ui.set_width(inner_width);
                 egui::ScrollArea::vertical()
                     .max_height(max_body)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .id_salt(id.with("body"))
                     .show(ui, body);
             });

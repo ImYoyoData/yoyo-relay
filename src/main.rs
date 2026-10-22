@@ -11,6 +11,7 @@ mod protocol;
 mod runtime;
 mod scheduler;
 mod snapshot;
+mod taskbar;
 mod tray;
 mod ui;
 

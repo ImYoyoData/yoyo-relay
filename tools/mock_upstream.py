@@ -45,8 +45,26 @@ class Handler(BaseHTTPRequestHandler):
             if who not in ("good", "anthropic"):
                 self._send(401, json.dumps({"error": {"message": "missing api key"}}))
                 return
-            models = ["gpt-4o-upstream"] if who == "good" else ["claude-upstream"]
-            self._send(200, json.dumps({"object": "list", "data": [{"id": m, "object": "model"} for m in models]}))
+            if who == "good":
+                models = [{
+                    "id": "gpt-4o-upstream",
+                    "object": "model",
+                    "context_window": 128000,
+                    "max_output_tokens": 8192,
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"],
+                    "reasoning_levels": ["low", "medium", "high"],
+                    "capabilities": {"tools": True, "streaming": True},
+                }]
+            else:
+                models = [{
+                    "id": "claude-upstream",
+                    "object": "model",
+                    "context_length": 200000,
+                    "max_tokens": 4096,
+                    "architecture": {"modality": "text->text"},
+                }]
+            self._send(200, json.dumps({"object": "list", "data": models}))
             return
         self._send(404, json.dumps({"error": {"message": "not found"}}))
 

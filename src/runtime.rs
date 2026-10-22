@@ -40,6 +40,11 @@ pub enum UiCommand {
     },
     TestRoute(String),
     TestLocalKey(String),
+    FetchModelInfo {
+        provider_id: String,
+        upstream_model: String,
+        client_model: String,
+    },
     RefreshBalance(Option<String>),
     CleanupNow,
     Shutdown,
@@ -91,7 +96,10 @@ struct Shared {
     running_tests: Mutex<HashSet<String>>,
     notices: Mutex<VecDeque<Notice>>,
     next_notice: AtomicU64,
+    next_fetch: AtomicU64,
     balance_refreshing: AtomicBool,
+    fetched_model: Mutex<Option<FetchedModelView>>,
+    model_fetch_running: AtomicBool,
     warnings: Mutex<Vec<String>>,
 }
 
@@ -103,7 +111,10 @@ impl Shared {
             running_tests: Mutex::new(HashSet::new()),
             notices: Mutex::new(VecDeque::new()),
             next_notice: AtomicU64::new(1),
+            next_fetch: AtomicU64::new(1),
             balance_refreshing: AtomicBool::new(false),
+            fetched_model: Mutex::new(None),
+            model_fetch_running: AtomicBool::new(false),
             warnings: Mutex::new(warnings),
         }
     }
@@ -353,6 +364,11 @@ impl Runtime {
             } => self.spawn_account_draft_test(provider_id, name, api_key, model_hint),
             UiCommand::TestRoute(id) => self.spawn_test("route", id),
             UiCommand::TestLocalKey(id) => self.spawn_test("local_key", id),
+            UiCommand::FetchModelInfo {
+                provider_id,
+                upstream_model,
+                client_model,
+            } => self.spawn_model_fetch(provider_id, upstream_model, client_model),
             UiCommand::RefreshBalance(only) => self.spawn_balance_refresh(only, true),
             UiCommand::CleanupNow => match self.db.cleanup(self.gateway.config().ui.retention_days)
             {
@@ -555,6 +571,51 @@ impl Runtime {
                     .await;
             shared.set_running(&key, false);
             shared.insert_test(result);
+        });
+    }
+
+    fn spawn_model_fetch(&self, provider_id: String, upstream_model: String, client_model: String) {
+        if self.shared.model_fetch_running.swap(true, Ordering::SeqCst) {
+            self.shared
+                .push_notice(NoticeLevel::Info, "模型信息获取已在进行中。");
+            return;
+        }
+        let gateway = self.gateway.clone();
+        let shared = self.shared.clone();
+        let provider_name = self
+            .gateway
+            .config()
+            .provider(&provider_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        tokio::spawn(async move {
+            let fetched = probe::fetch_model_info(&gateway, &provider_id, &upstream_model).await;
+            let level = if fetched.ok {
+                NoticeLevel::Success
+            } else {
+                NoticeLevel::Warning
+            };
+            shared.push_notice(level, format!("{}：{}", upstream_model, fetched.message));
+            let view = FetchedModelView {
+                id: shared.next_fetch.fetch_add(1, Ordering::SeqCst),
+                client_model,
+                provider_name,
+                upstream_model,
+                ok: fetched.ok,
+                message: fetched.message,
+                context_window: fetched.context_window,
+                max_output_tokens: fetched.max_output_tokens,
+                input_modalities: fetched.input_modalities,
+                output_modalities: fetched.output_modalities,
+                reasoning_levels: fetched.reasoning_levels,
+                supports_tools: fetched.supports_tools,
+                supports_streaming: fetched.supports_streaming,
+                models_seen: fetched.models_seen,
+            };
+            if let Ok(mut slot) = shared.fetched_model.lock() {
+                *slot = Some(view);
+            }
+            shared.model_fetch_running.store(false, Ordering::SeqCst);
         });
     }
 
@@ -851,6 +912,13 @@ impl Runtime {
             alerts,
             warnings,
             balance_refreshing: self.shared.balance_refreshing.load(Ordering::SeqCst),
+            fetched_model: self
+                .shared
+                .fetched_model
+                .lock()
+                .map(|slot| slot.clone())
+                .unwrap_or(None),
+            model_fetch_running: self.shared.model_fetch_running.load(Ordering::SeqCst),
             updated_at: now,
         };
         Arc::new(snapshot)

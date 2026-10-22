@@ -100,6 +100,16 @@ impl App {
         } else {
             "当前平台会最小化到任务栏；托盘菜单仍可退出应用"
         };
+        let taskbar_label = if cfg!(windows) {
+            "任务栏实时徽标"
+        } else {
+            "任务栏显示请求信息"
+        };
+        let taskbar_desc = if cfg!(windows) {
+            "在 Windows 任务栏托盘左侧常驻显示活跃请求、今日 Token 与成功率；窗口标题与托盘提示同步显示"
+        } else {
+            "窗口标题与托盘提示显示活跃请求、今日 Token 与代理状态"
+        };
 
         kit::section_card(
             ui,
@@ -137,24 +147,17 @@ impl App {
                         changed = true;
                     }
                 });
-                setting_row_last(
-                    ui,
-                    icons::BROWSER,
-                    "任务栏显示请求信息",
-                    "窗口标题显示活跃请求、今日 Token 与代理状态，悬停任务栏按钮即可查看",
-                    |ui| {
-                        if kit::toggle_switch(ui, &mut self.config.ui.show_taskbar_stats).changed()
-                        {
-                            changed = true;
-                        }
-                    },
-                );
+                setting_row_last(ui, icons::BROWSER, taskbar_label, taskbar_desc, |ui| {
+                    if kit::toggle_switch(ui, &mut self.config.ui.show_taskbar_stats).changed() {
+                        changed = true;
+                    }
+                });
                 ui.add_space(5.0);
                 kit::info_row(
                     ui,
                     icons::INFO,
                     if cfg!(windows) {
-                        "托盘图标始终使用 YoyoRelay 标志：左键单击恢复主窗口，右键菜单提供「显示主窗口」与「退出」。重复启动程序会直接唤出已有窗口，不会报错。"
+                        "任务栏徽标按系统主题自动切换深浅色，鼠标点击穿透；托盘图标使用 YoyoRelay 标志，左键恢复窗口，右键菜单可显示或退出。"
                     } else {
                         "托盘图标始终使用 YoyoRelay 标志，右键菜单可显示主窗口或退出。重复启动程序会直接唤出已有窗口，不会报错。"
                     },

@@ -269,6 +269,8 @@ pub struct App {
     pub(crate) import_path: String,
     pub(crate) last_export_path: Option<String>,
     pub(crate) last_dark: Option<bool>,
+    pub(crate) last_applied_fetch: Option<u64>,
+    pub(crate) taskbar_badge: Option<crate::taskbar::TaskbarBadge>,
     pub(crate) closing: bool,
     pub(crate) last_zoom: f32,
     pub(crate) signals: Arc<crate::instance::Signals>,
@@ -330,6 +332,8 @@ impl App {
             import_path: String::new(),
             last_export_path: None,
             last_dark: None,
+            last_applied_fetch: None,
+            taskbar_badge: None,
             closing: false,
             last_zoom: 1.0,
             signals,
@@ -355,6 +359,44 @@ impl App {
                 "editor" => app.open_new_provider(),
                 "account_editor" => app.open_new_account(),
                 "route_editor" | "route_model_editor" => app.open_new_route_model(),
+                "route_model_edit" => {
+                    if let Some(model) = app
+                        .config
+                        .model_profiles
+                        .first()
+                        .map(|profile| profile.client_model.clone())
+                    {
+                        app.open_edit_route_model(&model);
+                    }
+                }
+                "route_fetch" => {
+                    if let Some(model) = app
+                        .config
+                        .model_profiles
+                        .first()
+                        .map(|profile| profile.client_model.clone())
+                    {
+                        if let Some(route) = app
+                            .config
+                            .routes
+                            .iter()
+                            .find(|route| route.client_model == model)
+                        {
+                            let _ = app.cmd_tx.send(UiCommand::FetchModelInfo {
+                                provider_id: route.provider_id.clone(),
+                                upstream_model: route.upstream_model.clone(),
+                                client_model: model.clone(),
+                            });
+                        }
+                        app.open_edit_route_model(&model);
+                    }
+                }
+                "route_upstream_editor" => {
+                    if let Some(route) = app.config.routes.first() {
+                        let client_model = route.client_model.clone();
+                        app.open_new_route(&client_model);
+                    }
+                }
                 "key_editor" => app.open_new_local_key(),
                 "onboarding" => {
                     app.show_onboarding = true;
@@ -597,6 +639,59 @@ impl App {
         };
         if let Some(tray) = self.tray.as_mut() {
             tray.update_stats(&summary, &detail);
+        }
+    }
+
+    fn taskbar_stats_widget(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            if !self.config.ui.show_taskbar_stats {
+                self.taskbar_badge = None;
+                return;
+            }
+            let (status_color, _) = self.proxy_status();
+            let running = self.snapshot.proxy.is_running();
+            let totals = &self.snapshot.today.totals;
+            let rate = if totals.requests > 0 {
+                (totals.ok as f64 * 100.0 / totals.requests as f64).round() as u64
+            } else {
+                100
+            };
+            let text = if running {
+                let mut parts = vec![
+                    format!("{} 活跃", self.snapshot.active_requests),
+                    format!("{} tok", widgets::format_count(totals.total_tokens)),
+                ];
+                if self.snapshot.queued_requests > 0 {
+                    parts.push(format!("队列 {}", self.snapshot.queued_requests));
+                }
+                parts.push(format!("{rate}%"));
+                parts.join(" · ")
+            } else {
+                "代理未运行".to_string()
+            };
+            let dark = ctx
+                .system_theme()
+                .map(|theme| theme == egui::Theme::Dark)
+                .unwrap_or(false);
+            if self.taskbar_badge.is_none() {
+                self.taskbar_badge = crate::taskbar::TaskbarBadge::new();
+            }
+            if let Some(badge) = self.taskbar_badge.as_mut() {
+                let scale = ctx
+                    .input(|i| i.viewport().native_pixels_per_point)
+                    .unwrap_or(1.0);
+                badge.update(
+                    &text,
+                    (status_color.r(), status_color.g(), status_color.b()),
+                    dark,
+                    scale,
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = ctx;
         }
     }
 
@@ -1312,6 +1407,7 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
+        self.taskbar_stats_widget(ctx);
         self.handle_close(ctx);
         self.handle_shortcuts(ctx);
 
