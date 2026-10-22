@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 5;
+pub const CONFIG_SCHEMA_VERSION: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // Top-level configuration
@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub model_profiles: Vec<ClientModelProfile>,
     /// Reusable pricing tables that routes can apply in one click.
     pub price_plans: Vec<PricePlan>,
+    /// JavaScript plugin host settings. Plugin code itself lives on disk.
+    pub plugins: PluginSettings,
     pub local_keys: Vec<LocalKey>,
 }
 
@@ -37,6 +39,7 @@ impl Default for AppConfig {
             routes: Vec::new(),
             model_profiles: Vec::new(),
             price_plans: Vec::new(),
+            plugins: PluginSettings::default(),
             local_keys: Vec::new(),
         }
     }
@@ -930,6 +933,32 @@ impl Default for Account {
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Plugins
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct PluginSettings {
+    /// Allow `host.http.*` and `fetch`-style network calls from plugins.
+    pub allow_network: bool,
+    /// Allow `host.process.run`. Disabled by default because it can execute
+    /// arbitrary local programs.
+    pub allow_process: bool,
+    /// Plugin ids the user disabled. Enabled plugins are loaded on startup.
+    pub disabled: Vec<String>,
+}
+
+impl Default for PluginSettings {
+    fn default() -> Self {
+        Self {
+            allow_network: true,
+            allow_process: false,
+            disabled: Vec::new(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Pricing

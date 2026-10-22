@@ -4,6 +4,29 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-23
+
+### 新增
+
+- **JavaScript 插件系统**（Boa 0.22）：每个插件运行在专用线程与独立 `Context` 中，支持 ES Module、`import`、`async/await`；卸载即丢弃 `Context`，由 Boa GC 回收全部对象。插件目录为 `<配置目录>/plugins`，支持目录（`plugin.json` + `main.js`）或单个 `.js` 文件；数据目录为 `plugin-data/<id>`。
+- **插件管理页**：列出插件名称、版本、状态、事件、调用次数与运行日志；支持启用/禁用、加载/卸载、重新加载、自检、复制入口路径、安装示例插件与重新扫描。内置 API 文档弹窗。
+- **生命周期与拦截事件**：`onStartup`、`onEnable`、`onDisable`、`onShutdown`、`beforeRequest`、`afterResponse`、`onRequestCompleted`、`onAccountFailure`。`beforeRequest` 可替换请求体或直接拦截并返回自定义 JSON（含状态码）；`afterResponse` 可修改非流式响应。事件按插件配置顺序串行执行，单个插件超时 3 秒即跳过。
+- **宿主 API**：`host.log`、`await host.sleep`、沙箱 `host.fs`（读写/追加/存在/列表/删除/建目录）、`await host.http.request`、`host.crypto`（SHA-256、HMAC-SHA256、随机字节、AES-256-GCM）、`host.encoding`（Base64/Base64URL/URL/Hex）、`await host.process.run`（默认关闭）、`host.ui.toast/confirm/prompt`、`host.app`（版本/端点/模型）。
+- 插件设置：网络与进程权限开关；修改权限会自动重载运行中的插件。插件启用状态持久化到配置，禁用后启动时不再加载。
+- 示例插件：`hello-plugin`（启动日志 + 完成请求写 JSONL）、`request-guard`（拦截包含 `block-me` 的请求）、`toolkit`（异步 fs/编码/哈希自检）。
+- 新增 `docs/plugins.md` 插件开发文档。
+
+### 变更
+
+- 配置 schema 升级到 6：新增插件主机设置；旧配置自动迁移。
+- 运行时启动时加载已启用插件；退出时先停止所有插件线程并释放各自 `Context`。
+- 请求路径新增插件钩子：`beforeRequest` 在鉴权与模型白名单之后、调度之前执行；`afterResponse` 在非流式响应返回前执行；用量写入后异步通知 `onRequestCompleted`。
+
+### 修复
+
+- 修复插件截获后仍继续访问上游的问题；拦截响应现在直接返回给客户端并跳过调度。
+- 插件设置与界面配置保持同步，保存其他设置不会回滚插件启用状态；运行时保存配置时保留较新的汇率与更新检查信息。
+
 ## [0.3.0] - 2026-10-23
 
 ### 新增

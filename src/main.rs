@@ -7,6 +7,7 @@ mod db;
 mod fx;
 mod gateway;
 mod instance;
+mod plugins;
 mod probe;
 mod protocol;
 mod runtime;
