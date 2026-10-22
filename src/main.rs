@@ -15,6 +15,7 @@ mod snapshot;
 mod taskbar;
 mod tray;
 mod ui;
+mod update;
 mod windowfx;
 
 use std::sync::Arc;
@@ -79,6 +80,7 @@ fn run() -> Result<()> {
     let outcome = store.load()?;
     let headless = args.iter().any(|a| a == "--headless");
     let selftest = args.iter().any(|a| a == "--selftest");
+    let speedtest = args.iter().any(|a| a == "--speedtest");
     let initial_page = args
         .iter()
         .position(|a| a == "--page")
@@ -100,6 +102,13 @@ fn run() -> Result<()> {
 
     if selftest {
         run_selftest(&outcome.config, &cmd_tx, snap_rx);
+        let _ = cmd_tx.send(runtime::UiCommand::Shutdown);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        return Ok(());
+    }
+
+    if speedtest {
+        run_speedtest(&outcome.config, &cmd_tx, snap_rx);
         let _ = cmd_tx.send(runtime::UiCommand::Shutdown);
         std::thread::sleep(std::time::Duration::from_millis(300));
         return Ok(());
@@ -261,6 +270,75 @@ fn run_selftest(
         "
 自检完成：{} 个测试，{} 个非成功结果",
         expected, failures
+    );
+}
+
+/// Run the streaming speed test for every provider and print the results.
+/// Diagnostics only: nothing is written to the usage database.
+fn run_speedtest(
+    config: &config::AppConfig,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<runtime::UiCommand>,
+    snap_rx: std::sync::mpsc::Receiver<Arc<snapshot::UiSnapshot>>,
+) {
+    use runtime::UiCommand;
+
+    let mut snapshot = match snap_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            eprintln!("测速：等待运行时超时");
+            return;
+        }
+    };
+    let mut expected = Vec::new();
+    for provider in &config.providers {
+        let key = format!("speed:{}", provider.id);
+        let _ = cmd_tx.send(UiCommand::SpeedTestProvider(provider.id.clone()));
+        expected.push(key);
+    }
+    if expected.is_empty() {
+        println!("测速：配置中没有供应商");
+        return;
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while std::time::Instant::now() < deadline {
+        if let Ok(s) = snap_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            snapshot = s;
+        }
+        if expected.iter().all(|key| snapshot.tests.contains_key(key)) {
+            break;
+        }
+    }
+
+    let mut failures = 0usize;
+    for key in &expected {
+        match snapshot.tests.get(key) {
+            Some(result) => {
+                println!(
+                    "[{}] {} → {}（{} ms）",
+                    result.kind,
+                    result.title,
+                    result.level.label(),
+                    result.latency_ms
+                );
+                println!("  {}", result.message);
+                for line in result.detail.lines() {
+                    println!("  {line}");
+                }
+                if !matches!(result.level, probe::TestLevel::Success) {
+                    failures += 1;
+                }
+            }
+            None => {
+                println!("[speed] {key} → 无结果（超时或运行时已退出）");
+                failures += 1;
+            }
+        }
+    }
+    println!(
+        "\n测速完成：{} 个供应商，{} 个未成功",
+        expected.len(),
+        failures
     );
 }
 

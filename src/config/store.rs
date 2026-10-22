@@ -281,6 +281,42 @@ impl ConfigStore {
         Ok(config)
     }
 
+    /// Export reusable price plans as a standalone JSON document. Unlike the
+    /// full configuration export this file contains no credentials at all, so
+    /// it is safe to share.
+    pub fn export_price_plans(&self, plans: &[PricePlan]) -> Result<PathBuf> {
+        fs::create_dir_all(&self.paths.exports_dir)?;
+        let file = self.paths.exports_dir.join(format!(
+            "yoyo-relay-prices-{}.json",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        ));
+        let payload = serde_json::json!({
+            "kind": "yoyo-relay-price-plans",
+            "version": 1,
+            "exported_at": now_ts(),
+            "plans": plans,
+        });
+        fs::write(&file, serde_json::to_vec_pretty(&payload)?)?;
+        Ok(file)
+    }
+
+    /// Read a price-plan document. Accepts either the wrapper written by
+    /// `export_price_plans` or a bare array of plans.
+    pub fn import_price_plans(&self, path: &Path) -> Result<Vec<PricePlan>> {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("读取价格方案失败：{}", path.display()))?;
+        let value: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
+        let plans = match value {
+            Value::Array(items) => serde_json::from_value(Value::Array(items))?,
+            Value::Object(mut obj) => {
+                let plans = obj.remove("plans").unwrap_or(Value::Null);
+                serde_json::from_value(plans)?
+            }
+            _ => return Err(anyhow!("价格方案文件格式不受支持")),
+        };
+        Ok(plans)
+    }
+
     pub fn new_local_key(&self, name: &str) -> Result<LocalKey> {
         let plaintext = generate_local_key();
         Ok(LocalKey {
@@ -323,6 +359,18 @@ fn migrate_value(mut value: Value) -> Value {
         // v2 -> v3: live FX metadata, taskbar badge settings and the optional
         // balance formula all have serde defaults, so only the marker moves.
         obj.insert("schema_version".into(), Value::from(3));
+    }
+    if version < 4 {
+        // v3 -> v4: per-route currency, cached-input pricing, peak/off-peak
+        // periods and the price-plan library. Routes that only carry the old
+        // flat USD pair keep working through `ModelRoute::effective_pricing`.
+        obj.insert("schema_version".into(), Value::from(4));
+    }
+    if version < 5 {
+        // v4 -> v5: update-check settings, percent-based balance conversion and
+        // custom badge text colour all have serde defaults, so only the marker
+        // moves.
+        obj.insert("schema_version".into(), Value::from(5));
     }
     value
 }
@@ -440,6 +488,7 @@ pub fn is_sensitive_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn roundtrip_config_with_secrets() {
@@ -477,6 +526,111 @@ mod tests {
         assert_eq!(plain, "sk-plaintext-secret");
         let raw = fs::read_to_string(&store.paths.config_file).unwrap();
         assert!(!raw.contains("sk-plaintext-secret"));
+    }
+
+    #[test]
+    fn price_plans_roundtrip_without_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path().to_path_buf());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        let store = ConfigStore::for_test(paths).unwrap();
+        let plans = vec![PricePlan {
+            name: "GLM 峰谷".into(),
+            note: "2026 秋季价".into(),
+            currency: PriceCurrency::Cny,
+            base: PriceTier {
+                input_per_mtok: 2.0,
+                cached_input_per_mtok: 0.5,
+                output_per_mtok: 8.0,
+            },
+            periods: vec![PricePeriod {
+                name: "峰时".into(),
+                start_hour: 9,
+                end_hour: 18,
+                days: vec![0, 1, 2, 3, 4],
+                tier: PriceTier {
+                    input_per_mtok: 4.0,
+                    cached_input_per_mtok: 1.0,
+                    output_per_mtok: 16.0,
+                },
+            }],
+        }];
+        let path = store.export_price_plans(&plans).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("api_key"));
+        assert!(!text.contains("sk-"));
+        let loaded = store.import_price_plans(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "GLM 峰谷");
+        assert_eq!(loaded[0].currency, PriceCurrency::Cny);
+        assert!(loaded[0].periods[0].matches(
+            chrono::Local
+                .with_ymd_and_hms(2026, 10, 19, 10, 0, 0)
+                .single()
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn imports_bare_plan_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path().to_path_buf());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        let file = paths.config_dir.join("bare.json");
+        let store = ConfigStore::for_test(paths).unwrap();
+        fs::write(
+            &file,
+            serde_json::to_vec(&serde_json::json!([{
+                "name": "USD 基础",
+                "currency": "usd",
+                "base": {"input_per_mtok": 1.0, "cached_input_per_mtok": 0.1, "output_per_mtok": 2.0}
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = store.import_price_plans(&file).unwrap();
+        assert_eq!(loaded[0].name, "USD 基础");
+        assert_eq!(loaded[0].base.output_per_mtok, 2.0);
+    }
+
+    #[test]
+    fn migrates_v3_config_and_keeps_legacy_prices() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path().to_path_buf());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        let legacy = serde_json::json!({
+            "schema_version": 3,
+            "providers": [{
+                "id": "p1",
+                "name": "P",
+                "base_url": "https://example.com/v1"
+            }],
+            "routes": [{
+                "id": "r1",
+                "client_model": "m",
+                "provider_id": "p1",
+                "upstream_model": "up",
+                "input_price_per_mtok": 1.5,
+                "output_price_per_mtok": 6.0
+            }],
+            "ui": {"fx_rates": {"USD": 1.0, "CNY": 7.2}}
+        });
+        fs::write(
+            &paths.config_file,
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let store = ConfigStore::for_test(paths).unwrap();
+        let outcome = store.load().unwrap();
+        assert_eq!(outcome.config.schema_version, CONFIG_SCHEMA_VERSION);
+        let route = outcome.config.route("r1").unwrap();
+        let pricing = route.effective_pricing();
+        assert_eq!(pricing.currency, PriceCurrency::Usd);
+        assert!((pricing.base.input_per_mtok - 1.5).abs() < 1e-9);
+        assert!((pricing.base.output_per_mtok - 6.0).abs() < 1e-9);
+        assert!(outcome.config.price_plans.is_empty());
+        // Old badges without the new switches still load.
+        assert!(!outcome.config.ui.taskbar.transparent_bg);
     }
 
     #[test]

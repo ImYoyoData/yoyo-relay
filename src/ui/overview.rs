@@ -101,16 +101,20 @@ impl App {
         }
         ui.add_space(12.0);
 
-        let recent_count = self.snapshot.recent.len();
-        let mut go_usage = false;
+        let recent_count = self
+            .snapshot
+            .calls
+            .total
+            .max(self.snapshot.recent.len() as u64);
+        let mut go_calls = false;
         super::kit::section_card(
             ui,
             icons::LIST_BULLETS,
             "最近请求",
-            &format!("{recent_count} 条记录 · 最新 12 条"),
+            &format!("共 {recent_count} 条 · 最新 12 条 · 点击「调用明细」查看分页记录"),
             |ui| {
-                if super::kit::ghost_labeled(ui, icons::ARROW_RIGHT, "全部").clicked() {
-                    go_usage = true;
+                if super::kit::ghost_labeled(ui, icons::LIST_BULLETS, "调用明细").clicked() {
+                    go_calls = true;
                 }
             },
             |ui| {
@@ -191,6 +195,13 @@ impl App {
                                             .monospace()
                                             .size(10.0),
                                         );
+                                        ui.label(
+                                            RichText::new(widgets::format_cost(
+                                                request.cost_micros,
+                                            ))
+                                            .size(9.5)
+                                            .color(theme::ORANGE),
+                                        );
                                     },
                                 );
                             });
@@ -211,14 +222,46 @@ impl App {
                                         .color(theme::muted(ui)),
                                 );
                                 super::kit::badge(ui, &request.protocol, theme::MUTED);
+                                if !request.upstream_model.is_empty()
+                                    && request.upstream_model != request.client_model
+                                {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} → {}",
+                                            request.client_model, request.upstream_model
+                                        ))
+                                        .monospace()
+                                        .size(9.0)
+                                        .color(theme::muted(ui)),
+                                    );
+                                }
+                                if request.cached_tokens > 0 {
+                                    super::kit::badge(
+                                        ui,
+                                        &format!(
+                                            "缓存 {}",
+                                            widgets::format_count(request.cached_tokens)
+                                        ),
+                                        theme::PURPLE,
+                                    );
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "入 {} · 出 {}",
+                                        widgets::format_count(request.prompt_tokens),
+                                        widgets::format_count(request.completion_tokens)
+                                    ))
+                                    .size(9.0)
+                                    .color(theme::muted(ui)),
+                                );
                             });
                         });
                     ui.add_space(4.0);
                 }
             },
         );
-        if go_usage {
-            self.page = super::Page::Usage;
+        if go_calls {
+            self.page = super::Page::Calls;
         }
     }
 

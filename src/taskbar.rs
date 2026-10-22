@@ -15,6 +15,11 @@ pub struct BadgeStyle {
     pub gap: i32,
     pub opacity: f32,
     pub show_dot: bool,
+    /// Skip the capsule fill and draw only the text/dot. Useful when the
+    /// taskbar already has enough contrast (dark theme, accent-colored taskbar).
+    pub transparent_bg: bool,
+    /// Explicit text colour (RGB), overriding theme/backdrop auto-detection.
+    pub text_color: Option<(u8, u8, u8)>,
 }
 
 impl Default for BadgeStyle {
@@ -26,6 +31,8 @@ impl Default for BadgeStyle {
             gap: 10,
             opacity: 0.95,
             show_dot: true,
+            transparent_bg: false,
+            text_color: None,
         }
     }
 }
@@ -39,10 +46,10 @@ mod imp {
     use windows_sys::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
     use windows_sys::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
-        GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER,
-        BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-        DIB_RGB_COLORS, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
-        HGDIOBJ, TRANSPARENT,
+        GetDC, GetPixel, ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA,
+        AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLEARTYPE_QUALITY,
+        DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+        DT_VCENTER, FW_NORMAL, HGDIOBJ, TRANSPARENT,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -66,7 +73,7 @@ mod imp {
         last_dot: (u8, u8, u8),
         last_size: (i32, i32),
         last_pos: (i32, i32),
-        last_style: (i32, i32, i32, u8, bool),
+        last_style: (i32, i32, i32, u8, bool, bool),
         last_paint: Instant,
         visible: bool,
     }
@@ -250,7 +257,7 @@ mod imp {
                     last_dot: (0, 0, 0),
                     last_size: (0, 0),
                     last_pos: (i32::MIN, i32::MIN),
-                    last_style: (0, 0, 0, 0, false),
+                    last_style: (0, 0, 0, 0, false, false),
                     last_paint: Instant::now() - Duration::from_secs(10),
                     visible: false,
                 })
@@ -283,6 +290,7 @@ mod imp {
                 style.gap,
                 (opacity * 255.0).round() as u8,
                 style.show_dot,
+                style.transparent_bg,
             );
             let same_content = self.last_text == text
                 && self.last_dark == dark
@@ -321,6 +329,8 @@ mod imp {
                 scale,
                 opacity,
                 style.show_dot,
+                style.transparent_bg,
+                style.text_color,
             ) {
                 self.last_text = text.to_string();
                 self.last_dark = dark;
@@ -345,6 +355,8 @@ mod imp {
             scale: f32,
             opacity: f32,
             show_dot: bool,
+            transparent_bg: bool,
+            custom_text_color: Option<(u8, u8, u8)>,
         ) -> bool {
             unsafe {
                 let mut bmi = BITMAPINFO::default();
@@ -377,28 +389,35 @@ mod imp {
                     std::slice::from_raw_parts_mut(bits as *mut u32, (width * height) as usize);
                 pixels.fill(0);
 
-                let (bg, fg, rim) = if dark {
+                let (bg, mut fg, rim) = if dark {
                     ((38, 40, 46), (236, 239, 245), (66, 70, 78))
                 } else {
                     ((252, 252, 253), (33, 41, 54), (222, 227, 234))
                 };
+                if let Some(color) = custom_text_color {
+                    fg = color;
+                } else if transparent_bg {
+                    fg = contrast_text(sample_backdrop(pos, width, height), dark);
+                }
                 let bg_alpha = 242u32;
                 let radius = height as f32 / 2.0;
                 let dot_radius = (3.4 * scale).max(2.5);
                 let dot_cx = 10.0 * scale + dot_radius;
                 let dot_cy = height as f32 / 2.0;
-                for y in 0..height {
-                    let fy = y as f32 + 0.5;
-                    for x in 0..width {
-                        let fx = x as f32 + 0.5;
-                        let distance = capsule_distance(fx, fy, width, height, radius);
-                        let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
-                        if coverage <= 0.0 {
-                            continue;
+                if !transparent_bg {
+                    for y in 0..height {
+                        let fy = y as f32 + 0.5;
+                        for x in 0..width {
+                            let fx = x as f32 + 0.5;
+                            let distance = capsule_distance(fx, fy, width, height, radius);
+                            let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
+                            if coverage <= 0.0 {
+                                continue;
+                            }
+                            let color = if distance > radius - 1.2 { rim } else { bg };
+                            let alpha = (bg_alpha as f32 * coverage) as u32;
+                            pixels[(y * width + x) as usize] = argb(alpha, color);
                         }
-                        let color = if distance > radius - 1.2 { rim } else { bg };
-                        let alpha = (bg_alpha as f32 * coverage) as u32;
-                        pixels[(y * width + x) as usize] = argb(alpha, color);
                     }
                 }
 
@@ -413,40 +432,97 @@ mod imp {
                                 continue;
                             }
                             let idx = (y * width + x) as usize;
-                            let (r, g, b) = (
-                                (dot.0 as f32 * coverage + bg.0 as f32 * (1.0 - coverage)) as u8,
-                                (dot.1 as f32 * coverage + bg.1 as f32 * (1.0 - coverage)) as u8,
-                                (dot.2 as f32 * coverage + bg.2 as f32 * (1.0 - coverage)) as u8,
-                            );
-                            pixels[idx] = argb(bg_alpha, (r, g, b));
+                            // On a transparent background blend the dot against
+                            // transparency instead of the (unused) capsule fill.
+                            let base_alpha = if transparent_bg {
+                                (255.0 * coverage) as u32
+                            } else {
+                                bg_alpha
+                            };
+                            let (r, g, b) = if transparent_bg {
+                                (dot.0, dot.1, dot.2)
+                            } else {
+                                (
+                                    (dot.0 as f32 * coverage + bg.0 as f32 * (1.0 - coverage))
+                                        as u8,
+                                    (dot.1 as f32 * coverage + bg.1 as f32 * (1.0 - coverage))
+                                        as u8,
+                                    (dot.2 as f32 * coverage + bg.2 as f32 * (1.0 - coverage))
+                                        as u8,
+                                )
+                            };
+                            pixels[idx] = argb(base_alpha, (r, g, b));
                         }
                     }
                 }
 
-                let before = pixels.to_vec();
-                let dc = CreateCompatibleDC(std::ptr::null_mut());
+                let text_left = if show_dot {
+                    (dot_cx + dot_radius + 7.0 * scale) as i32
+                } else {
+                    (9.0 * scale) as i32
+                };
+                let text_right = width - (8.0 * scale) as i32;
+                let text_wide = wide(text);
+
+                let (dc, mask_dib, mask_bits) = if transparent_bg {
+                    // Draw the glyphs as a white-on-black mask so their
+                    // grayscale becomes per-pixel alpha. Drawing straight into
+                    // the colour surface would antialias against black and
+                    // leave dark halos on the real taskbar.
+                    let mut mask_bits: *mut c_void = std::ptr::null_mut();
+                    let mask_dib = CreateDIBSection(
+                        std::ptr::null_mut(),
+                        &bmi,
+                        DIB_RGB_COLORS,
+                        &mut mask_bits,
+                        std::ptr::null_mut(),
+                        0,
+                    );
+                    if mask_dib.is_null() || mask_bits.is_null() {
+                        DeleteObject(dib as HGDIOBJ);
+                        return false;
+                    }
+                    let mask = std::slice::from_raw_parts_mut(
+                        mask_bits as *mut u32,
+                        (width * height) as usize,
+                    );
+                    mask.fill(0);
+                    let dc = CreateCompatibleDC(std::ptr::null_mut());
+                    if dc.is_null() {
+                        DeleteObject(mask_dib as HGDIOBJ);
+                        DeleteObject(dib as HGDIOBJ);
+                        return false;
+                    }
+                    (dc, mask_dib, mask_bits)
+                } else {
+                    (
+                        CreateCompatibleDC(std::ptr::null_mut()),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
                 if dc.is_null() {
                     DeleteObject(dib as HGDIOBJ);
                     return false;
                 }
-                let old_bitmap = SelectObject(dc, dib as HGDIOBJ);
+                let before = pixels.to_vec();
+                let target = if transparent_bg { mask_dib } else { dib };
+                let old_bitmap = SelectObject(dc, target as HGDIOBJ);
                 SetBkMode(dc, TRANSPARENT as i32);
-                SetTextColor(dc, colorref(fg));
+                SetTextColor(
+                    dc,
+                    colorref(if transparent_bg { (255, 255, 255) } else { fg }),
+                );
                 let font = create_font(scale);
                 let old_font = if font.is_null() {
                     std::ptr::null_mut()
                 } else {
                     SelectObject(dc, font as HGDIOBJ)
                 };
-                let text_wide = wide(text);
                 let mut rect = RECT {
-                    left: if show_dot {
-                        (dot_cx + dot_radius + 7.0 * scale) as i32
-                    } else {
-                        (9.0 * scale) as i32
-                    },
+                    left: text_left,
                     top: 0,
-                    right: width - (8.0 * scale) as i32,
+                    right: text_right,
                     bottom: height,
                 };
                 DrawTextW(
@@ -456,14 +532,35 @@ mod imp {
                     &mut rect,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                 );
-                // GDI does not maintain the alpha channel. Pixels whose RGB was
-                // touched by the glyphs become opaque.
-                for (idx, pixel) in pixels.iter_mut().enumerate() {
-                    if (*pixel & 0x00FF_FFFF) != (before[idx] & 0x00FF_FFFF) {
-                        *pixel = (*pixel & 0x00FF_FFFF) | 0xFF00_0000;
+                if transparent_bg {
+                    let mask = std::slice::from_raw_parts(
+                        mask_bits as *const u32,
+                        (width * height) as usize,
+                    );
+                    for (idx, pixel) in pixels.iter_mut().enumerate() {
+                        let sample = mask[idx];
+                        let coverage = (sample & 0xFF) as u32;
+                        if coverage == 0 {
+                            continue;
+                        }
+                        *pixel = argb(coverage, fg);
+                    }
+                } else {
+                    // GDI does not maintain the alpha channel. Pixels whose RGB
+                    // was touched by the glyphs become opaque.
+                    for (idx, pixel) in pixels.iter_mut().enumerate() {
+                        if (*pixel & 0x00FF_FFFF) != (before[idx] & 0x00FF_FFFF) {
+                            *pixel = (*pixel & 0x00FF_FFFF) | 0xFF00_0000;
+                        }
                     }
                 }
 
+                // The DC currently has the text mask selected in transparent
+                // mode; UpdateLayeredWindow must upload the composited colour
+                // surface instead.
+                if !mask_dib.is_null() {
+                    SelectObject(dc, dib as HGDIOBJ);
+                }
                 let screen = GetDC(std::ptr::null_mut());
                 let blend = BLENDFUNCTION {
                     BlendOp: AC_SRC_OVER as u8,
@@ -498,6 +595,9 @@ mod imp {
                 }
                 SelectObject(dc, old_bitmap);
                 DeleteDC(dc);
+                if !mask_dib.is_null() {
+                    DeleteObject(mask_dib as HGDIOBJ);
+                }
                 DeleteObject(dib as HGDIOBJ);
                 true
             }
@@ -509,6 +609,55 @@ mod imp {
             unsafe {
                 DestroyWindow(self.hwnd);
             }
+        }
+    }
+
+    /// Sample the desktop just below the badge so a transparent badge can pick
+    /// text that stays legible on both light and dark taskbars.
+    fn sample_backdrop(pos: (i32, i32), width: i32, height: i32) -> Option<(u8, u8, u8)> {
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            if screen.is_null() {
+                return None;
+            }
+            // Probe just left and right of the badge at mid-height: that strip
+            // is bare taskbar, whereas the area under the badge can fall past
+            // the taskbar edge.
+            let y = pos.1 + height / 2;
+            let mut sum = (0u32, 0u32, 0u32);
+            let mut count = 0u32;
+            for dx in [-14, -8, width + 8, width + 14] {
+                let color = GetPixel(screen, pos.0 + dx, y);
+                if color == u32::MAX {
+                    continue;
+                }
+                sum.0 += color & 0xFF;
+                sum.1 += (color >> 8) & 0xFF;
+                sum.2 += (color >> 16) & 0xFF;
+                count += 1;
+            }
+            ReleaseDC(std::ptr::null_mut(), screen);
+            (count > 0).then(|| {
+                (
+                    (sum.0 / count) as u8,
+                    (sum.1 / count) as u8,
+                    (sum.2 / count) as u8,
+                )
+            })
+        }
+    }
+
+    /// Pick near-black or near-white text for the given backdrop.
+    fn contrast_text(backdrop: Option<(u8, u8, u8)>, dark: bool) -> (u8, u8, u8) {
+        let Some((r, g, b)) = backdrop else {
+            return if dark { (236, 239, 245) } else { (33, 41, 54) };
+        };
+        // Rec. 601 luma is accurate enough to choose between two extremes.
+        let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+        if luma > 140.0 {
+            (24, 30, 40)
+        } else {
+            (243, 246, 250)
         }
     }
 

@@ -8,8 +8,10 @@ use serde_json::{json, Value};
 
 use crate::config::{now_ts, Account, Protocol, Provider};
 use crate::gateway::{apply_auth, readable_reqwest_error, upstream_error_message, Gateway};
+use futures_util::StreamExt;
+
 use crate::protocol::{
-    build_upstream_body, extract_nonstream_usage, route_supports_ingress, Ingress,
+    build_upstream_body, extract_nonstream_usage, route_supports_ingress, Ingress, SseDecoder,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +49,11 @@ pub struct TestResult {
     pub detail: String,
     pub models: Vec<String>,
     pub tokens: Option<u64>,
+    /// Measured decode throughput (completion tokens per second) for a speed
+    /// test. `None` for ordinary connectivity probes.
+    pub tokens_per_sec: Option<f64>,
+    /// Time to first streamed chunk, in milliseconds.
+    pub first_token_ms: Option<u64>,
     pub at: i64,
 }
 
@@ -63,6 +70,8 @@ impl TestResult {
             detail: String::new(),
             models: Vec::new(),
             tokens: None,
+            tokens_per_sec: None,
+            first_token_ms: None,
             at: now_ts(),
         }
     }
@@ -1286,4 +1295,676 @@ pub async fn half_open_probe(
     };
     let data = probe_credentials(gw, provider, &key, model_hint.as_deref(), true).await;
     matches!(data.level, TestLevel::Success)
+}
+
+// ---------------------------------------------------------------------------
+// Speed test (tokens per second)
+// ---------------------------------------------------------------------------
+
+/// Generation budget for a speed test. Large enough that the first-token
+/// latency does not dominate the measurement, small enough to stay cheap.
+const SPEED_TEST_MAX_TOKENS: u32 = 256;
+
+fn speed_prompt() -> &'static str {
+    "Write a detailed technical explanation of how TCP congestion control works. \
+     Cover slow start, congestion avoidance, fast retransmit and the difference \
+     between Reno and CUBIC. Keep writing continuously."
+}
+
+fn speed_body(protocol: Protocol, model: &str) -> Value {
+    match protocol {
+        Protocol::OpenAiChat => json!({
+            "model": model,
+            "messages": [{"role": "user", "content": speed_prompt()}],
+            "max_tokens": SPEED_TEST_MAX_TOKENS,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }),
+        Protocol::AnthropicMessages => json!({
+            "model": model,
+            "messages": [{"role": "user", "content": speed_prompt()}],
+            "max_tokens": SPEED_TEST_MAX_TOKENS,
+            "stream": true
+        }),
+        Protocol::OpenAiResponses => json!({
+            "model": model,
+            "input": speed_prompt(),
+            "max_output_tokens": SPEED_TEST_MAX_TOKENS,
+            "stream": true
+        }),
+    }
+}
+
+/// Build and send one speed-test request, mapping failures to readable text.
+#[allow(clippy::too_many_arguments)]
+async fn send_speed_request(
+    gw: &Gateway,
+    provider: &Provider,
+    key: &str,
+    url: &str,
+    protocol: Protocol,
+    body: &Value,
+    timeout_secs: u64,
+) -> Result<reqwest::Response, String> {
+    let mut req = gw
+        .client_for(url)
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            reqwest::header::ACCEPT,
+            "text/event-stream, application/json",
+        )
+        .json(body);
+    req = apply_auth(req, &provider.auth, key).map_err(|err| format!("鉴权头配置无效：{err}"))?;
+    for h in &provider.extra_headers {
+        if !h.name.trim().is_empty() {
+            req = req.header(h.name.trim(), h.value.as_str());
+        }
+    }
+    if protocol == Protocol::AnthropicMessages
+        && !provider
+            .extra_headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("anthropic-version"))
+    {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), req.send()).await {
+        Err(_) => Err(format!("连接超时（{timeout_secs}s）")),
+        Ok(Err(err)) => Err(readable_reqwest_error(&err)),
+        Ok(Ok(resp)) => Ok(resp),
+    }
+}
+
+/// Length of assistant text in a non-streaming response body.
+fn nonstream_text_chars(protocol: Protocol, value: &Value) -> usize {
+    let text = match protocol {
+        Protocol::OpenAiChat => value
+            .pointer("/choices/0/message/content")
+            .or_else(|| value.pointer("/choices/0/text")),
+        // Anthropic returns an array of content blocks; every text block is
+        // generated output and should count toward the estimate.
+        Protocol::AnthropicMessages => value
+            .get("content")
+            .filter(|content| content.is_array())
+            .or_else(|| value.get("completion")),
+        Protocol::OpenAiResponses => value
+            .pointer("/output_text")
+            .or_else(|| value.pointer("/output"))
+            .or_else(|| value.pointer("/response/output")),
+    };
+    let chars = match text {
+        Some(Value::String(text)) => text.chars().count(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .map(|text| text.chars().count())
+            .sum(),
+        _ => 0,
+    };
+    if chars > 0 {
+        return chars;
+    }
+    // Dialect mismatch fallback: count any normal content field.
+    generic_stream_text(value)
+        .map(|text| text.chars().count())
+        .unwrap_or(0)
+}
+
+/// Measure decode throughput against one account.
+///
+/// The request asks for a bounded amount of streaming output, then reports
+/// completion tokens divided by the time between the first token and the last.
+/// Time to first token (TTFT) is reported separately, because it reflects queue
+/// and prefill latency rather than generation speed.
+pub async fn test_speed_account(
+    gw: &Gateway,
+    account_id: &str,
+    model_hint: Option<String>,
+) -> TestResult {
+    let cfg = gw.config();
+    let mut result = TestResult::new(&format!("speed:{account_id}"), "speed", "账号测速");
+    let Some(account) = cfg.account(account_id).cloned() else {
+        result.level = TestLevel::Error;
+        result.message = "账号不存在".into();
+        return result;
+    };
+    result.title = account.name.clone();
+    let Some(provider) = cfg.provider(&account.provider_id).cloned() else {
+        result.level = TestLevel::Error;
+        result.message = "账号所属供应商不存在".into();
+        return result;
+    };
+    let key = match gw.master.decrypt(&account.api_key) {
+        Ok(k) => k,
+        Err(err) => {
+            result.level = TestLevel::Error;
+            result.message = format!("Key 无法解密：{err}");
+            return result;
+        }
+    };
+    let model = model_hint
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| {
+            cfg.routes
+                .iter()
+                .find(|r| r.provider_id == provider.id)
+                .map(|r| r.upstream_model.clone())
+        })
+        .or_else(|| provider.test_model.clone())
+        .unwrap_or_else(|| default_test_model(&provider));
+    let protocol = provider.protocol_for(&model, None);
+    let url = minimal_url(&provider, protocol);
+    let body = speed_body(protocol, &model);
+
+    let timeout = provider.timeout_secs.unwrap_or(120).max(20);
+    let mut payload = body;
+    let mut started = Instant::now();
+    let mut resp =
+        match send_speed_request(gw, &provider, &key, &url, protocol, &payload, timeout).await {
+            Ok(resp) => resp,
+            Err(message) => {
+                result.level = TestLevel::Unreachable;
+                result.message = message;
+                result.latency_ms = started.elapsed().as_millis() as u64;
+                return result;
+            }
+        };
+    let mut status = resp.status().as_u16();
+    // Some OpenAI-compatible gateways reject `stream_options`; retry once
+    // without it rather than failing the speed test.
+    if status == 400 && protocol == Protocol::OpenAiChat && payload.get("stream_options").is_some()
+    {
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("stream_options");
+        }
+        started = Instant::now();
+        resp = match send_speed_request(gw, &provider, &key, &url, protocol, &payload, timeout)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(message) => {
+                result.level = TestLevel::Unreachable;
+                result.message = message;
+                return result;
+            }
+        };
+        status = resp.status().as_u16();
+    }
+    result.status = Some(status);
+    if status == 401 || status == 403 {
+        result.level = TestLevel::AuthFailed;
+        result.message = "Key 无效或无权限".into();
+        result.latency_ms = started.elapsed().as_millis() as u64;
+        return result;
+    }
+    if status == 429 {
+        result.level = TestLevel::RateLimited;
+        result.message = "当前被限流，无法测速".into();
+        result.latency_ms = started.elapsed().as_millis() as u64;
+        return result;
+    }
+    if !(200..300).contains(&status) {
+        let text = tokio::time::timeout(Duration::from_secs(10), resp.text())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        result.level = TestLevel::Error;
+        result.message = format!("HTTP {status}：{}", upstream_error_message(&text));
+        result.latency_ms = started.elapsed().as_millis() as u64;
+        return result;
+    }
+
+    let mut stream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+    > = Box::pin(resp.bytes_stream());
+    let mut decoder = SseDecoder::default();
+    let mut raw: Vec<u8> = Vec::new();
+    let mut first_token_at: Option<Duration> = None;
+    let mut last_token_at = started.elapsed();
+    let mut usage = crate::protocol::Usage::default();
+    let mut produced_chars = 0usize;
+    let idle = Duration::from_secs(30);
+    loop {
+        if started.elapsed() > Duration::from_secs(timeout) {
+            break;
+        }
+        match tokio::time::timeout(idle, stream.next()).await {
+            Err(_) => break,
+            Ok(None) => break,
+            Ok(Some(Err(_))) => break,
+            Ok(Some(Ok(chunk))) => {
+                if raw.len() < 512 * 1024 {
+                    raw.extend_from_slice(&chunk);
+                }
+                for event in decoder.push(&chunk) {
+                    note_speed_event(
+                        protocol,
+                        &event,
+                        started,
+                        &mut first_token_at,
+                        &mut last_token_at,
+                        &mut produced_chars,
+                        &mut usage,
+                    );
+                }
+            }
+        }
+        if usage.output_tokens > 0 && first_token_at.is_some() {
+            break;
+        }
+    }
+    if let Some(event) = decoder.flush() {
+        note_speed_event(
+            protocol,
+            &event,
+            started,
+            &mut first_token_at,
+            &mut last_token_at,
+            &mut produced_chars,
+            &mut usage,
+        );
+    }
+
+    let elapsed = started.elapsed();
+    result.latency_ms = elapsed.as_millis() as u64;
+    result.first_token_ms = first_token_at.map(|d| d.as_millis() as u64);
+    if first_token_at.is_none() && usage.output_tokens > 0 {
+        // No delta text was recognised, but the upstream did report output
+        // tokens. Throughput over the whole request is still a useful number.
+        let tokens = usage.output_tokens;
+        let measured = elapsed.as_secs_f64().max(0.05);
+        let tps = tokens as f64 / measured;
+        result.tokens = Some(tokens);
+        result.tokens_per_sec = Some(tps);
+        result.level = TestLevel::Success;
+        result.message = format!("{:.1} tok/s · {} tokens（按上游 usage 计时）", tps, tokens);
+        result.detail = format!(
+            "POST {url}\n协议: {}\n模型: {}\nHTTP {status}\n\
+             未捕获增量文本，使用上游 usage 的 output_tokens 计时\n\
+             生成速度: {:.2} tokens/s\n生成 token: {}\n总耗时: {}ms",
+            protocol.label(),
+            model,
+            tps,
+            tokens,
+            elapsed.as_millis()
+        );
+        return result;
+    }
+    let Some(first_at) = first_token_at else {
+        // The upstream may have ignored `stream` and returned a plain JSON
+        // body; measure that instead of reporting a failure.
+        if let Ok(value) = serde_json::from_slice::<Value>(&raw) {
+            let usage = crate::protocol::extract_nonstream_usage(protocol, &value);
+            let chars = nonstream_text_chars(protocol, &value);
+            let tokens = if usage.output_tokens > 0 {
+                usage.output_tokens
+            } else {
+                (chars / 4).max(1) as u64
+            };
+            if tokens > 0 && elapsed.as_secs_f64() > 0.05 {
+                let tps = tokens as f64 / elapsed.as_secs_f64();
+                result.status = Some(status);
+                result.tokens = Some(tokens);
+                result.tokens_per_sec = Some(tps);
+                result.level = TestLevel::Success;
+                result.message = format!("{:.1} tok/s · {} tokens（非流式）", tps, tokens);
+                result.detail = format!(
+                    "POST {url}\n协议: {}\n模型: {}\nHTTP {status}\n\
+                     上游未返回 SSE，按非流式响应计时\n\
+                     生成速度: {:.2} tokens/s\n生成 token: {}\n总耗时: {}ms",
+                    protocol.label(),
+                    model,
+                    tps,
+                    tokens,
+                    elapsed.as_millis()
+                );
+                return result;
+            }
+        }
+        result.level = TestLevel::Warning;
+        result.message = "上游接受了请求，但没有返回可测量的文本，无法测速".into();
+        result.detail = format!(
+            "POST {url}\n协议: {}\n模型: {}\nHTTP {status}\n总耗时: {}ms",
+            protocol.label(),
+            model,
+            elapsed.as_millis()
+        );
+        return result;
+    };
+    let tokens = if usage.output_tokens > 0 {
+        usage.output_tokens
+    } else {
+        (produced_chars / 4).max(1) as u64
+    };
+    let decode_secs = last_token_at.saturating_sub(first_at).as_secs_f64();
+    let measured = if usage.output_tokens > 0 && decode_secs > 0.05 {
+        decode_secs
+    } else {
+        // No usage block: the stream keeps flowing until the cap, so subtract
+        // TTFT from the total wall time.
+        elapsed.saturating_sub(first_at).as_secs_f64().max(0.05)
+    };
+    let tps = tokens as f64 / measured;
+    result.tokens = Some(tokens);
+    result.tokens_per_sec = Some(tps);
+    result.level = TestLevel::Success;
+    result.message = format!(
+        "{:.1} tok/s · TTFT {}ms · {} tokens",
+        tps,
+        result.first_token_ms.unwrap_or(0),
+        tokens
+    );
+    result.detail = format!(
+        "POST {url}\n协议: {}\n模型: {}\nHTTP {status}\n\
+         生成速度: {:.2} tokens/s\n首字延迟: {}ms\n生成 token: {}{}\n总耗时: {}ms",
+        protocol.label(),
+        model,
+        tps,
+        result.first_token_ms.unwrap_or(0),
+        tokens,
+        if usage.output_tokens == 0 {
+            "（按字符估算）"
+        } else {
+            ""
+        },
+        elapsed.as_millis()
+    );
+    result
+}
+
+/// Speed-test every enabled account of a provider, sequentially, and summarize.
+pub async fn test_speed_provider(gw: &Gateway, provider_id: &str) -> TestResult {
+    let cfg = gw.config();
+    let mut result = TestResult::new(&format!("speed:{provider_id}"), "speed", "供应商测速");
+    let Some(provider) = cfg.provider(provider_id).cloned() else {
+        result.level = TestLevel::Error;
+        result.message = "供应商不存在".into();
+        return result;
+    };
+    result.title = provider.name.clone();
+    let mut accounts = cfg.accounts_of(&provider.id);
+    accounts.retain(|a| a.enabled);
+    accounts.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+    if accounts.is_empty() {
+        result.level = TestLevel::Error;
+        result.message = "该供应商没有启用的账号".into();
+        return result;
+    }
+    let model_hint = cfg
+        .routes
+        .iter()
+        .find(|r| r.provider_id == provider.id)
+        .map(|r| r.upstream_model.clone())
+        .or_else(|| provider.test_model.clone());
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut best: Option<(String, f64)> = None;
+    let mut measured = 0usize;
+    for account in &accounts {
+        let one = test_speed_account(gw, &account.id, model_hint.clone()).await;
+        match one.tokens_per_sec {
+            Some(tps) => {
+                measured += 1;
+                lines.push(format!(
+                    "账号「{}」：{:.1} tok/s · TTFT {}ms · {} tokens",
+                    account.name,
+                    tps,
+                    one.first_token_ms.unwrap_or(0),
+                    one.tokens.unwrap_or(0)
+                ));
+                if best
+                    .as_ref()
+                    .map(|(_, current)| tps > *current)
+                    .unwrap_or(true)
+                {
+                    best = Some((account.name.clone(), tps));
+                }
+            }
+            None => lines.push(format!(
+                "账号「{}」：{} — {}",
+                account.name,
+                one.level.label(),
+                one.message
+            )),
+        }
+    }
+    result.detail = format!(
+        "供应商: {}\nBase URL: {}\n账号数: {}\n\n{}",
+        provider.name,
+        provider.base_url,
+        accounts.len(),
+        lines.join("\n")
+    );
+    match best {
+        Some((name, tps)) => {
+            result.level = TestLevel::Success;
+            result.tokens_per_sec = Some(tps);
+            result.message = format!(
+                "最快账号「{name}」{tps:.1} tok/s（{measured}/{} 个账号测速成功）",
+                accounts.len()
+            );
+        }
+        None => {
+            result.level = TestLevel::Warning;
+            result.message = format!("{} 个账号均未能完成测速", accounts.len());
+        }
+    }
+    result
+}
+
+/// Extract generated text from a streaming event. All three dialects have
+/// several variants in the wild (reasoning deltas, tool arguments, gateways
+/// that send a whole message instead of a delta), and any of them proves the
+/// model is producing tokens, which is all the speed test needs.
+fn text_delta(protocol: Protocol, value: &Value) -> Option<&str> {
+    match protocol {
+        Protocol::OpenAiChat => value
+            .pointer("/choices/0/delta/content")
+            .or_else(|| value.pointer("/choices/0/delta/reasoning_content"))
+            .or_else(|| value.pointer("/choices/0/delta/reasoning"))
+            .or_else(|| value.pointer("/choices/0/message/content"))
+            .or_else(|| value.pointer("/choices/0/text"))
+            .or_else(|| value.pointer("/choices/0/delta/tool_calls/0/function/arguments"))
+            .and_then(as_text),
+        Protocol::AnthropicMessages => {
+            let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            match kind {
+                "content_block_delta" => value
+                    .pointer("/delta/text")
+                    .or_else(|| value.pointer("/delta/thinking"))
+                    .or_else(|| value.pointer("/delta/partial_json"))
+                    .and_then(as_text),
+                "content_block_start" => value.pointer("/content_block/text").and_then(as_text),
+                _ => None,
+            }
+        }
+        Protocol::OpenAiResponses => {
+            let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            match kind {
+                "response.output_text.delta"
+                | "response.reasoning_text.delta"
+                | "response.function_call_arguments.delta" => value.get("delta").and_then(as_text),
+                "response.output_text.done" => value.get("text").and_then(as_text),
+                _ => None,
+            }
+        }
+    }
+    // Last resort: providers sometimes speak a slightly different dialect than
+    // configured (or wrap text in extra fields). Any generated text is enough
+    // to measure speed.
+    .or_else(|| generic_stream_text(value))
+}
+
+/// Depth-limited search for a generated-text field. Only used when the
+/// protocol-specific extractor finds nothing, and only keys that are almost
+/// always assistant output are considered.
+fn generic_stream_text(value: &Value) -> Option<&str> {
+    const KEYS: [&str; 8] = [
+        "output_text",
+        "reasoning_content",
+        "partial_json",
+        "arguments",
+        "content",
+        "thinking",
+        "text",
+        "delta",
+    ];
+    for key in KEYS {
+        if let Some(found) = find_key(value, key, 5) {
+            if let Some(text) = as_text(found) {
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_key<'a>(value: &'a Value, key: &str, depth: u8) -> Option<&'a Value> {
+    if depth == 0 {
+        return None;
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map.get(key) {
+                return Some(found);
+            }
+            map.values()
+                .find_map(|child| find_key(child, key, depth - 1))
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|child| find_key(child, key, depth - 1)),
+        _ => None,
+    }
+}
+
+/// Accept a plain string or an array of content parts.
+fn as_text(value: &Value) -> Option<&str> {
+    if let Some(text) = value.as_str() {
+        return Some(text);
+    }
+    value
+        .as_array()
+        .and_then(|parts| parts.iter().find_map(|part| part.get("text")?.as_str()))
+}
+
+/// Feed one SSE event into the running speed measurement.
+fn note_speed_event(
+    protocol: Protocol,
+    event: &crate::protocol::SseEvent,
+    started: Instant,
+    first_token_at: &mut Option<Duration>,
+    last_token_at: &mut Duration,
+    produced_chars: &mut usize,
+    usage: &mut crate::protocol::Usage,
+) {
+    let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+        return;
+    };
+    if let Some(delta) = text_delta(protocol, &value) {
+        if !delta.is_empty() {
+            if first_token_at.is_none() {
+                *first_token_at = Some(started.elapsed());
+            }
+            *last_token_at = started.elapsed();
+            *produced_chars += delta.chars().count();
+        }
+    }
+    *usage = merge_stream_usage(protocol, &value, *usage);
+}
+
+fn merge_stream_usage(
+    protocol: Protocol,
+    value: &Value,
+    current: crate::protocol::Usage,
+) -> crate::protocol::Usage {
+    let usage = match protocol {
+        Protocol::OpenAiChat => value.get("usage"),
+        Protocol::AnthropicMessages => value
+            .pointer("/message/usage")
+            .or_else(|| value.get("usage")),
+        Protocol::OpenAiResponses => value
+            .pointer("/response/usage")
+            .or_else(|| value.get("usage")),
+    };
+    match usage.and_then(Value::as_object) {
+        Some(object) => {
+            let next = crate::protocol::usage_from_object(protocol, object);
+            crate::protocol::Usage {
+                input_tokens: current.input_tokens.max(next.input_tokens),
+                cached_tokens: current.cached_tokens.max(next.cached_tokens),
+                output_tokens: current.output_tokens.max(next.output_tokens),
+                total_tokens: current.total_tokens.max(next.total_tokens),
+                estimated: current.estimated,
+            }
+        }
+        None => current,
+    }
+}
+
+#[cfg(test)]
+mod speed_probe_tests {
+    use super::*;
+
+    #[test]
+    fn reads_text_deltas_from_each_protocol() {
+        let chat = json!({"choices":[{"delta":{"content":"hello"}}]});
+        assert_eq!(text_delta(Protocol::OpenAiChat, &chat), Some("hello"));
+
+        let anthropic =
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}});
+        assert_eq!(
+            text_delta(Protocol::AnthropicMessages, &anthropic),
+            Some("hi")
+        );
+
+        let responses = json!({"type":"response.output_text.delta","delta":"yo"});
+        assert_eq!(
+            text_delta(Protocol::OpenAiResponses, &responses),
+            Some("yo")
+        );
+        assert_eq!(text_delta(Protocol::OpenAiChat, &json!({})), None);
+    }
+
+    #[test]
+    fn merges_stream_usage_upwards() {
+        let first = json!({"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}});
+        let second = json!({"usage":{"prompt_tokens":10,"completion_tokens":9,"total_tokens":19}});
+        let usage = merge_stream_usage(
+            Protocol::OpenAiChat,
+            &first,
+            crate::protocol::Usage::default(),
+        );
+        let usage = merge_stream_usage(Protocol::OpenAiChat, &second, usage);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.total_tokens, 19);
+    }
+
+    #[test]
+    fn counts_nonstream_text_for_estimates() {
+        let chat = json!({"choices":[{"message":{"content":"four words here"}}]});
+        assert_eq!(
+            nonstream_text_chars(Protocol::OpenAiChat, &chat),
+            "four words here".chars().count()
+        );
+        let anthropic =
+            json!({"content":[{"type":"text","text":"abc"},{"type":"text","text":"de"}]});
+        assert_eq!(
+            nonstream_text_chars(Protocol::AnthropicMessages, &anthropic),
+            5
+        );
+        let responses = json!({"output_text":"hello"});
+        assert_eq!(
+            nonstream_text_chars(Protocol::OpenAiResponses, &responses),
+            5
+        );
+    }
 }

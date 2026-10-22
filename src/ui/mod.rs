@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod balances;
 pub mod brands;
+pub mod calls;
 pub mod editors;
 pub mod keys;
 pub mod kit;
@@ -34,18 +35,20 @@ pub enum SettingsTab {
     Taskbar,
     Proxy,
     Scheduler,
+    Pricing,
     Security,
     Data,
     About,
 }
 
 impl SettingsTab {
-    pub fn all() -> [SettingsTab; 7] {
+    pub fn all() -> [SettingsTab; 8] {
         [
             SettingsTab::General,
             SettingsTab::Taskbar,
             SettingsTab::Proxy,
             SettingsTab::Scheduler,
+            SettingsTab::Pricing,
             SettingsTab::Security,
             SettingsTab::Data,
             SettingsTab::About,
@@ -58,6 +61,7 @@ impl SettingsTab {
             SettingsTab::Taskbar => "任务栏徽标",
             SettingsTab::Proxy => "代理",
             SettingsTab::Scheduler => "调度与熔断",
+            SettingsTab::Pricing => "计费价格",
             SettingsTab::Security => "安全",
             SettingsTab::Data => "数据",
             SettingsTab::About => "关于",
@@ -70,6 +74,7 @@ impl SettingsTab {
             SettingsTab::Taskbar => icons::MONITOR,
             SettingsTab::Proxy => icons::DESKTOP_TOWER,
             SettingsTab::Scheduler => icons::ACTIVITY,
+            SettingsTab::Pricing => icons::TAG,
             SettingsTab::Security => icons::SHIELD_CHECK,
             SettingsTab::Data => icons::DATABASE,
             SettingsTab::About => icons::INFO,
@@ -85,12 +90,13 @@ pub enum Page {
     Routes,
     LocalKeys,
     Usage,
+    Calls,
     Balances,
     Settings,
 }
 
 impl Page {
-    pub fn all() -> [Page; 8] {
+    pub fn all() -> [Page; 9] {
         [
             Page::Overview,
             Page::Providers,
@@ -98,6 +104,7 @@ impl Page {
             Page::Routes,
             Page::LocalKeys,
             Page::Usage,
+            Page::Calls,
             Page::Balances,
             Page::Settings,
         ]
@@ -111,6 +118,7 @@ impl Page {
             Page::Routes => "路由",
             Page::LocalKeys => "本地 Key",
             Page::Usage => "用量",
+            Page::Calls => "调用明细",
             Page::Balances => "余额",
             Page::Settings => "设置",
         }
@@ -124,6 +132,7 @@ impl Page {
             Page::Routes => icons::GIT_BRANCH,
             Page::LocalKeys => icons::KEY,
             Page::Usage => icons::CHART_BAR,
+            Page::Calls => icons::LIST_BULLETS,
             Page::Balances => icons::WALLET,
             Page::Settings => icons::GEAR_SIX,
         }
@@ -137,6 +146,7 @@ impl Page {
             Page::Routes => "Configuration · 路由",
             Page::LocalKeys => "Configuration · 本地 Key",
             Page::Usage => "Observability · 用量",
+            Page::Calls => "Observability · 调用明细",
             Page::Balances => "Observability · 余额",
             Page::Settings => "System · 设置",
         }
@@ -150,6 +160,7 @@ impl Page {
             "routes" => Some(Page::Routes),
             "keys" | "local_keys" => Some(Page::LocalKeys),
             "usage" => Some(Page::Usage),
+            "calls" | "details" => Some(Page::Calls),
             "balances" => Some(Page::Balances),
             "settings" => Some(Page::Settings),
             _ => None,
@@ -179,6 +190,7 @@ pub(crate) enum Editor {
     RouteModel(RouteModelDraft),
     LocalKey(LocalKeyDraft),
     ManualBalance(ManualBalanceDraft),
+    BalanceSetup(BalanceSetupDraft),
 }
 
 pub(crate) struct ProviderDraft {
@@ -226,6 +238,16 @@ pub(crate) struct ManualBalanceDraft {
     pub amount: f64,
 }
 
+/// Full balance configuration for one account, editable from the Balances
+/// page. It edits the same `Account.balance` as the account editor.
+pub(crate) struct BalanceSetupDraft {
+    pub account_id: String,
+    pub account_name: String,
+    pub provider_name: String,
+    pub balance: crate::config::BalanceConfig,
+    pub percent_used: f64,
+}
+
 pub(crate) enum ConfirmAction {
     DeleteProvider(String),
     DeleteAccount(String),
@@ -234,6 +256,7 @@ pub(crate) enum ConfirmAction {
     DeleteLocalKey(String),
     ResetLocalKey(String),
     ImportConfig(String),
+    ClearCalls,
     Quit,
 }
 
@@ -278,6 +301,12 @@ pub struct App {
     pub(crate) last_applied_fetch: Option<u64>,
     pub(crate) models_requested: HashSet<String>,
     pub(crate) taskbar_badge: Option<crate::taskbar::TaskbarBadge>,
+    /// Draft price plan awaiting a name in the "save as plan" modal.
+    pub(crate) saving_price_plan: Option<crate::config::PricePlan>,
+    pub(crate) price_plan_import_path: String,
+    pub(crate) update_modal: bool,
+    pub(crate) update_waiting: bool,
+    pub(crate) update_prompted: Option<String>,
     pub(crate) closing: bool,
     pub(crate) last_zoom: f32,
     pub(crate) signals: Arc<crate::instance::Signals>,
@@ -344,6 +373,11 @@ impl App {
             last_applied_fetch: None,
             models_requested: HashSet::new(),
             taskbar_badge: None,
+            saving_price_plan: None,
+            price_plan_import_path: String::new(),
+            update_modal: false,
+            update_waiting: false,
+            update_prompted: None,
             closing: false,
             last_zoom: 1.0,
             signals,
@@ -360,6 +394,7 @@ impl App {
                 "taskbar" => SettingsTab::Taskbar,
                 "proxy" => SettingsTab::Proxy,
                 "scheduler" => SettingsTab::Scheduler,
+                "pricing" => SettingsTab::Pricing,
                 "security" => SettingsTab::Security,
                 "data" => SettingsTab::Data,
                 "about" => SettingsTab::About,
@@ -375,6 +410,12 @@ impl App {
                     if let Some(account) = app.config.accounts.first() {
                         let id = account.id.clone();
                         app.open_edit_account(&id);
+                    }
+                }
+                "balance_setup" => {
+                    if let Some(account) = app.config.accounts.first() {
+                        let id = account.id.clone();
+                        app.open_balance_setup(&id);
                     }
                 }
                 "route_editor" | "route_model_editor" => app.open_new_route_model(),
@@ -414,6 +455,11 @@ impl App {
                     if let Some(route) = app.config.routes.first() {
                         let client_model = route.client_model.clone();
                         app.open_new_route(&client_model);
+                    }
+                }
+                "route_upstream_edit" => {
+                    if let Some(id) = app.config.routes.first().map(|route| route.id.clone()) {
+                        app.open_edit_route(&id);
                     }
                 }
                 "key_editor" => app.open_new_local_key(),
@@ -485,6 +531,8 @@ impl App {
         let cmd = match kind {
             "provider" => UiCommand::TestProvider(id.to_string()),
             "account" => UiCommand::TestAccount(id.to_string()),
+            "speed_account" => UiCommand::SpeedTestAccount(id.to_string()),
+            "speed_provider" => UiCommand::SpeedTestProvider(id.to_string()),
             "route" => UiCommand::TestRoute(id.to_string()),
             "local_key" => UiCommand::TestLocalKey(id.to_string()),
             _ => return,
@@ -492,6 +540,31 @@ impl App {
         if self.cmd_tx.send(cmd).is_err() {
             self.toast(NoticeLevel::Error, "运行时已退出，无法测试。");
         }
+    }
+
+    /// Merge imported plans into the local library. A plan with the same name
+    /// (case-insensitive) is replaced; everything else is appended.
+    pub(crate) fn merge_price_plans(&mut self, plans: Vec<crate::config::PricePlan>) -> usize {
+        let mut added = 0;
+        for plan in plans {
+            let plan = plan.normalized();
+            if plan.name.is_empty() {
+                continue;
+            }
+            match self
+                .config
+                .price_plans
+                .iter_mut()
+                .find(|existing| existing.name.eq_ignore_ascii_case(&plan.name))
+            {
+                Some(existing) => *existing = plan,
+                None => {
+                    self.config.price_plans.push(plan);
+                    added += 1;
+                }
+            }
+        }
+        added
     }
 
     pub(crate) fn matches_search(&self, haystack: &str) -> bool {
@@ -624,6 +697,127 @@ impl App {
         }
     }
 
+    fn prompt_update_if_needed(&mut self) {
+        let update = self.snapshot.update.clone();
+        if update.checking {
+            return;
+        }
+        if self.update_waiting {
+            self.update_waiting = false;
+            if update.available {
+                self.update_modal = true;
+            }
+            return;
+        }
+        if update.available && !update.dismissed && !update.latest.is_empty() {
+            let latest = update.latest.clone();
+            if self.update_prompted.as_deref() != Some(latest.as_str()) {
+                self.update_prompted = Some(latest);
+                self.update_modal = true;
+            }
+        }
+    }
+
+    fn show_update_modal(&mut self, ctx: &egui::Context) {
+        if !self.update_modal {
+            return;
+        }
+        let update = self.snapshot.update.clone();
+        if update.latest.is_empty() {
+            self.update_modal = false;
+            return;
+        }
+        let mut close = false;
+        let mut dismiss = false;
+        let mut update_now = false;
+        let closed = kit::modal_shell(
+            ctx,
+            Id::new("yoyo_update"),
+            &format!("发现新版本 v{}", update.latest),
+            &format!("当前版本 v{} · 更新后需要重新启动程序", update.current),
+            620.0,
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    kit::badge(ui, &format!("v{}", update.current), theme::MUTED);
+                    ui.label(
+                        RichText::new(icons::ARROW_RIGHT)
+                            .size(12.0)
+                            .color(theme::muted(ui)),
+                    );
+                    kit::badge(ui, &format!("v{}", update.latest), theme::GREEN);
+                    if update.checked_at > 0 {
+                        ui.label(
+                            RichText::new(format!(
+                                "检查于 {}",
+                                widgets::time_ago(update.checked_at, crate::config::now_ts())
+                            ))
+                            .size(10.0)
+                            .color(theme::muted(ui)),
+                        );
+                    }
+                });
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(theme::subtle_fill(ui))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("update_notes")
+                            .max_height(260.0)
+                            .show(ui, |ui| {
+                                if update.notes.trim().is_empty() {
+                                    ui.label(
+                                        RichText::new("该版本没有提供发布说明。")
+                                            .size(11.0)
+                                            .color(theme::muted(ui)),
+                                    );
+                                } else {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(update.notes.trim()).size(11.0),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            });
+                    });
+                ui.add_space(8.0);
+                kit::info_row(
+                    ui,
+                    icons::INFO,
+                    "「立即更新」会在浏览器中打开 Release 页面，由你确认下载与安装。",
+                );
+            },
+            |ui| {
+                if kit::primary_button(ui, icons::DOWNLOAD_SIMPLE, "立即更新").clicked() {
+                    update_now = true;
+                }
+                if kit::secondary_button(ui, icons::BELL_SLASH, "不再提示").clicked() {
+                    dismiss = true;
+                }
+                if kit::secondary_button(ui, "", "稍后").clicked() {
+                    close = true;
+                }
+            },
+        );
+        if update_now {
+            open_url(&update.url);
+            self.update_modal = false;
+            self.toast(NoticeLevel::Info, "已在浏览器中打开 Release 页面");
+            return;
+        }
+        if dismiss {
+            self.config.ui.update_dismissed_version = update.latest.clone();
+            self.update_modal = false;
+            self.persist_with_notice("已不再提示该版本的更新");
+            return;
+        }
+        if closed || close {
+            self.update_modal = false;
+        }
+    }
+
     fn update_window_title(&mut self, ctx: &egui::Context) {
         let title = if self.config.ui.show_taskbar_stats {
             let (_, label) = self.proxy_status();
@@ -719,6 +913,12 @@ impl App {
             if badge_cfg.show_cost {
                 parts.push(widgets::format_cost(totals.cost_micros));
             }
+            if badge_cfg.show_speed {
+                parts.push(format!(
+                    "{} tok/s",
+                    widgets::format_count(self.snapshot.tokens_per_sec.round() as u64)
+                ));
+            }
             let text = if !badge_cfg.has_content() || parts.is_empty() {
                 "YoyoRelay".to_string()
             } else {
@@ -747,6 +947,12 @@ impl App {
                         gap: badge_cfg.gap,
                         opacity: badge_cfg.opacity,
                         show_dot: badge_cfg.show_dot,
+                        transparent_bg: badge_cfg.transparent_bg,
+                        text_color: if badge_cfg.custom_text_color {
+                            crate::ui::settings::parse_hex_color(&badge_cfg.text_color)
+                        } else {
+                            None
+                        },
                     },
                 );
             }
@@ -892,6 +1098,35 @@ impl App {
                                 ui.add_space(4.0);
                                 let (color, label) = self.proxy_status();
                                 kit::status_pill(ui, label, color);
+                                let update = self.snapshot.update.clone();
+                                let update_icon = if update.checking {
+                                    icons::SPINNER
+                                } else {
+                                    icons::ARROWS_CLOCKWISE
+                                };
+                                let response = kit::icon_button(
+                                    ui,
+                                    update_icon,
+                                    if update.available {
+                                        "发现新版本，点击查看"
+                                    } else {
+                                        "检查更新"
+                                    },
+                                );
+                                if update.available && !update.dismissed {
+                                    let dot = response.rect.right_top() + Vec2::new(-2.0, 2.0);
+                                    ui.painter().circle_filled(dot, 3.5, theme::RED);
+                                }
+                                if response.clicked() {
+                                    let _ =
+                                        self.cmd_tx.send(UiCommand::CheckUpdate { manual: true });
+                                    if update.available {
+                                        self.update_modal = true;
+                                    } else {
+                                        self.update_waiting = true;
+                                        self.toast(NoticeLevel::Info, "正在检查更新…");
+                                    }
+                                }
                                 if self.page.needs_search() {
                                     let search_width = if content_rect.width() > 760.0 {
                                         180.0
@@ -1140,6 +1375,18 @@ impl App {
                 self.page = Page::Usage;
                 self.search.clear();
             }
+            if kit::nav_item(
+                ui,
+                icons::LIST_BULLETS,
+                "调用明细",
+                self.page == Page::Calls,
+                Some(self.snapshot.calls.total.to_string()),
+            )
+            .clicked()
+            {
+                self.page = Page::Calls;
+                self.search.clear();
+            }
             if kit::nav_item(ui, icons::WALLET, "余额", self.page == Page::Balances, None).clicked()
             {
                 self.page = Page::Balances;
@@ -1377,6 +1624,7 @@ impl App {
                                     Page::Routes => self.page_routes(ui),
                                     Page::LocalKeys => self.page_local_keys(ui),
                                     Page::Usage => self.page_usage(ui),
+                                    Page::Calls => self.page_calls(ui),
                                     Page::Balances => self.page_balances(ui),
                                     Page::Settings => self.page_settings(ui),
                                 }
@@ -1465,6 +1713,7 @@ impl eframe::App for App {
             self.signals.mark_hidden(false);
         }
         self.poll_snapshot(ctx);
+        self.prompt_update_if_needed();
         self.sync_live_fx();
         self.apply_theme(ctx);
         self.sync_autostart();
@@ -1524,6 +1773,8 @@ impl eframe::App for App {
         self.central(ctx);
 
         self.show_editor(ctx);
+        self.show_price_plan_modal(ctx);
+        self.show_update_modal(ctx);
         self.show_confirm(ctx);
         self.show_test_modal(ctx);
         self.show_onboarding(ctx);
@@ -1541,5 +1792,23 @@ impl Drop for App {
         if !self.closing {
             let _ = self.cmd_tx.send(UiCommand::Shutdown);
         }
+    }
+}
+
+/// Open a URL in the platform's default browser.
+pub(crate) fn open_url(url: &str) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
 }

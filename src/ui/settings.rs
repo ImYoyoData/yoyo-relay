@@ -62,6 +62,7 @@ impl App {
                         SettingsTab::Taskbar => self.settings_taskbar(ui),
                         SettingsTab::Proxy => self.settings_proxy(ui),
                         SettingsTab::Scheduler => self.settings_scheduler(ui),
+                        SettingsTab::Pricing => self.settings_pricing(ui),
                         SettingsTab::Security => self.settings_security(ui),
                         SettingsTab::Data => self.settings_data(ui),
                         SettingsTab::About => self.settings_about(ui),
@@ -503,6 +504,7 @@ impl App {
                             ("排队数量", &mut taskbar.show_queued),
                             ("成功率", &mut taskbar.show_success),
                             ("预估花费", &mut taskbar.show_cost),
+                            ("实时 tok/s", &mut taskbar.show_speed),
                         ]
                         .into_iter()
                         .enumerate()
@@ -516,6 +518,60 @@ impl App {
                             }
                         }
                     });
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    if kit::toggle_switch(ui, &mut self.config.ui.taskbar.transparent_bg).changed()
+                    {
+                        changed = true;
+                    }
+                    ui.label(
+                        RichText::new("透明底色")
+                            .size(11.0)
+                            .strong()
+                            .color(theme::text(ui)),
+                    );
+                    ui.label(
+                        RichText::new("只绘制文字与状态点，不显示胶囊背景，适配深色或彩色任务栏")
+                            .size(10.0)
+                            .color(theme::muted(ui)),
+                    );
+                });
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    if kit::toggle_switch(ui, &mut self.config.ui.taskbar.custom_text_color)
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    ui.label(
+                        RichText::new("自定义文字颜色")
+                            .size(11.0)
+                            .strong()
+                            .color(theme::text(ui)),
+                    );
+                    let mut rgb = parse_hex_color(&self.config.ui.taskbar.text_color)
+                        .map(|(r, g, b)| [r, g, b])
+                        .unwrap_or([17, 24, 39]);
+                    let color_response = ui
+                        .add_enabled_ui(self.config.ui.taskbar.custom_text_color, |ui| {
+                            egui::color_picker::color_edit_button_srgb(ui, &mut rgb)
+                        })
+                        .inner;
+                    if color_response.changed() {
+                        self.config.ui.taskbar.text_color =
+                            format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+                        changed = true;
+                    }
+                    ui.label(
+                        RichText::new(if self.config.ui.taskbar.custom_text_color {
+                            "关闭后按系统主题与任务栏底色自动选择对比色"
+                        } else {
+                            "当前使用自动对比色"
+                        })
+                        .size(10.0)
+                        .color(theme::muted(ui)),
+                    );
+                });
                 ui.add_space(4.0);
                 kit::divider(ui);
                 kit::section_label(ui, "尺寸与位置");
@@ -602,6 +658,184 @@ impl App {
         if reset {
             self.config.ui.taskbar = crate::config::TaskbarBadgeConfig::default();
             changed = true;
+        }
+        if changed {
+            self.persist();
+        }
+    }
+
+    // -- Pricing ------------------------------------------------------------
+
+    fn settings_pricing(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        let mut remove: Option<usize> = None;
+        let mut export_plans = false;
+        let mut import_plans = false;
+        let plan_count = self.config.price_plans.len();
+
+        kit::section_card(
+            ui,
+            icons::TAG,
+            "价格方案库",
+            "可复用的价格表：一次配置，多个上游一键套用，也便于导出分享",
+            |ui| {
+                kit::badge(ui, &format!("{plan_count} 套"), theme::ACCENT);
+            },
+            |ui| {
+                if self.config.price_plans.is_empty() {
+                    kit::tooltip_text(
+                        ui,
+                        icons::INFO,
+                        "还没有价格方案。在任一上游的「计费价格」里配置好后点「存为方案」即可。",
+                    );
+                }
+                for (index, plan) in self.config.price_plans.iter_mut().enumerate() {
+                    egui::Frame::new()
+                        .fill(theme::subtle_fill(ui))
+                        .corner_radius(10)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut plan.name)
+                                                .desired_width(220.0)
+                                                .hint_text("方案名称"),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                    let periods = if plan.periods.is_empty() {
+                                        "全天基础价".to_string()
+                                    } else {
+                                        plan.periods
+                                            .iter()
+                                            .map(|period| {
+                                                format!(
+                                                    "{} {}",
+                                                    period.name,
+                                                    period.schedule_label()
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(" · ")
+                                    };
+                                    if !plan.note.trim().is_empty() {
+                                        ui.label(
+                                            RichText::new(&plan.note)
+                                                .size(9.5)
+                                                .color(theme::muted(ui)),
+                                        );
+                                    }
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · 输入 {} · 命中 {} · 输出 {} · {}",
+                                            plan.currency.code(),
+                                            fmt_price(plan.base.input_per_mtok),
+                                            fmt_price(plan.base.cached_input_per_mtok),
+                                            fmt_price(plan.base.output_per_mtok),
+                                            periods
+                                        ))
+                                        .size(10.0)
+                                        .color(theme::muted(ui)),
+                                    );
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if kit::danger_icon_button(
+                                        ui,
+                                        icons::TRASH_SIMPLE,
+                                        "删除价格方案",
+                                    )
+                                    .clicked()
+                                    {
+                                        remove = Some(index);
+                                    }
+                                });
+                            });
+                        });
+                    ui.add_space(5.0);
+                }
+            },
+        );
+        ui.add_space(12.0);
+
+        kit::section_card(
+            ui,
+            icons::ARROWS_LEFT_RIGHT,
+            "导入与导出",
+            "价格方案单独存储为 JSON，可复制到其他机器或团队共享",
+            |_ui| {},
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if kit::secondary_button(ui, icons::DOWNLOAD_SIMPLE, "导出价格方案").clicked()
+                    {
+                        export_plans = true;
+                    }
+                    if kit::secondary_button(ui, icons::UPLOAD_SIMPLE, "导入价格方案").clicked()
+                    {
+                        import_plans = true;
+                    }
+                });
+                if import_plans {
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.price_plan_import_path)
+                                .desired_width(380.0)
+                                .hint_text("价格方案 JSON 的绝对路径"),
+                        );
+                        if kit::secondary_button(ui, icons::CHECK, "确认导入").clicked() {
+                            let path = self.price_plan_import_path.trim().to_string();
+                            if path.is_empty() {
+                                self.toast(NoticeLevel::Warning, "请先填写导入文件路径。");
+                            } else {
+                                match self.store.import_price_plans(std::path::Path::new(&path)) {
+                                    Ok(plans) => {
+                                        let added = self.merge_price_plans(plans);
+                                        if self.persist() {
+                                            self.toast(
+                                                NoticeLevel::Success,
+                                                format!("已导入 {added} 套价格方案"),
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        self.toast(NoticeLevel::Error, format!("导入失败：{err}"))
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    kit::info_row(
+                        ui,
+                        icons::INFO,
+                        "导入会合并同名方案：文件中的同名方案覆盖当前值，其余追加。",
+                    );
+                }
+                ui.add_space(4.0);
+                kit::info_row(
+                    ui,
+                    icons::INFO,
+                    "价格方案只包含价格表，不含任何账号、Key 或上游地址。",
+                );
+            },
+        );
+
+        if let Some(index) = remove {
+            self.config.price_plans.remove(index);
+            changed = true;
+        }
+        if export_plans {
+            match self.store.export_price_plans(&self.config.price_plans) {
+                Ok(path) => self.toast(
+                    NoticeLevel::Success,
+                    format!("已导出价格方案到 {}", path.display()),
+                ),
+                Err(err) => self.toast(NoticeLevel::Error, format!("导出失败：{err}")),
+            }
         }
         if changed {
             self.persist();
@@ -1067,6 +1301,7 @@ impl App {
 
     fn settings_about(&mut self, ui: &mut egui::Ui) {
         let uptime = crate::config::fmt_duration_secs(self.snapshot.uptime_secs);
+        let mut changed = false;
         let mut restart_onboarding = false;
         let mut quit = false;
         let mut show_alerts = false;
@@ -1116,6 +1351,71 @@ impl App {
                         });
                     });
                 });
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(theme::subtle_fill(ui))
+                    .corner_radius(9)
+                    .inner_margin(egui::Margin::symmetric(11, 9))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if kit::toggle_switch(ui, &mut self.config.ui.auto_update_check)
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            ui.label(
+                                RichText::new("自动检查更新")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(theme::text(ui)),
+                            );
+                            ui.label(RichText::new("每").size(10.0).color(theme::muted(ui)));
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.config.ui.update_check_hours)
+                                        .range(1..=168)
+                                        .suffix(" 小时"),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            ui.label(RichText::new("检查一次").size(10.0).color(theme::muted(ui)));
+                        });
+                        ui.add_space(3.0);
+                        let update = &self.snapshot.update;
+                        let status = if update.checking {
+                            "正在检查…".to_string()
+                        } else if let Some(error) = &update.error {
+                            format!("检查失败：{error}")
+                        } else if update.available {
+                            format!("发现新版本 v{}", update.latest)
+                        } else if update.checked_at > 0 {
+                            format!(
+                                "已是最新版本 · {}",
+                                widgets::time_ago(update.checked_at, crate::config::now_ts())
+                            )
+                        } else {
+                            "尚未检查".to_string()
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(status).size(10.0).color(if update.available {
+                                theme::GREEN
+                            } else {
+                                theme::muted(ui)
+                            }));
+                            if kit::ghost_button(ui, icons::ARROWS_CLOCKWISE, "立即检查").clicked()
+                            {
+                                let _ = self.cmd_tx.send(UiCommand::CheckUpdate { manual: true });
+                            }
+                            if update.available
+                                && kit::ghost_button(ui, icons::DOWNLOAD_SIMPLE, "查看更新")
+                                    .clicked()
+                            {
+                                crate::ui::open_url(&update.url);
+                            }
+                        });
+                    });
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.hyperlink_to(
@@ -1168,6 +1468,9 @@ impl App {
                 );
             },
         );
+        if changed {
+            self.persist();
+        }
         if restart_onboarding {
             self.config.ui.onboarding_done = false;
             self.show_onboarding = true;
@@ -1469,4 +1772,28 @@ fn scheduler_slow_fields(ui: &mut Ui, cfg: &mut crate::config::SchedulerConfig) 
         });
     }
     changed
+}
+
+fn fmt_price(value: f64) -> String {
+    if value == 0.0 {
+        "—".to_string()
+    } else if value >= 100.0 {
+        format!("{value:.1}")
+    } else if value >= 1.0 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.4}")
+    }
+}
+
+/// Parse `#RRGGBB` (or `RRGGBB`) into an RGB triple.
+pub fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+    let hex = value.trim().trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some((r, g, b))
 }

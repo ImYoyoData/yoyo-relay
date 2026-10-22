@@ -577,9 +577,25 @@ impl Scheduler {
             advance_cursor,
         );
         let normal_cap = (cfg.scheduler.max_retries as usize + 1).max(1);
-        chain
-            .attempts
-            .extend(primary_attempts.into_iter().take(normal_cap));
+        // Account-level retries are capped, but every distinct upstream model
+        // must still get one chance. Otherwise a provider with many accounts
+        // could consume the whole budget and a failing model would never fall
+        // through to the next upstream.
+        let mut selected: Vec<Attempt> =
+            primary_attempts.iter().take(normal_cap).cloned().collect();
+        for attempt in &primary_attempts {
+            if selected
+                .iter()
+                .any(|chosen| chosen.route.id == attempt.route.id)
+            {
+                continue;
+            }
+            if selected.len() >= normal_cap.max(32) {
+                break;
+            }
+            selected.push(attempt.clone());
+        }
+        chain.attempts.extend(selected);
 
         // Third layer: another client-model mapping chain, only when explicitly configured.
         let fallback_model = cfg.fallback_for(client_model);
@@ -637,7 +653,11 @@ impl Scheduler {
                 ));
                 continue;
             };
-            let upstream = provider.protocol_for(&route.upstream_model, route.protocol);
+            let upstream = provider.protocol_for_ingress(
+                &route.upstream_model,
+                route.protocol,
+                ingress.protocol(),
+            );
             if !route_supports_ingress(route, ingress, upstream) {
                 notes.push(format!(
                     "路由 {} → {} 的协议组合（{} → {}）当前不支持",
@@ -675,7 +695,11 @@ impl Scheduler {
                 FallbackLayer::Provider
             };
             for route in group_routes {
-                let upstream = provider.protocol_for(&route.upstream_model, route.protocol);
+                let upstream = provider.protocol_for_ingress(
+                    &route.upstream_model,
+                    route.protocol,
+                    ingress.protocol(),
+                );
                 for account in &accounts {
                     attempts.push(Attempt {
                         account: account.clone(),
@@ -804,7 +828,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{new_id, Account, AppConfig, ModelRoute, Provider};
+    use crate::config::{new_id, Account, AppConfig, ModelRoute, ProtocolStrategyMode, Provider};
 
     fn setup() -> (Scheduler, AppConfig, String, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -970,6 +994,67 @@ mod tests {
         assert!(
             last_p1 < first_p2,
             "same-provider accounts must be tried before other providers: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn every_route_gets_one_attempt_even_with_small_retry_cap() {
+        let (s, mut cfg, _account_id, provider_id) = setup();
+        // Four accounts on the same provider: with the old behaviour these
+        // could consume the whole retry budget and the second upstream model
+        // would never be tried.
+        for i in 0..3 {
+            cfg.accounts.push(Account {
+                id: new_id(),
+                provider_id: provider_id.clone(),
+                name: format!("A{}", i + 2),
+                enabled: true,
+                max_concurrency: 2,
+                ..Account::default()
+            });
+        }
+        let second_route = ModelRoute {
+            id: new_id(),
+            client_model: "gpt-4o".into(),
+            provider_id: provider_id.clone(),
+            upstream_model: "gpt-4o-backup".into(),
+            priority: -1,
+            ..ModelRoute::default()
+        };
+        cfg.routes.push(second_route.clone());
+        cfg.scheduler.max_retries = 1;
+
+        let chain = s.build_chain(&cfg, "gpt-4o", Ingress::Chat, true);
+        assert!(
+            chain
+                .attempts
+                .iter()
+                .any(|attempt| attempt.route.id == second_route.id),
+            "second upstream model must get an attempt: {:?}",
+            chain
+                .attempts
+                .iter()
+                .map(|attempt| &attempt.route.upstream_model)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ingress_protocol_mode_follows_caller() {
+        let (s, mut cfg, _account_id, provider_id) = setup();
+        if let Some(provider) = cfg.providers.iter_mut().find(|p| p.id == provider_id) {
+            provider.protocol_strategy.mode = ProtocolStrategyMode::Ingress;
+            provider.static_protocol = Protocol::OpenAiChat;
+        }
+        let chain = s.build_chain(&cfg, "gpt-4o", Ingress::Anthropic, true);
+        assert_eq!(
+            chain.attempts[0].upstream_protocol,
+            Protocol::AnthropicMessages
+        );
+        let chain = s.build_chain(&cfg, "gpt-4o", Ingress::Responses, true);
+        assert_eq!(
+            chain.attempts[0].upstream_protocol,
+            Protocol::OpenAiResponses
         );
     }
 

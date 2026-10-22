@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -137,6 +137,100 @@ impl ConcurrencyGate {
 }
 
 // ---------------------------------------------------------------------------
+// Live throughput meter
+// ---------------------------------------------------------------------------
+
+/// Rolling window of completion tokens, sampled as streams produce output.
+/// The taskbar badge and overview read this to show tokens per second.
+pub struct SpeedMeter {
+    samples: Mutex<VecDeque<(Instant, u64)>>,
+}
+
+impl SpeedMeter {
+    fn new() -> Self {
+        Self {
+            samples: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Record `tokens` newly generated completion tokens.
+    pub fn record(&self, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        samples.push_back((now, tokens));
+        while let Some((at, _)) = samples.front() {
+            if now.duration_since(*at) > Duration::from_secs(8) {
+                samples.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Spread a completed non-streaming response across the time it took, so a
+    /// single large reply does not register as an artificial burst.
+    pub fn record_span(&self, tokens: u64, elapsed: Duration) {
+        if tokens == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let span = elapsed.min(Duration::from_secs(8));
+        if span < Duration::from_millis(200) {
+            self.insert_samples(vec![(now, tokens)]);
+            return;
+        }
+        let steps = 8u64.min(tokens.max(1));
+        let per = tokens / steps;
+        let remainder = tokens % steps;
+        let mut samples = Vec::with_capacity(steps as usize);
+        for i in 0..steps {
+            let back = span.mul_f64((steps - i) as f64 / steps as f64);
+            let portion = per + u64::from(i + 1 == steps) * remainder;
+            samples.push((now - back, portion));
+        }
+        self.insert_samples(samples);
+    }
+
+    fn insert_samples(&self, samples: Vec<(Instant, u64)>) {
+        let now = Instant::now();
+        let mut guard = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        guard.extend(samples);
+        guard.make_contiguous().sort_by_key(|(at, _)| *at);
+        while let Some((at, _)) = guard.front() {
+            if now.duration_since(*at) > Duration::from_secs(8) {
+                guard.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Completion tokens per second over the last three seconds. Returns 0.0
+    /// after two seconds of silence so the badge drops back to zero instead of
+    /// showing a stale average.
+    pub fn tokens_per_sec(&self) -> f64 {
+        const WINDOW: f64 = 3.0;
+        let now = Instant::now();
+        let samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((last_at, _)) = samples.back() else {
+            return 0.0;
+        };
+        if now.duration_since(*last_at) > Duration::from_secs(2) {
+            return 0.0;
+        }
+        let total: u64 = samples
+            .iter()
+            .filter(|(at, _)| now.duration_since(*at) <= Duration::from_secs_f64(WINDOW))
+            .map(|(_, tokens)| *tokens)
+            .sum();
+        total as f64 / WINDOW
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gateway
 // ---------------------------------------------------------------------------
 
@@ -149,6 +243,7 @@ pub struct Gateway {
     pub(crate) http_local: reqwest::Client,
     gate: Arc<ConcurrencyGate>,
     key_quota_cache: Mutex<HashMap<String, KeyQuotaCache>>,
+    pub speed: Arc<SpeedMeter>,
     pub started_at: i64,
 }
 
@@ -191,6 +286,7 @@ impl Gateway {
             http_local,
             gate,
             key_quota_cache: Mutex::new(HashMap::new()),
+            speed: Arc::new(SpeedMeter::new()),
             started_at: now_ts(),
         })
     }
@@ -863,8 +959,15 @@ async fn chat_handler(
     let mut attempts_made = 0usize;
     let mut last_failure: Option<(String, String)> = None;
     let mut last_status = StatusCode::BAD_GATEWAY;
+    // Request-shape errors (400/404/413/422) are route-specific. Skip the rest
+    // of that upstream model but keep walking the chain so the next configured
+    // upstream still gets a chance.
+    let mut skip_routes: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for attempt in &chain.attempts {
+        if skip_routes.contains(&attempt.route.id) {
+            continue;
+        }
         attempts_made += 1;
         // The chain is built before the first request. If an earlier attempt
         // in this same request cooled the account, do not try it again for a
@@ -1104,6 +1207,9 @@ async fn chat_handler(
                     local_key_id: auth.key.as_ref().map(|k| k.id.clone()),
                     request_id: request_id.clone(),
                     usage: usage_cell.clone(),
+                    fx_units_per_usd: cfg
+                        .ui
+                        .fx_rate(attempt.route.effective_pricing().currency.code()),
                     _slot: Some(slot),
                     _permit: Some(permit),
                     started,
@@ -1116,6 +1222,7 @@ async fn chat_handler(
                     translator,
                     finalizer,
                     usage_cell,
+                    gw.speed.clone(),
                     Duration::from_secs(cfg.server.stream_idle_timeout_secs.max(5)),
                 );
                 let mut response = Response::new(body);
@@ -1260,11 +1367,17 @@ async fn chat_handler(
                         stream: false,
                         cancelled: false,
                         prompt_tokens: usage.input_tokens,
+                        cached_tokens: usage.cached_tokens,
                         completion_tokens: usage.output_tokens,
                         total_tokens: usage.total(),
-                        cost_micros: attempt
-                            .route
-                            .cost_micros(usage.input_tokens, usage.output_tokens),
+                        cost_micros: attempt.route.cost_micros_with_fx(
+                            usage.input_tokens,
+                            usage.cached_tokens,
+                            usage.output_tokens,
+                            chrono::Local::now(),
+                            cfg.ui
+                                .fx_rate(attempt.route.effective_pricing().currency.code()),
+                        ),
                         latency_ms: latency,
                         kind: "chat".into(),
                     });
@@ -1275,6 +1388,7 @@ async fn chat_handler(
                         attempts_made.to_string().parse().unwrap(),
                     );
                     h.insert("x-yoyo-latency-ms", latency.to_string().parse().unwrap());
+                    gw.speed.record_span(usage.output_tokens, started.elapsed());
                     return response;
                 }
                 Err(err) => {
@@ -1319,7 +1433,14 @@ async fn chat_handler(
                 ));
             }
             400 | 413 | 422 => {
-                // A deterministic client-side error. Do not burn other accounts.
+                // A deterministic request-shape error. Do not burn the other
+                // accounts of this route, but do continue with the next
+                // upstream model instead of failing the whole request.
+                skip_routes.insert(attempt.route.id.clone());
+                errors.push(format!(
+                    "账号「{}」/上游模型「{}」拒绝了请求（HTTP {}）：{}",
+                    attempt.account.name, attempt.route.upstream_model, status, summary
+                ));
                 let latency = started.elapsed().as_millis() as u64;
                 gw.record_usage(UsageRecord {
                     ts: now_ts(),
@@ -1335,6 +1456,7 @@ async fn chat_handler(
                     stream: stream_requested,
                     cancelled: false,
                     prompt_tokens: 0,
+                    cached_tokens: 0,
                     completion_tokens: 0,
                     total_tokens: 0,
                     cost_micros: 0,
@@ -1342,14 +1464,12 @@ async fn chat_handler(
                     kind: "chat".into(),
                 });
                 gw.scheduler.breaker.record_success();
-                return gw.error_response(
-                    ingress,
-                    status,
-                    "upstream_invalid_request",
-                    &format!("上游拒绝了请求：{summary}"),
-                );
+                continue;
             }
             404 => {
+                // The upstream model name or path is wrong for this route; try
+                // the next upstream model rather than every account of this one.
+                skip_routes.insert(attempt.route.id.clone());
                 errors.push(format!(
                     "账号「{}」上游路径或模型不存在（HTTP 404）：{}",
                     attempt.account.name, summary
@@ -1400,6 +1520,7 @@ async fn chat_handler(
         stream: stream_requested,
         cancelled: false,
         prompt_tokens: 0,
+        cached_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,
         cost_micros: 0,
@@ -1456,6 +1577,8 @@ struct StreamFinalizer {
     local_key_id: Option<String>,
     request_id: String,
     usage: Arc<Mutex<Usage>>,
+    /// Currency units per 1 USD for this route's pricing currency.
+    fx_units_per_usd: f64,
     _slot: Option<AccountSlot>,
     _permit: Option<GatePermit>,
     started: Instant,
@@ -1496,11 +1619,16 @@ impl StreamFinalizer {
             stream: true,
             cancelled: !self.completed,
             prompt_tokens: usage.input_tokens,
+            cached_tokens: usage.cached_tokens,
             completion_tokens: usage.output_tokens,
             total_tokens: usage.total(),
-            cost_micros: self
-                .route
-                .cost_micros(usage.input_tokens, usage.output_tokens),
+            cost_micros: self.route.cost_micros_with_fx(
+                usage.input_tokens,
+                usage.cached_tokens,
+                usage.output_tokens,
+                chrono::Local::now(),
+                self.fx_units_per_usd,
+            ),
             latency_ms: latency,
             kind: "chat".into(),
         };
@@ -1530,6 +1658,7 @@ fn build_sse_body<S>(
     mut translator: StreamTranslator,
     mut finalizer: StreamFinalizer,
     usage_cell: Arc<Mutex<Usage>>,
+    speed: Arc<SpeedMeter>,
     idle_timeout: Duration,
 ) -> Body
 where
@@ -1537,6 +1666,10 @@ where
 {
     let stream = async_stream::stream! {
         futures_util::pin_mut!(upstream);
+        // Streams rarely carry a running token count, so the live meter counts
+        // generated characters (about four per token) until the final usage
+        // block lands, then reconciles against the real number.
+        let mut metered_tokens = 0u64;
         let mut decoder = SseDecoder::default();
         let mut hard_failed = false;
         loop {
@@ -1570,7 +1703,18 @@ where
                                 yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                             }
                         }
-                        *usage_cell.lock().unwrap_or_else(|e| e.into_inner()) = translator.usage();
+                        let usage = translator.usage();
+                        *usage_cell.lock().unwrap_or_else(|e| e.into_inner()) = usage;
+                        let produced = if usage.output_tokens > 0 {
+                            usage.output_tokens
+                        } else {
+                            (translator.produced_chars() / 4) as u64
+                        };
+                        let delta = produced.saturating_sub(metered_tokens);
+                        if delta > 0 {
+                            metered_tokens = produced;
+                            speed.record(delta);
+                        }
                     }
                 }
             }
@@ -1593,7 +1737,16 @@ where
                 }
             }
         }
-        *usage_cell.lock().unwrap_or_else(|e| e.into_inner()) = translator.usage();
+        let final_usage = translator.usage();
+        *usage_cell.lock().unwrap_or_else(|e| e.into_inner()) = final_usage;
+        // Charge any tokens the character estimate missed (tool calls, CJK
+        // text, or a final usage block that arrived after the last chunk).
+        let delta = final_usage
+            .output_tokens
+            .saturating_sub(metered_tokens);
+        if delta > 0 {
+            speed.record(delta);
+        }
         finalizer.finish();
     };
     Body::from_stream(stream)
@@ -1851,9 +2004,17 @@ async fn generic_handler(
                 stream: false,
                 cancelled: false,
                 prompt_tokens: usage.input_tokens,
+                cached_tokens: usage.cached_tokens,
                 completion_tokens: 0,
                 total_tokens: usage.total(),
-                cost_micros: attempt.route.cost_micros(usage.input_tokens, 0),
+                cost_micros: attempt.route.cost_micros_with_fx(
+                    usage.input_tokens,
+                    usage.cached_tokens,
+                    0,
+                    chrono::Local::now(),
+                    cfg.ui
+                        .fx_rate(attempt.route.effective_pricing().currency.code()),
+                ),
                 latency_ms: latency,
                 kind: "non_chat".into(),
             });
@@ -1924,4 +2085,37 @@ fn extract_generic_usage(bytes: &[u8]) -> Usage {
             .unwrap_or(0);
     }
     u
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::SpeedMeter;
+    use std::time::Duration;
+
+    #[test]
+    fn meter_is_idle_without_samples() {
+        let meter = SpeedMeter::new();
+        assert_eq!(meter.tokens_per_sec(), 0.0);
+    }
+
+    #[test]
+    fn meter_reports_recent_tokens() {
+        let meter = SpeedMeter::new();
+        meter.record(60);
+        let tps = meter.tokens_per_sec();
+        assert!(tps > 0.0, "expected a positive rate, got {tps}");
+        // 60 tokens inside a three-second window is at most 60/s.
+        assert!(tps <= 60.0 + f64::EPSILON);
+    }
+
+    #[test]
+    fn completed_span_is_spread_over_time() {
+        let meter = SpeedMeter::new();
+        meter.record_span(800, Duration::from_secs(4));
+        let tps = meter.tokens_per_sec();
+        assert!(tps > 0.0, "expected a positive rate, got {tps}");
+        // The whole reply must never look faster than 800 tokens over the
+        // three-second reporting window.
+        assert!(tps <= 800.0 / 3.0 + 1.0, "unexpected burst: {tps}");
+    }
 }

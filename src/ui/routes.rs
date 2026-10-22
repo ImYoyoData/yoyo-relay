@@ -282,6 +282,13 @@ impl App {
                             .color(theme::muted(ui)),
                         );
                     }
+                    if !row.price_label.is_empty() {
+                        let mut label = row.price_label.clone();
+                        if row.price_periods > 0 {
+                            label.push_str(&format!(" · {} 时段", row.price_periods));
+                        }
+                        super::kit::badge(ui, &label, theme::PURPLE);
+                    }
                     if let Some(warning) = &row.warning {
                         ui.label(
                             RichText::new(icons::WARNING)
