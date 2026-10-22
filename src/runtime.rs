@@ -30,6 +30,9 @@ pub enum UiCommand {
         days: u32,
         dimension: UsageDimension,
     },
+    SetUsageFilter {
+        local_key: Option<String>,
+    },
     TestProvider(String),
     TestAccount(String),
     TestAccountDraft {
@@ -44,6 +47,10 @@ pub enum UiCommand {
         provider_id: String,
         upstream_model: String,
         client_model: String,
+    },
+    FetchProviderModels(String),
+    RefreshFxRates {
+        manual: bool,
     },
     RefreshBalance(Option<String>),
     CleanupNow,
@@ -100,6 +107,9 @@ struct Shared {
     balance_refreshing: AtomicBool,
     fetched_model: Mutex<Option<FetchedModelView>>,
     model_fetch_running: AtomicBool,
+    provider_models: Mutex<HashMap<String, ProviderModelsView>>,
+    models_fetching: Mutex<HashSet<String>>,
+    fx_refreshing: AtomicBool,
     warnings: Mutex<Vec<String>>,
 }
 
@@ -115,6 +125,9 @@ impl Shared {
             balance_refreshing: AtomicBool::new(false),
             fetched_model: Mutex::new(None),
             model_fetch_running: AtomicBool::new(false),
+            provider_models: Mutex::new(HashMap::new()),
+            models_fetching: Mutex::new(HashSet::new()),
+            fx_refreshing: AtomicBool::new(false),
             warnings: Mutex::new(warnings),
         }
     }
@@ -205,6 +218,7 @@ struct ProxyHandle {
 struct UsageParams {
     days: u32,
     dimension: UsageDimension,
+    local_key: Option<String>,
     last_built: Option<Instant>,
     view: UsageView,
 }
@@ -221,6 +235,7 @@ pub struct Runtime {
     usage: UsageParams,
     last_probe_check: Instant,
     last_balance_refresh: Instant,
+    last_fx_refresh: Instant,
     last_cleanup: Instant,
 }
 
@@ -256,11 +271,15 @@ impl Runtime {
             usage: UsageParams {
                 days: 7,
                 dimension: UsageDimension::Global,
+                local_key: None,
                 last_built: None,
                 view: UsageView::default(),
             },
             last_probe_check: Instant::now(),
             last_balance_refresh: Instant::now() - Duration::from_secs(3600),
+            // Refresh rates on the first periodic tick so a fresh install gets
+            // a realistic CNY total without waiting for the interval.
+            last_fx_refresh: Instant::now() - Duration::from_secs(24 * 3600),
             last_cleanup: Instant::now() - Duration::from_secs(6 * 3600),
         })
     }
@@ -324,7 +343,15 @@ impl Runtime {
             }
             UiCommand::SaveConfig(cfg) => {
                 let old = self.gateway.config();
-                let new = Arc::new(*cfg);
+                let mut new = *cfg;
+                // Never let a stale UI copy roll back a live-rate refresh that
+                // landed after the last snapshot was emitted.
+                if new.ui.fx_updated_at < old.ui.fx_updated_at {
+                    new.ui.fx_rates = old.ui.fx_rates.clone();
+                    new.ui.fx_updated_at = old.ui.fx_updated_at;
+                    new.ui.fx_source = old.ui.fx_source.clone();
+                }
+                let new = Arc::new(new);
                 let restart = old.server.bind != new.server.bind
                     || old.server.port != new.server.port
                     || old.server.cors != new.server.cors;
@@ -354,6 +381,12 @@ impl Runtime {
                     self.usage.last_built = None;
                 }
             }
+            UiCommand::SetUsageFilter { local_key } => {
+                if self.usage.local_key != local_key {
+                    self.usage.local_key = local_key;
+                    self.usage.last_built = None;
+                }
+            }
             UiCommand::TestProvider(id) => self.spawn_test("provider", id),
             UiCommand::TestAccount(id) => self.spawn_test("account", id),
             UiCommand::TestAccountDraft {
@@ -369,6 +402,8 @@ impl Runtime {
                 upstream_model,
                 client_model,
             } => self.spawn_model_fetch(provider_id, upstream_model, client_model),
+            UiCommand::FetchProviderModels(provider_id) => self.spawn_model_list_fetch(provider_id),
+            UiCommand::RefreshFxRates { manual } => self.spawn_fx_refresh(manual),
             UiCommand::RefreshBalance(only) => self.spawn_balance_refresh(only, true),
             UiCommand::CleanupNow => match self.db.cleanup(self.gateway.config().ui.retention_days)
             {
@@ -498,6 +533,15 @@ impl Runtime {
             self.spawn_balance_refresh(None, false);
         }
 
+        let fx_interval = Duration::from_secs(cfg.ui.fx_refresh_hours.max(1) * 3600);
+        if cfg.ui.fx_auto
+            && self.last_fx_refresh.elapsed() >= fx_interval
+            && !self.shared.fx_refreshing.load(Ordering::SeqCst)
+        {
+            self.last_fx_refresh = Instant::now();
+            self.spawn_fx_refresh(false);
+        }
+
         if self.last_cleanup.elapsed() >= Duration::from_secs(6 * 3600) {
             self.last_cleanup = Instant::now();
             match self.db.cleanup(cfg.ui.retention_days) {
@@ -616,6 +660,106 @@ impl Runtime {
                 *slot = Some(view);
             }
             shared.model_fetch_running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn spawn_model_list_fetch(&self, provider_id: String) {
+        {
+            let mut fetching = self
+                .shared
+                .models_fetching
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !fetching.insert(provider_id.clone()) {
+                return;
+            }
+        }
+        let gateway = self.gateway.clone();
+        let shared = self.shared.clone();
+        let provider_name = self
+            .gateway
+            .config()
+            .provider(&provider_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        tokio::spawn(async move {
+            let fetched = probe::fetch_model_list(&gateway, &provider_id).await;
+            let level = if fetched.ok {
+                NoticeLevel::Info
+            } else {
+                NoticeLevel::Warning
+            };
+            shared.push_notice(level, format!("{}：{}", provider_name, fetched.message));
+            if let Ok(mut map) = shared.provider_models.lock() {
+                map.insert(
+                    provider_id.clone(),
+                    ProviderModelsView {
+                        provider_id: provider_id.clone(),
+                        provider_name,
+                        models: fetched.models,
+                        ok: fetched.ok,
+                        message: fetched.message,
+                        at: now_ts(),
+                    },
+                );
+            }
+            if let Ok(mut fetching) = shared.models_fetching.lock() {
+                fetching.remove(&provider_id);
+            }
+        });
+    }
+
+    fn spawn_fx_refresh(&self, manual: bool) {
+        if self.shared.fx_refreshing.swap(true, Ordering::SeqCst) {
+            if manual {
+                self.shared
+                    .push_notice(NoticeLevel::Info, "汇率刷新已在进行中。");
+            }
+            return;
+        }
+        let gateway = self.gateway.clone();
+        let shared = self.shared.clone();
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            let client = gateway
+                .client_for("https://api.frankfurter.app/latest?from=USD")
+                .clone();
+            let result = crate::fx::fetch_rates(&client).await;
+            match result {
+                Ok(rates) => {
+                    let mut cfg = (*gateway.config()).clone();
+                    cfg.ui.fx_rates = rates.rates.clone();
+                    cfg.ui.fx_updated_at = now_ts();
+                    cfg.ui.fx_source = rates.source.clone();
+                    match store.save(&mut cfg) {
+                        Ok(()) => {
+                            gateway.update_config(Arc::new(cfg));
+                            if manual {
+                                shared.push_notice(
+                                    NoticeLevel::Success,
+                                    format!(
+                                        "汇率已更新（{}）：1 USD = {:.4} CNY。",
+                                        rates.source,
+                                        rates.rates.get("CNY").copied().unwrap_or(0.0)
+                                    ),
+                                );
+                            }
+                        }
+                        Err(err) => shared.push_notice(
+                            NoticeLevel::Error,
+                            format!("汇率已获取但保存失败：{err}"),
+                        ),
+                    }
+                }
+                Err(err) => {
+                    if manual {
+                        shared.push_notice(NoticeLevel::Warning, format!("汇率获取失败：{err:#}"));
+                    } else {
+                        tracing::warn!("自动汇率刷新失败：{err:#}");
+                    }
+                }
+            }
+            shared.fx_refreshing.store(false, Ordering::SeqCst);
         });
     }
 
@@ -919,6 +1063,22 @@ impl Runtime {
                 .map(|slot| slot.clone())
                 .unwrap_or(None),
             model_fetch_running: self.shared.model_fetch_running.load(Ordering::SeqCst),
+            provider_models: self
+                .shared
+                .provider_models
+                .lock()
+                .map(|map| map.clone())
+                .unwrap_or_default(),
+            models_fetching: self
+                .shared
+                .models_fetching
+                .lock()
+                .map(|set| set.clone())
+                .unwrap_or_default(),
+            fx_rates: cfg.ui.fx_rates.clone(),
+            fx_updated_at: cfg.ui.fx_updated_at,
+            fx_source: cfg.ui.fx_source.clone(),
+            fx_refreshing: self.shared.fx_refreshing.load(Ordering::SeqCst),
             updated_at: now,
         };
         Arc::new(snapshot)
@@ -994,7 +1154,8 @@ impl Runtime {
     ) -> Vec<RouteGroupView> {
         let mut groups = Vec::new();
         for model in cfg.client_models() {
-            let routes = cfg.routes_for(&model);
+            let routes = cfg.all_routes_for(&model);
+            let enabled_count = routes.iter().filter(|route| route.enabled).count();
             let mut rows = Vec::new();
             let mut previous_protocol: Option<(String, crate::config::RouteMode)> = None;
             for route in &routes {
@@ -1007,31 +1168,33 @@ impl Runtime {
                     .copied()
                     .unwrap_or((0, 0));
                 let mut warning = None;
-                if total == 0 {
-                    warning = Some("该供应商没有账号".to_string());
-                } else if available == 0 {
-                    warning = Some("当前没有可用账号".to_string());
-                }
-                if let Some((prev_protocol, prev_mode)) = &previous_protocol {
-                    if prev_protocol != protocol.label() {
-                        if route.mode == crate::config::RouteMode::Passthrough
-                            || *prev_mode == crate::config::RouteMode::Passthrough
-                        {
-                            warning = Some(format!(
-                                "协议从 {} 切换为 {}，透传模式下无法自动转换",
-                                prev_protocol,
-                                protocol.label()
-                            ));
-                        } else {
-                            warning = Some(format!(
-                                "故障切换到此条需要协议转换（{} → {}）",
-                                prev_protocol,
-                                protocol.label()
-                            ));
+                if route.enabled {
+                    if total == 0 {
+                        warning = Some("该供应商没有账号".to_string());
+                    } else if available == 0 {
+                        warning = Some("当前没有可用账号".to_string());
+                    }
+                    if let Some((prev_protocol, prev_mode)) = &previous_protocol {
+                        if prev_protocol != protocol.label() {
+                            if route.mode == crate::config::RouteMode::Passthrough
+                                || *prev_mode == crate::config::RouteMode::Passthrough
+                            {
+                                warning = Some(format!(
+                                    "协议从 {} 切换为 {}，透传模式下无法自动转换",
+                                    prev_protocol,
+                                    protocol.label()
+                                ));
+                            } else {
+                                warning = Some(format!(
+                                    "故障切换到此条需要协议转换（{} → {}）",
+                                    prev_protocol,
+                                    protocol.label()
+                                ));
+                            }
                         }
                     }
+                    previous_protocol = Some((protocol.label().to_string(), route.mode));
                 }
-                previous_protocol = Some((protocol.label().to_string(), route.mode));
                 rows.push(RouteRowView {
                     route_id: route.id.clone(),
                     provider_id: provider.id.clone(),
@@ -1059,6 +1222,8 @@ impl Runtime {
             }
             if routes.is_empty() {
                 notes.push("没有启用的路由".into());
+            } else if enabled_count == 0 {
+                notes.push("该路由模型的所有上游都已停用，不会参与调度。".into());
             }
             groups.push(RouteGroupView {
                 client_model: model,
@@ -1081,14 +1246,21 @@ impl Runtime {
         }
         let days = self.usage.days;
         let dimension = self.usage.dimension;
+        let local_key = self.usage.local_key.clone();
         let since = db::range_start(days);
-        let totals = self.db.totals_since(since).unwrap_or_default();
+        let totals = self
+            .db
+            .totals_since_key(since, local_key.as_deref())
+            .unwrap_or_default();
         let group_key = if dimension == UsageDimension::Global {
             "model"
         } else {
             dimension.key()
         };
-        let raw_groups = self.db.group_since(group_key, since).unwrap_or_default();
+        let raw_groups = self
+            .db
+            .group_since_key(group_key, since, local_key.as_deref())
+            .unwrap_or_default();
         let groups = raw_groups
             .into_iter()
             .map(|row| {
@@ -1124,17 +1296,21 @@ impl Runtime {
             .collect();
         let model_pairs = self
             .db
-            .model_upstream_since(since)
+            .model_upstream_since_key(since, local_key.as_deref())
             .unwrap_or_default()
             .into_iter()
             .map(|r| (r.client_model, r.upstream_model, r.totals))
             .collect();
         let bucket = if days <= 1 { 3600 } else { 86_400 };
-        let series = self.db.series_since(since, bucket).unwrap_or_default();
+        let series = self
+            .db
+            .series_since_key(since, bucket, local_key.as_deref())
+            .unwrap_or_default();
         self.usage.last_built = Some(Instant::now());
         self.usage.view = UsageView {
             days,
             dimension,
+            local_key,
             totals,
             groups,
             model_pairs,

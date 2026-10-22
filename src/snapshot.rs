@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::db::{RecentRequest, SeriesPoint, Totals};
 use crate::probe::TestResult;
@@ -218,6 +218,8 @@ pub struct UsageGroupView {
 pub struct UsageView {
     pub days: u32,
     pub dimension: UsageDimension,
+    /// Optional local-key filter (`None` means every key plus unauthenticated).
+    pub local_key: Option<String>,
     pub totals: Totals,
     pub groups: Vec<UsageGroupView>,
     pub model_pairs: Vec<(String, String, Totals)>,
@@ -231,6 +233,7 @@ impl Default for UsageView {
         Self {
             days: 7,
             dimension: UsageDimension::Global,
+            local_key: None,
             totals: Totals::default(),
             groups: Vec::new(),
             model_pairs: Vec::new(),
@@ -239,6 +242,18 @@ impl Default for UsageView {
             bucket_secs: 86_400,
         }
     }
+}
+
+/// Cached `/models` catalogue for one provider, fetched on demand by the route
+/// editor so upstream model names can be picked instead of typed.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderModelsView {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub models: Vec<String>,
+    pub ok: bool,
+    pub message: String,
+    pub at: i64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -285,6 +300,14 @@ pub struct UiSnapshot {
     pub balance_refreshing: bool,
     pub fetched_model: Option<FetchedModelView>,
     pub model_fetch_running: bool,
+    /// Latest `/models` catalogue per provider id.
+    pub provider_models: HashMap<String, ProviderModelsView>,
+    pub models_fetching: HashSet<String>,
+    /// Live USD-based rate table plus refresh metadata.
+    pub fx_rates: BTreeMap<String, f64>,
+    pub fx_updated_at: i64,
+    pub fx_source: String,
+    pub fx_refreshing: bool,
     pub updated_at: i64,
 }
 
@@ -319,6 +342,12 @@ impl Default for UiSnapshot {
             balance_refreshing: false,
             fetched_model: None,
             model_fetch_running: false,
+            provider_models: HashMap::new(),
+            models_fetching: HashSet::new(),
+            fx_rates: BTreeMap::new(),
+            fx_updated_at: 0,
+            fx_source: String::new(),
+            fx_refreshing: false,
             updated_at: 0,
         }
     }

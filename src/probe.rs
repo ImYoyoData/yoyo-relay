@@ -1133,62 +1133,15 @@ pub async fn fetch_model_info(
     provider_id: &str,
     upstream_model: &str,
 ) -> FetchedModel {
-    let cfg = gw.config();
-    let Some(provider) = cfg.provider(provider_id).cloned() else {
-        return FetchedModel {
-            message: "供应商不存在。".into(),
-            ..FetchedModel::default()
-        };
-    };
-    let key = cfg
-        .accounts_of(provider_id)
-        .into_iter()
-        .find(|account| account.enabled && !account.api_key.is_empty())
-        .and_then(|account| gw.master.decrypt(&account.api_key).ok())
-        .unwrap_or_default();
-    let url = models_endpoint(&provider);
-    let timeout = provider.timeout_secs.unwrap_or(20).max(5);
-    let resp = send_probe(gw, &provider, &key, "GET", &url, None, timeout).await;
-    if let Some(err) = resp.error {
-        return FetchedModel {
-            message: format!("无法连接上游：{err}"),
-            ..FetchedModel::default()
-        };
-    }
-    let Some(status) = resp.status else {
-        return FetchedModel {
-            message: "上游没有返回 HTTP 状态。".into(),
-            ..FetchedModel::default()
-        };
-    };
-    if status == 401 || status == 403 {
-        return FetchedModel {
-            message: format!("上游鉴权失败（HTTP {status}），请先检查账号 Key。"),
-            ..FetchedModel::default()
-        };
-    }
-    if status != 200 {
-        return FetchedModel {
-            message: format!("上游模型列表返回 HTTP {status}。"),
-            ..FetchedModel::default()
-        };
-    }
-    let value: Value = match serde_json::from_str(&resp.body) {
-        Ok(v) => v,
-        Err(err) => {
+    let items = match load_model_items(gw, provider_id).await {
+        Ok(items) => items,
+        Err(message) => {
             return FetchedModel {
-                message: format!("上游模型列表不是合法 JSON：{err}"),
+                message,
                 ..FetchedModel::default()
-            };
+            }
         }
     };
-    let items: Vec<Value> = value
-        .get("data")
-        .and_then(Value::as_array)
-        .or_else(|| value.get("models").and_then(Value::as_array))
-        .cloned()
-        .or_else(|| value.as_array().cloned())
-        .unwrap_or_default();
     let wanted = upstream_model.trim().to_ascii_lowercase();
     let item = items
         .iter()
@@ -1232,6 +1185,92 @@ pub async fn fetch_model_info(
         format!("上游确认存在「{upstream_model}」，但没有返回上下文/输出等元数据，请手动填写。")
     };
     fetched
+}
+
+/// Cached list of model ids advertised by a provider.
+#[derive(Clone, Debug, Default)]
+pub struct FetchedModelList {
+    pub ok: bool,
+    pub message: String,
+    pub models: Vec<String>,
+}
+
+/// Read every model id from the provider's `/models` endpoint. Used by the
+/// route editor to offer a picker while still allowing free-form input.
+pub async fn fetch_model_list(gw: &Gateway, provider_id: &str) -> FetchedModelList {
+    let items = match load_model_items(gw, provider_id).await {
+        Ok(items) => items,
+        Err(message) => {
+            return FetchedModelList {
+                message,
+                ..FetchedModelList::default()
+            }
+        }
+    };
+    let mut models: Vec<String> = items
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    models.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    models.dedup();
+    FetchedModelList {
+        ok: true,
+        message: if models.is_empty() {
+            "上游模型列表为空，请手动填写模型名。".into()
+        } else {
+            format!("已获取 {} 个上游模型。", models.len())
+        },
+        models,
+    }
+}
+
+/// Fetch and unwrap `data` / `models` arrays from a provider's `/models`
+/// endpoint, returning readable diagnostics on failure.
+async fn load_model_items(gw: &Gateway, provider_id: &str) -> Result<Vec<Value>, String> {
+    let cfg = gw.config();
+    let provider = cfg
+        .provider(provider_id)
+        .cloned()
+        .ok_or_else(|| "供应商不存在。".to_string())?;
+    let accounts = cfg.accounts_of(provider_id);
+    let key = accounts
+        .iter()
+        .find(|account| account.enabled && !account.api_key.is_empty())
+        .or_else(|| accounts.iter().find(|account| !account.api_key.is_empty()))
+        .and_then(|account| gw.master.decrypt(&account.api_key).ok())
+        .unwrap_or_default();
+    let url = models_endpoint(&provider);
+    let timeout = provider.timeout_secs.unwrap_or(20).max(5);
+    let resp = send_probe(gw, &provider, &key, "GET", &url, None, timeout).await;
+    if let Some(err) = resp.error {
+        return Err(format!("无法连接上游：{err}"));
+    }
+    let Some(status) = resp.status else {
+        return Err("上游没有返回 HTTP 状态。".into());
+    };
+    if status == 401 || status == 403 {
+        return Err(format!("上游鉴权失败（HTTP {status}），请先检查账号 Key。"));
+    }
+    if status != 200 {
+        return Err(format!("上游模型列表返回 HTTP {status}。"));
+    }
+    let value: Value = serde_json::from_str(&resp.body)
+        .map_err(|err| format!("上游模型列表不是合法 JSON：{err}"))?;
+    let items = value
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| value.get("models").and_then(Value::as_array))
+        .cloned()
+        .or_else(|| value.as_array().cloned())
+        .unwrap_or_default();
+    Ok(items)
 }
 
 /// Minimal side-effect-free probe used by the half-open recovery task.

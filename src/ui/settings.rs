@@ -7,7 +7,7 @@ use crate::config::ThemeMode;
 use crate::runtime::UiCommand;
 use crate::snapshot::{NoticeLevel, ProxyStatus};
 
-use super::{kit, theme, App, ConfirmAction, Page, SettingsTab};
+use super::{kit, theme, widgets, App, ConfirmAction, Page, SettingsTab};
 
 impl App {
     pub(crate) fn page_settings(&mut self, ui: &mut egui::Ui) {
@@ -59,6 +59,7 @@ impl App {
                     ui.set_width(content_width);
                     match self.settings_tab {
                         SettingsTab::General => self.settings_general(ui),
+                        SettingsTab::Taskbar => self.settings_taskbar(ui),
                         SettingsTab::Proxy => self.settings_proxy(ui),
                         SettingsTab::Scheduler => self.settings_scheduler(ui),
                         SettingsTab::Security => self.settings_security(ui),
@@ -90,6 +91,7 @@ impl App {
         let mut changed = false;
         let mut manage_keys = false;
         let mut test_key = false;
+        let mut refresh_fx = false;
         let close_label = if cfg!(windows) {
             "关闭窗口时隐藏到托盘"
         } else {
@@ -106,7 +108,7 @@ impl App {
             "任务栏显示请求信息"
         };
         let taskbar_desc = if cfg!(windows) {
-            "在 Windows 任务栏托盘左侧常驻显示活跃请求、今日 Token 与成功率；窗口标题与托盘提示同步显示"
+            "在 Windows 任务栏通知区域左侧常驻显示实时状态；显示内容、尺寸与位置可在「任务栏徽标」页调整"
         } else {
             "窗口标题与托盘提示显示活跃请求、今日 Token 与代理状态"
         };
@@ -239,15 +241,76 @@ impl App {
                 );
                 ui.horizontal(|ui| {
                     setting_label(ui, icons::WARNING_CIRCLE, "低余额阈值与汇率");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::secondary_button(ui, icons::ARROWS_CLOCKWISE, "立即获取汇率")
+                            .clicked()
+                        {
+                            refresh_fx = true;
+                        }
+                        if self.snapshot.fx_refreshing {
+                            ui.add(egui::Spinner::new().size(14.0));
+                        }
+                    });
                 });
                 setting_desc(
                     ui,
-                    "按币种分别设置；余额合计不会把 CNY 与 USD 直接相加。汇率用于把按 USD 计价的花费折算到手动余额。",
+                    "按币种分别设置低余额阈值；汇率以 1 USD 为基准，用于手动余额折算与余额页的 CNY 合计。",
                 );
+                ui.add_space(4.0);
+                egui::Frame::new()
+                    .fill(theme::subtle_fill(ui))
+                    .corner_radius(9)
+                    .inner_margin(egui::Margin::symmetric(11, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if kit::toggle_switch(ui, &mut self.config.ui.fx_auto).changed() {
+                                changed = true;
+                            }
+                            ui.label(
+                                RichText::new("自动获取实时汇率")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(theme::text(ui)),
+                            );
+                            ui.label(RichText::new("每").size(10.0).color(theme::muted(ui)));
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.config.ui.fx_refresh_hours)
+                                        .range(1..=168)
+                                        .suffix(" 小时"),
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            ui.label(RichText::new("刷新一次").size(10.0).color(theme::muted(ui)));
+                        });
+                        ui.add_space(2.0);
+                        let source = if self.config.ui.fx_source.is_empty() {
+                            "尚未获取".to_string()
+                        } else {
+                            self.config.ui.fx_source.clone()
+                        };
+                        let when = if self.config.ui.fx_updated_at > 0 {
+                            widgets::format_time(self.config.ui.fx_updated_at)
+                        } else {
+                            "—".to_string()
+                        };
+                        ui.label(
+                            RichText::new(format!(
+                                "数据源：{source} · 最近更新：{when} · 1 USD = {:.2} CNY",
+                                self.config.ui.fx_rate("CNY")
+                            ))
+                            .size(9.5)
+                            .color(theme::muted(ui)),
+                        );
+                    });
+                ui.add_space(6.0);
                 let currencies = self.balance_currencies();
                 let mut thresholds = self.config.ui.low_balance_thresholds.clone();
                 let mut rates = self.config.ui.fx_rates.clone();
-                let mut fx_changed = false;
+                let mut threshold_changed = false;
+                let mut rate_changed = false;
                 egui::Grid::new("balance_currency_settings")
                     .num_columns(3)
                     .spacing([16.0, 7.0])
@@ -284,7 +347,7 @@ impl App {
                                 )
                                 .changed()
                             {
-                                fx_changed = true;
+                                threshold_changed = true;
                             }
                             if currency == "USD" {
                                 ui.label(RichText::new("1.00").size(10.5).color(theme::muted(ui)));
@@ -301,15 +364,20 @@ impl App {
                                     )
                                     .changed()
                                 {
-                                    fx_changed = true;
+                                    rate_changed = true;
                                 }
                             }
                             ui.end_row();
                         }
                     });
-                if fx_changed {
+                if threshold_changed {
                     self.config.ui.low_balance_thresholds = thresholds;
+                    changed = true;
+                }
+                if rate_changed {
                     self.config.ui.fx_rates = rates;
+                    self.config.ui.fx_updated_at = crate::config::now_ts();
+                    self.config.ui.fx_source = "手动填写".into();
                     changed = true;
                 }
                 ui.horizontal(|ui| {
@@ -371,6 +439,169 @@ impl App {
                 let id = key.id.clone();
                 self.start_test("local_key", &id);
             }
+        }
+        if refresh_fx {
+            let _ = self.cmd_tx.send(UiCommand::RefreshFxRates { manual: true });
+        }
+        if changed {
+            self.persist();
+        }
+    }
+
+    // -- Taskbar badge ------------------------------------------------------
+
+    fn settings_taskbar(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        let mut reset = false;
+        let windows = cfg!(windows);
+        kit::section_card(
+            ui,
+            icons::MONITOR,
+            "任务栏实时徽标",
+            if windows {
+                "常驻任务栏通知区域左侧的实时状态胶囊"
+            } else {
+                "当前平台不支持任务栏原生徽标；窗口标题与托盘提示仍会显示状态"
+            },
+            |ui| {
+                kit::badge(
+                    ui,
+                    if windows {
+                        "实时预览"
+                    } else {
+                        "仅 Windows"
+                    },
+                    if windows { theme::GREEN } else { theme::MUTED },
+                );
+            },
+            |ui| {
+                setting_row(
+                    ui,
+                    icons::BROWSER,
+                    "启用任务栏徽标",
+                    "关闭后徽标立即从任务栏消失，代理继续在后台运行",
+                    |ui| {
+                        if kit::toggle_switch(ui, &mut self.config.ui.show_taskbar_stats).changed()
+                        {
+                            changed = true;
+                        }
+                    },
+                );
+                let taskbar = &mut self.config.ui.taskbar;
+                kit::section_label(ui, "显示内容");
+                ui.add_space(3.0);
+                egui::Grid::new("taskbar_content")
+                    .num_columns(3)
+                    .spacing([18.0, 8.0])
+                    .show(ui, |ui| {
+                        for (index, (label, value)) in [
+                            ("状态圆点", &mut taskbar.show_dot),
+                            ("代理状态文字", &mut taskbar.show_status),
+                            ("活跃请求", &mut taskbar.show_active),
+                            ("今日 Token", &mut taskbar.show_tokens),
+                            ("今日请求", &mut taskbar.show_requests),
+                            ("排队数量", &mut taskbar.show_queued),
+                            ("成功率", &mut taskbar.show_success),
+                            ("预估花费", &mut taskbar.show_cost),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            if kit::toggle_switch(ui, value).changed() {
+                                changed = true;
+                            }
+                            ui.label(RichText::new(label).size(11.0).color(theme::text(ui)));
+                            if index % 3 == 2 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                ui.add_space(4.0);
+                kit::divider(ui);
+                kit::section_label(ui, "尺寸与位置");
+                ui.add_space(3.0);
+                ui.spacing_mut().slider_width = 190.0;
+                egui::Grid::new("taskbar_geometry")
+                    .num_columns(2)
+                    .spacing([18.0, 9.0])
+                    .show(ui, |ui| {
+                        ui.label("整体缩放");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.config.ui.taskbar.scale, 0.6..=2.2)
+                                    .fixed_decimals(2)
+                                    .suffix("×"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.end_row();
+                        ui.label("水平偏移");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.config.ui.taskbar.offset_x, -300..=300)
+                                    .suffix(" px"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.end_row();
+                        ui.label("垂直偏移");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.config.ui.taskbar.offset_y, -40..=40)
+                                    .suffix(" px"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.end_row();
+                        ui.label("与通知区域间距");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.config.ui.taskbar.gap, 0..=60)
+                                    .suffix(" px"),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.end_row();
+                        ui.label("不透明度");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.config.ui.taskbar.opacity, 0.3..=1.0)
+                                    .fixed_decimals(2),
+                            )
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        ui.end_row();
+                    });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if kit::secondary_button(ui, icons::ARROW_COUNTER_CLOCKWISE, "恢复默认")
+                        .clicked()
+                    {
+                        reset = true;
+                    }
+                    ui.label(
+                        RichText::new(
+                            "滑块与开关会立即应用到任务栏，无需重启。位置偏移以默认锚点为基准。",
+                        )
+                        .size(9.5)
+                        .color(theme::muted(ui)),
+                    );
+                });
+            },
+        );
+        if reset {
+            self.config.ui.taskbar = crate::config::TaskbarBadgeConfig::default();
+            changed = true;
         }
         if changed {
             self.persist();
@@ -503,6 +734,18 @@ impl App {
                         }
                     },
                 );
+                setting_row(
+                    ui,
+                    icons::GLOBE,
+                    "系统代理失败时直连重试",
+                    "上游请求经系统代理连接失败或超时后，自动改用直连客户端重试同一账号一次",
+                    |ui| {
+                        if kit::toggle_switch(ui, &mut self.config.server.direct_fallback).changed()
+                        {
+                            changed = true;
+                        }
+                    },
+                );
                 setting_row_last(
                     ui,
                     icons::BROWSER,
@@ -564,6 +807,8 @@ impl App {
                     changed |= scheduler_fields_b(&mut cols[1], &mut self.config.scheduler);
                 });
                 ui.add_space(8.0);
+                changed |= scheduler_slow_fields(ui, &mut self.config.scheduler);
+                ui.add_space(6.0);
                 kit::info_row(
                     ui,
                     icons::INFO,
@@ -1179,5 +1424,49 @@ fn scheduler_fields_b(ui: &mut Ui, cfg: &mut crate::config::SchedulerConfig) -> 
                 .changed();
             ui.end_row();
         });
+    changed
+}
+
+fn scheduler_slow_fields(ui: &mut Ui, cfg: &mut crate::config::SchedulerConfig) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        if kit::toggle_switch(ui, &mut cfg.slow_switch).changed() {
+            changed = true;
+        }
+        ui.label(RichText::new("慢请求自动切换").size(12.0).strong());
+        ui.label(
+            RichText::new(
+                "首包超时后先换本供应商的其他账号，再换其他供应商；第一个请求失败也走同一条链路",
+            )
+            .size(10.0)
+            .color(theme::muted(ui)),
+        );
+    });
+    if cfg.slow_switch {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("首包超时");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut cfg.slow_first_byte_secs)
+                        .range(3..=300)
+                        .suffix(" 秒"),
+                )
+                .changed();
+            ui.label("慢响应冷却");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut cfg.slow_cooldown_secs)
+                        .range(5..=3600)
+                        .suffix(" 秒"),
+                )
+                .changed();
+            ui.label(
+                RichText::new("仅统计首包/首个流式分片，不打断已开始输出的响应")
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+            );
+        });
+    }
     changed
 }

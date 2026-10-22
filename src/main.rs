@@ -4,6 +4,7 @@ mod autostart;
 mod balance;
 mod config;
 mod db;
+mod fx;
 mod gateway;
 mod instance;
 mod probe;
@@ -14,6 +15,7 @@ mod snapshot;
 mod taskbar;
 mod tray;
 mod ui;
+mod windowfx;
 
 use std::sync::Arc;
 

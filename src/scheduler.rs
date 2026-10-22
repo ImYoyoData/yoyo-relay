@@ -146,6 +146,9 @@ pub enum FailureKind {
     Server,
     Timeout,
     Network,
+    /// Upstream accepted the request but did not produce a first byte /
+    /// first SSE chunk within the configured deadline.
+    Slow,
     NotFound,
 }
 
@@ -345,6 +348,7 @@ impl Scheduler {
                     "连接失败",
                 )
             }
+            FailureKind::Slow => (cfg.slow_cooldown_secs.max(1), "首包/首 token 超时"),
             FailureKind::NotFound => (0, ""),
         };
         *rt.state.lock().unwrap_or_else(|e| e.into_inner()) = AccountState::Cooling {
@@ -914,6 +918,73 @@ mod tests {
         assert!(!chain.attempts.is_empty());
         assert_eq!(chain.attempts[0].account.id, a2.id);
         assert_eq!(chain.attempts[0].layer, FallbackLayer::Provider);
+    }
+
+    #[test]
+    fn chain_order_prefers_same_provider_accounts_then_next_provider() {
+        let (s, mut cfg, _account_id, provider_id) = setup();
+        let second = Account {
+            id: new_id(),
+            provider_id: provider_id.clone(),
+            name: "A2".into(),
+            enabled: true,
+            max_concurrency: 2,
+            ..Account::default()
+        };
+        cfg.accounts.push(second.clone());
+        let p2 = Provider {
+            id: new_id(),
+            name: "P2".into(),
+            base_url: "https://example.org/v1".into(),
+            ..Provider::default()
+        };
+        cfg.providers.push(p2.clone());
+        let a3 = Account {
+            id: new_id(),
+            provider_id: p2.id.clone(),
+            name: "B1".into(),
+            enabled: true,
+            ..Account::default()
+        };
+        cfg.accounts.push(a3.clone());
+        cfg.routes.push(ModelRoute {
+            id: new_id(),
+            client_model: "gpt-4o".into(),
+            provider_id: p2.id.clone(),
+            upstream_model: "gpt-4o-mini".into(),
+            priority: -1,
+            ..ModelRoute::default()
+        });
+
+        let chain = s.build_chain(&cfg, "gpt-4o", Ingress::Chat, true);
+        let ordered: Vec<&str> = chain
+            .attempts
+            .iter()
+            .map(|a| a.account.id.as_str())
+            .collect();
+        let last_p1 = ordered
+            .iter()
+            .rposition(|id| *id == second.id.as_str() || *id == _account_id.as_str())
+            .unwrap();
+        let first_p2 = ordered.iter().position(|id| *id == a3.id.as_str()).unwrap();
+        assert!(
+            last_p1 < first_p2,
+            "same-provider accounts must be tried before other providers: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn slow_failure_uses_slow_cooldown() {
+        let (s, cfg, account_id, _) = setup();
+        let account = cfg.account(&account_id).unwrap().clone();
+        let now = 1_000_000;
+        s.on_failure_at(&account, FailureKind::Slow, &cfg.scheduler, now);
+        match s.state_of(&account, now + 1) {
+            AccountState::Cooling { until, .. } => {
+                assert_eq!(until, now + cfg.scheduler.slow_cooldown_secs as i64);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

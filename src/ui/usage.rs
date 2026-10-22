@@ -46,6 +46,9 @@ impl App {
                     self.send_usage_view();
                 }
             });
+            ui.horizontal(|ui| {
+                self.usage_key_filter(ui);
+            });
         } else {
             ui.horizontal(|ui| {
                 if let Some(days) = widgets::segmented(
@@ -72,6 +75,8 @@ impl App {
                     self.usage_pinned = None;
                     self.send_usage_view();
                 }
+                ui.separator();
+                self.usage_key_filter(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(format!(
@@ -259,6 +264,18 @@ impl App {
                         .size(10.5)
                         .color(theme::muted(ui)),
                 );
+                if let Some(key_id) = &usage.local_key {
+                    let name = self
+                        .config
+                        .local_key(key_id)
+                        .map(|key| key.name.as_str())
+                        .unwrap_or("已删除 Key");
+                    ui.label(
+                        RichText::new(format!("· 已筛选 Key：{name}"))
+                            .size(10.0)
+                            .color(theme::ACCENT),
+                    );
+                }
             });
             ui.add_space(8.0);
             if usage.groups.is_empty() {
@@ -418,6 +435,67 @@ impl App {
             days: self.usage_days,
             dimension: self.usage_dim,
         });
+    }
+
+    fn send_usage_filter(&mut self) {
+        let _ = self.cmd_tx.send(UiCommand::SetUsageFilter {
+            local_key: self.usage_local_key.clone(),
+        });
+    }
+
+    /// Filter every usage aggregation by one local key.
+    fn usage_key_filter(&mut self, ui: &mut egui::Ui) {
+        let keys: Vec<(String, String)> = self
+            .config
+            .local_keys
+            .iter()
+            .map(|key| (key.id.clone(), key.name.clone()))
+            .collect();
+        if let Some(selected) = &self.usage_local_key {
+            if !keys.iter().any(|(id, _)| id == selected) {
+                self.usage_local_key = None;
+                self.send_usage_filter();
+            }
+        }
+        let label = self
+            .usage_local_key
+            .as_ref()
+            .and_then(|id| keys.iter().find(|(key_id, _)| key_id == id))
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| "全部 Key".to_string());
+        ui.label(RichText::new(icons::KEY).size(12.0).color(theme::muted(ui)));
+        let mut selected = self.usage_local_key.clone();
+        egui::ComboBox::from_id_salt("usage_key_filter")
+            .selected_text(RichText::new(label).size(11.0))
+            .width(168.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(selected.is_none(), "全部 Key / 未鉴权")
+                    .clicked()
+                {
+                    selected = None;
+                }
+                for (id, name) in &keys {
+                    if ui
+                        .selectable_label(selected.as_deref() == Some(id.as_str()), name)
+                        .clicked()
+                    {
+                        selected = Some(id.clone());
+                    }
+                }
+            });
+        if selected != self.usage_local_key {
+            self.usage_local_key = selected;
+            self.usage_pinned = None;
+            self.send_usage_filter();
+        }
+        if self.usage_local_key.is_some() {
+            ui.label(
+                RichText::new("仅统计该 Key 发起的请求")
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+            );
+        }
     }
 }
 

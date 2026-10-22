@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Top-level configuration
@@ -72,13 +72,29 @@ impl AppConfig {
         routes
     }
 
-    /// All distinct client models exposed by enabled routes, plus route models
-    /// that were created but do not have an upstream yet.
+    /// All routes for a client model, including disabled ones. Used by the UI
+    /// so disabling an upstream never hides it from the route page.
+    pub fn all_routes_for(&self, client_model: &str) -> Vec<ModelRoute> {
+        let mut routes: Vec<_> = self
+            .routes
+            .iter()
+            .filter(|r| r.client_model == client_model)
+            .cloned()
+            .collect();
+        routes.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        routes
+    }
+
+    /// All distinct client models known to the configuration, including
+    /// disabled routes and profile-only entries.
     pub fn client_models(&self) -> Vec<String> {
         let mut models: Vec<String> = self
             .routes
             .iter()
-            .filter(|r| r.enabled)
             .map(|r| r.client_model.clone())
             .chain(self.model_profiles.iter().map(|p| p.client_model.clone()))
             .collect();
@@ -152,6 +168,9 @@ pub struct ServerConfig {
     pub queue_timeout_secs: u64,
     pub upstream_timeout_secs: u64,
     pub stream_idle_timeout_secs: u64,
+    /// Retry the same account through a direct (no proxy) client when the
+    /// system-proxy connection fails.
+    pub direct_fallback: bool,
     pub cors: bool,
 }
 
@@ -166,6 +185,7 @@ impl Default for ServerConfig {
             queue_timeout_secs: 30,
             upstream_timeout_secs: 120,
             stream_idle_timeout_secs: 120,
+            direct_fallback: true,
             cors: true,
         }
     }
@@ -186,6 +206,13 @@ pub struct SchedulerConfig {
     pub breaker_cooldown_secs: u64,
     pub half_open_probe_secs: u64,
     pub quota_cache_secs: u64,
+    /// Detect slow first bytes / first SSE chunks and switch to the next
+    /// account (same provider first, then other providers).
+    pub slow_switch: bool,
+    /// Deadline for the first byte of a response (or first SSE chunk).
+    pub slow_first_byte_secs: u64,
+    /// Cooldown applied to an account that exceeded the slow deadline.
+    pub slow_cooldown_secs: u64,
 }
 
 impl Default for SchedulerConfig {
@@ -201,6 +228,9 @@ impl Default for SchedulerConfig {
             breaker_cooldown_secs: 30,
             half_open_probe_secs: 10,
             quota_cache_secs: 10,
+            slow_switch: true,
+            slow_first_byte_secs: 20,
+            slow_cooldown_secs: 30,
         }
     }
 }
@@ -212,6 +242,82 @@ pub enum ThemeMode {
     Light,
     Dark,
     System,
+}
+
+/// Live taskbar badge composition and placement (Windows).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct TaskbarBadgeConfig {
+    /// Show the proxy status text (running/stopped) as the first fragment.
+    pub show_status: bool,
+    /// Show the colored status dot.
+    pub show_dot: bool,
+    pub show_active: bool,
+    pub show_tokens: bool,
+    pub show_requests: bool,
+    pub show_queued: bool,
+    pub show_success: bool,
+    pub show_cost: bool,
+    /// Overall scale of the badge (text, padding and height).
+    pub scale: f32,
+    /// Horizontal nudge in physical pixels, relative to the default anchor.
+    pub offset_x: i32,
+    /// Vertical nudge in physical pixels, relative to the taskbar center.
+    pub offset_y: i32,
+    /// Distance in physical pixels between the badge and the notification area.
+    pub gap: i32,
+    /// Whole-badge opacity, 0.25 – 1.0.
+    pub opacity: f32,
+}
+
+impl Default for TaskbarBadgeConfig {
+    fn default() -> Self {
+        Self {
+            show_status: false,
+            show_dot: true,
+            show_active: true,
+            show_tokens: true,
+            show_requests: false,
+            show_queued: false,
+            show_success: true,
+            show_cost: false,
+            scale: 1.0,
+            offset_x: 0,
+            offset_y: 0,
+            gap: 10,
+            opacity: 0.95,
+        }
+    }
+}
+
+impl TaskbarBadgeConfig {
+    pub fn normalized(&self) -> Self {
+        let mut copy = self.clone();
+        copy.scale = if copy.scale.is_finite() {
+            copy.scale.clamp(0.6, 2.2)
+        } else {
+            1.0
+        };
+        copy.opacity = if copy.opacity.is_finite() {
+            copy.opacity.clamp(0.25, 1.0)
+        } else {
+            1.0
+        };
+        copy.offset_x = copy.offset_x.clamp(-400, 400);
+        copy.offset_y = copy.offset_y.clamp(-80, 80);
+        copy.gap = copy.gap.clamp(0, 80);
+        copy
+    }
+
+    pub fn has_content(&self) -> bool {
+        self.show_status
+            || self.show_active
+            || self.show_tokens
+            || self.show_requests
+            || self.show_queued
+            || self.show_success
+            || self.show_cost
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -238,8 +344,19 @@ pub struct UiConfig {
     /// Currency-specific low-balance thresholds, keyed by ISO code.
     pub low_balance_thresholds: BTreeMap<String, f64>,
     /// Currency units per 1 USD, used to estimate manual balances from
-    /// USD-priced route costs. Missing entries are treated as 1.0.
+    /// USD-priced route costs and to show a CNY-converted total. Missing
+    /// entries are treated as 1.0.
     pub fx_rates: BTreeMap<String, f64>,
+    /// Fetch live exchange rates instead of relying only on the manual values.
+    pub fx_auto: bool,
+    /// How often live rates are refreshed, in hours.
+    pub fx_refresh_hours: u64,
+    /// Unix timestamp of the last successful live-rate refresh.
+    pub fx_updated_at: i64,
+    /// Human-readable source of the last live-rate refresh.
+    pub fx_source: String,
+    /// Windows taskbar badge composition and placement.
+    pub taskbar: TaskbarBadgeConfig,
     pub onboarding_done: bool,
 }
 
@@ -263,6 +380,16 @@ impl UiConfig {
             .filter(|rate| *rate > 0.0)
             .unwrap_or(1.0)
     }
+
+    /// Convert between two currencies using the USD-based rate table.
+    pub fn fx_convert(&self, amount: f64, from: &str, to: &str) -> f64 {
+        let from = self.fx_rate(from);
+        let to = self.fx_rate(to);
+        if from <= 0.0 {
+            return amount;
+        }
+        amount * to / from
+    }
 }
 
 impl Default for UiConfig {
@@ -285,6 +412,11 @@ impl Default for UiConfig {
                 ("CNY".to_string(), 35.0),
             ]),
             fx_rates: BTreeMap::from([("USD".to_string(), 1.0), ("CNY".to_string(), 7.2)]),
+            fx_auto: true,
+            fx_refresh_hours: 12,
+            fx_updated_at: 0,
+            fx_source: String::new(),
+            taskbar: TaskbarBadgeConfig::default(),
             onboarding_done: false,
         }
     }
@@ -665,6 +797,10 @@ pub struct BalanceConfig {
     pub manual_updated_at: i64,
     pub url: Option<String>,
     pub json_path: String,
+    /// Optional arithmetic expression over JSON paths, e.g.
+    /// `data.balance / 100` or `data.total - data.used`. When empty the value
+    /// at `json_path` is used as-is.
+    pub formula: String,
     pub scale: f64,
     pub currency: String,
 }
@@ -677,6 +813,7 @@ impl Default for BalanceConfig {
             manual_updated_at: 0,
             url: None,
             json_path: "balance".to_string(),
+            formula: String::new(),
             scale: 1.0,
             currency: "USD".to_string(),
         }

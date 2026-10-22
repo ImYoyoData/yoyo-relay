@@ -36,6 +36,19 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(" + ")
         };
+        let cny_total: f64 = totals
+            .iter()
+            .map(|(currency, amount)| self.config.ui.fx_convert(*amount, currency, "CNY"))
+            .sum();
+        let cny_sub = if totals.is_empty() {
+            "暂无可用余额数据".to_string()
+        } else {
+            let rate = self.config.ui.fx_rate("CNY");
+            format!(
+                "折合 {} CNY · USD/CNY {rate:.2}",
+                widgets::format_money(cny_total, "CNY")
+            )
+        };
         let low = known
             .iter()
             .filter(|b| b.amount.unwrap_or(0.0) < self.config.ui.threshold_for(&b.currency))
@@ -76,11 +89,7 @@ impl App {
                 icons::WALLET,
                 "已知余额合计",
                 total_text,
-                if known.is_empty() {
-                    "暂无可用余额数据".to_string()
-                } else {
-                    "按币种分别统计，不做汇率相加".to_string()
-                },
+                cny_sub,
                 theme::ACCENT,
             ),
             (
@@ -94,7 +103,7 @@ impl App {
                 icons::ARROWS_CLOCKWISE,
                 "自动查询",
                 format!("{auto_count} 个"),
-                "每 {} 分钟刷新".to_string(),
+                format!("每 {} 分钟刷新", self.config.ui.balance_refresh_mins.max(1)),
                 theme::BLUE_INFO,
             ),
             (

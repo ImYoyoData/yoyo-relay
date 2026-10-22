@@ -203,6 +203,7 @@ impl ConfigStore {
 
     pub fn save(&self, config: &mut AppConfig) -> Result<()> {
         config.schema_version = CONFIG_SCHEMA_VERSION;
+        config.ui.taskbar = config.ui.taskbar.normalized();
         let errors = validate(config);
         if !errors.is_empty() {
             return Err(anyhow!(errors.join("；")));
@@ -317,6 +318,11 @@ fn migrate_value(mut value: Value) -> Value {
         // v1 -> v2: model profiles are derived lazily from routes when absent,
         // so only the marker needs to move. Existing route metadata remains.
         obj.insert("schema_version".into(), Value::from(2));
+    }
+    if version < 3 {
+        // v2 -> v3: live FX metadata, taskbar badge settings and the optional
+        // balance formula all have serde defaults, so only the marker moves.
+        obj.insert("schema_version".into(), Value::from(3));
     }
     value
 }

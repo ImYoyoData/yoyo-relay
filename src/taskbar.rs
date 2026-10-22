@@ -5,6 +5,31 @@
 //! layered window drawn with GDI (per-pixel alpha), placed just left of the
 //! notification area and marked click-through.
 
+/// Visual placement options for the taskbar badge. Passed from the UI so the
+/// settings page can resize/nudge the badge in real time.
+#[derive(Clone, Copy, Debug)]
+pub struct BadgeStyle {
+    pub scale: f32,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub gap: i32,
+    pub opacity: f32,
+    pub show_dot: bool,
+}
+
+impl Default for BadgeStyle {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            offset_x: 0,
+            offset_y: 0,
+            gap: 10,
+            opacity: 0.95,
+            show_dot: true,
+        }
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
@@ -16,8 +41,8 @@ mod imp {
         CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW,
         GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER,
         BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CLEARTYPE_QUALITY, DEFAULT_CHARSET,
-        DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HGDIOBJ,
-        TRANSPARENT,
+        DIB_RGB_COLORS, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
+        HGDIOBJ, TRANSPARENT,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -27,7 +52,11 @@ mod imp {
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
 
+    use super::BadgeStyle;
+
     static REGISTER_CLASS: Once = Once::new();
+
+    const FONT_NAME: &str = "Microsoft YaHei UI";
 
     /// A click-through, always-on-top badge showing live request statistics.
     pub struct TaskbarBadge {
@@ -37,6 +66,7 @@ mod imp {
         last_dot: (u8, u8, u8),
         last_size: (i32, i32),
         last_pos: (i32, i32),
+        last_style: (i32, i32, i32, u8, bool),
         last_paint: Instant,
         visible: bool,
     }
@@ -69,7 +99,7 @@ mod imp {
         });
     }
 
-    fn anchor(width: i32, height: i32) -> Option<(i32, i32)> {
+    fn anchor(width: i32, height: i32, style: &BadgeStyle) -> Option<(i32, i32)> {
         unsafe {
             let tray = FindWindowW(windows_sys::w!("Shell_TrayWnd"), std::ptr::null());
             if tray.is_null() {
@@ -110,9 +140,79 @@ mod imp {
                     notify_left = candidate.left;
                 }
             }
-            let x = (notify_left - width - 10).max(tray_rect.left);
-            let y = tray_rect.top + ((tray_h - height) / 2).max(0);
+            let x = (notify_left - width - style.gap + style.offset_x).max(tray_rect.left);
+            let y = tray_rect.top + ((tray_h - height) / 2).max(0) + style.offset_y;
             Some((x, y))
+        }
+    }
+
+    fn create_font(scale: f32) -> windows_sys::Win32::Graphics::Gdi::HFONT {
+        unsafe {
+            let font_name = wide(FONT_NAME);
+            let font_height = -((11.0 * scale).round() as i32).max(12);
+            CreateFontW(
+                font_height,
+                0,
+                0,
+                0,
+                FW_NORMAL as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                0,
+                0,
+                CLEARTYPE_QUALITY as u32,
+                0,
+                font_name.as_ptr(),
+            )
+        }
+    }
+
+    /// Measure the rendered width of the badge text so the capsule hugs its
+    /// content instead of using a fixed width.
+    fn measure(text: &str, scale: f32, show_dot: bool) -> (i32, i32) {
+        unsafe {
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            if dc.is_null() {
+                return ((120.0 * scale) as i32, (30.0 * scale) as i32);
+            }
+            let font = create_font(scale);
+            let old_font = if font.is_null() {
+                std::ptr::null_mut()
+            } else {
+                SelectObject(dc, font as HGDIOBJ)
+            };
+            let text_wide = wide(text);
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            DrawTextW(
+                dc,
+                text_wide.as_ptr(),
+                -1,
+                &mut rect,
+                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            if !old_font.is_null() {
+                SelectObject(dc, old_font);
+            }
+            if !font.is_null() {
+                DeleteObject(font as HGDIOBJ);
+            }
+            DeleteDC(dc);
+            let pad = (9.0 * scale).round().max(5.0) as i32;
+            let dot_width = if show_dot {
+                (3.4 * scale).max(2.5) * 2.0 + 7.0 * scale
+            } else {
+                0.0
+            } as i32;
+            let width = (rect.right.max(1) + pad * 2 + dot_width).max((40.0 * scale) as i32);
+            let height = ((30.0 * scale).round() as i32).max(22);
+            (width, height)
         }
     }
 
@@ -150,24 +250,45 @@ mod imp {
                     last_dot: (0, 0, 0),
                     last_size: (0, 0),
                     last_pos: (i32::MIN, i32::MIN),
+                    last_style: (0, 0, 0, 0, false),
                     last_paint: Instant::now() - Duration::from_secs(10),
                     visible: false,
                 })
             }
         }
 
-        pub fn update(&mut self, text: &str, dot: (u8, u8, u8), dark: bool, scale: f32) {
-            let scale = if scale.is_finite() {
-                scale.clamp(0.75, 3.0)
+        pub fn update(
+            &mut self,
+            text: &str,
+            dot: (u8, u8, u8),
+            dark: bool,
+            dpi: f32,
+            style: &BadgeStyle,
+        ) {
+            let dpi = if dpi.is_finite() {
+                dpi.clamp(0.75, 3.0)
             } else {
                 1.0
             };
-            let width = (176.0 * scale).round() as i32;
-            let height = (30.0 * scale).round() as i32;
+            let scale = (dpi * style.scale.clamp(0.6, 2.2)).clamp(0.6, 4.0);
+            let opacity = if style.opacity.is_finite() {
+                style.opacity.clamp(0.25, 1.0)
+            } else {
+                1.0
+            };
+            let (width, height) = measure(text, scale, style.show_dot);
+            let style_key = (
+                style.offset_x,
+                style.offset_y,
+                style.gap,
+                (opacity * 255.0).round() as u8,
+                style.show_dot,
+            );
             let same_content = self.last_text == text
                 && self.last_dark == dark
                 && self.last_dot == dot
-                && self.last_size == (width, height);
+                && self.last_size == (width, height)
+                && self.last_style == style_key;
             // Avoid Win32 window queries on every UI frame; content changes or
             // the periodic re-anchor below still repaint promptly.
             if same_content
@@ -176,7 +297,7 @@ mod imp {
             {
                 return;
             }
-            let Some(pos) = anchor(width, height) else {
+            let Some(pos) = anchor(width, height, style) else {
                 if self.visible {
                     unsafe {
                         ShowWindow(self.hwnd, SW_HIDE);
@@ -190,17 +311,29 @@ mod imp {
             if !changed && self.last_paint.elapsed() < Duration::from_secs(2) {
                 return;
             }
-            if self.paint(width, height, pos, text, dot, dark, scale) {
+            if self.paint(
+                width,
+                height,
+                pos,
+                text,
+                dot,
+                dark,
+                scale,
+                opacity,
+                style.show_dot,
+            ) {
                 self.last_text = text.to_string();
                 self.last_dark = dark;
                 self.last_dot = dot;
                 self.last_size = (width, height);
                 self.last_pos = pos;
+                self.last_style = style_key;
                 self.last_paint = Instant::now();
                 self.visible = true;
             }
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn paint(
             &self,
             width: i32,
@@ -210,6 +343,8 @@ mod imp {
             dot: (u8, u8, u8),
             dark: bool,
             scale: f32,
+            opacity: f32,
+            show_dot: bool,
         ) -> bool {
             unsafe {
                 let mut bmi = BITMAPINFO::default();
@@ -267,23 +402,24 @@ mod imp {
                     }
                 }
 
-                // Status dot.
-                for y in 0..height {
-                    let fy = y as f32 + 0.5;
-                    for x in 0..width {
-                        let fx = x as f32 + 0.5;
-                        let dist = ((fx - dot_cx).powi(2) + (fy - dot_cy).powi(2)).sqrt();
-                        let coverage = (dot_radius - dist + 0.5).clamp(0.0, 1.0);
-                        if coverage <= 0.0 {
-                            continue;
+                if show_dot {
+                    for y in 0..height {
+                        let fy = y as f32 + 0.5;
+                        for x in 0..width {
+                            let fx = x as f32 + 0.5;
+                            let dist = ((fx - dot_cx).powi(2) + (fy - dot_cy).powi(2)).sqrt();
+                            let coverage = (dot_radius - dist + 0.5).clamp(0.0, 1.0);
+                            if coverage <= 0.0 {
+                                continue;
+                            }
+                            let idx = (y * width + x) as usize;
+                            let (r, g, b) = (
+                                (dot.0 as f32 * coverage + bg.0 as f32 * (1.0 - coverage)) as u8,
+                                (dot.1 as f32 * coverage + bg.1 as f32 * (1.0 - coverage)) as u8,
+                                (dot.2 as f32 * coverage + bg.2 as f32 * (1.0 - coverage)) as u8,
+                            );
+                            pixels[idx] = argb(bg_alpha, (r, g, b));
                         }
-                        let idx = (y * width + x) as usize;
-                        let (r, g, b) = (
-                            (dot.0 as f32 * coverage + bg.0 as f32 * (1.0 - coverage)) as u8,
-                            (dot.1 as f32 * coverage + bg.1 as f32 * (1.0 - coverage)) as u8,
-                            (dot.2 as f32 * coverage + bg.2 as f32 * (1.0 - coverage)) as u8,
-                        );
-                        pixels[idx] = argb(bg_alpha, (r, g, b));
                     }
                 }
 
@@ -296,24 +432,7 @@ mod imp {
                 let old_bitmap = SelectObject(dc, dib as HGDIOBJ);
                 SetBkMode(dc, TRANSPARENT as i32);
                 SetTextColor(dc, colorref(fg));
-                let font_name = wide("Microsoft YaHei UI");
-                let font_height = -((11.0 * scale).round() as i32).max(12);
-                let font = CreateFontW(
-                    font_height,
-                    0,
-                    0,
-                    0,
-                    FW_NORMAL as i32,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET as u32,
-                    0,
-                    0,
-                    CLEARTYPE_QUALITY as u32,
-                    0,
-                    font_name.as_ptr(),
-                );
+                let font = create_font(scale);
                 let old_font = if font.is_null() {
                     std::ptr::null_mut()
                 } else {
@@ -321,7 +440,11 @@ mod imp {
                 };
                 let text_wide = wide(text);
                 let mut rect = RECT {
-                    left: (dot_cx + dot_radius + 7.0 * scale) as i32,
+                    left: if show_dot {
+                        (dot_cx + dot_radius + 7.0 * scale) as i32
+                    } else {
+                        (9.0 * scale) as i32
+                    },
                     top: 0,
                     right: width - (8.0 * scale) as i32,
                     bottom: height,
@@ -345,7 +468,7 @@ mod imp {
                 let blend = BLENDFUNCTION {
                     BlendOp: AC_SRC_OVER as u8,
                     BlendFlags: 0,
-                    SourceConstantAlpha: 255,
+                    SourceConstantAlpha: (opacity.clamp(0.25, 1.0) * 255.0).round() as u8,
                     AlphaFormat: AC_SRC_ALPHA as u8,
                 };
                 let dst = POINT { x: pos.0, y: pos.1 };
@@ -417,5 +540,13 @@ impl TaskbarBadge {
         None
     }
 
-    pub fn update(&mut self, _text: &str, _dot: (u8, u8, u8), _dark: bool, _scale: f32) {}
+    pub fn update(
+        &mut self,
+        _text: &str,
+        _dot: (u8, u8, u8),
+        _dark: bool,
+        _dpi: f32,
+        _style: &BadgeStyle,
+    ) {
+    }
 }

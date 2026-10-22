@@ -3,7 +3,7 @@ use egui_phosphor::regular as icons;
 
 use crate::snapshot::{NoticeLevel, RouteGroupView, RouteRowView};
 
-use super::{theme, widgets, App, ConfirmAction};
+use super::{brands, theme, widgets, App, ConfirmAction};
 
 impl App {
     pub(crate) fn page_routes(&mut self, ui: &mut egui::Ui) {
@@ -66,7 +66,12 @@ impl App {
                 continue;
             }
             let profile = self.config.model_profile(&group.client_model);
-            let mut meta = vec![format!("{} 个上游", matching_rows.len())];
+            let enabled_rows = group.rows.iter().filter(|r| r.enabled).count();
+            let mut meta = vec![format!(
+                "{} 个上游 · {} 个参与调度",
+                group.rows.len(),
+                enabled_rows
+            )];
             if let Some(profile) = profile {
                 if let Some(context) = profile.context_window {
                     meta.push(format!("上下文 {}", widgets::format_count(context)));
@@ -152,6 +157,7 @@ impl App {
                 RouteAction::Delete(id) => self.confirm = Some(ConfirmAction::DeleteRoute(id)),
                 RouteAction::Test(id) => self.start_test("route", &id),
                 RouteAction::Priority(id, delta) => self.adjust_route_priority(&id, delta),
+                RouteAction::Toggle(id) => self.toggle_route_enabled(&id),
                 RouteAction::AddUpstream(model) => self.open_new_route(&model),
                 RouteAction::EditModel(model) => self.open_edit_route_model(&model),
                 RouteAction::DeleteModel(model) => {
@@ -193,6 +199,7 @@ impl App {
                             theme::MUTED
                         },
                     );
+                    brands::tile(ui, &brands::for_name(&row.provider_name), 20.0);
                     ui.label(RichText::new(&row.provider_name).size(13.5).strong());
                     ui.label(
                         RichText::new(icons::ARROW_RIGHT)
@@ -212,6 +219,23 @@ impl App {
                         if super::kit::icon_button(ui, icons::PENCIL_SIMPLE, "编辑路由").clicked()
                         {
                             pending.push(RouteAction::Edit(row.route_id.clone()));
+                        }
+                        if super::kit::icon_button(
+                            ui,
+                            if row.enabled {
+                                icons::PAUSE
+                            } else {
+                                icons::PLAY
+                            },
+                            if row.enabled {
+                                "停用该上游（保留在列表，不参与调度）"
+                            } else {
+                                "启用该上游"
+                            },
+                        )
+                        .clicked()
+                        {
+                            pending.push(RouteAction::Toggle(row.route_id.clone()));
                         }
                         if super::kit::icon_button(
                             ui,
@@ -273,6 +297,26 @@ impl App {
             });
     }
 
+    fn toggle_route_enabled(&mut self, id: &str) {
+        let backup = self.config.clone();
+        if let Some(route) = self.config.routes.iter_mut().find(|r| r.id == id) {
+            route.enabled = !route.enabled;
+            let enabled = route.enabled;
+            if self.persist() {
+                self.toast(
+                    NoticeLevel::Success,
+                    if enabled {
+                        "该上游已启用，将参与调度"
+                    } else {
+                        "该上游已停用，仍保留在路由列表中"
+                    },
+                );
+            } else {
+                self.config = backup;
+            }
+        }
+    }
+
     fn adjust_route_priority(&mut self, id: &str, delta: i32) {
         let backup = self.config.clone();
         if let Some(route) = self.config.routes.iter_mut().find(|r| r.id == id) {
@@ -299,6 +343,7 @@ enum RouteAction {
     Delete(String),
     Test(String),
     Priority(String, i32),
+    Toggle(String),
     AddUpstream(String),
     EditModel(String),
     DeleteModel(String),

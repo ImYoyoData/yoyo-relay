@@ -1,6 +1,6 @@
 [package]
 name = "yoyo-relay"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Local multi-upstream LLM relay with account failover"
 license = "MIT"
@@ -38,8 +38,10 @@ raw-window-handle = "0.6"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
 ] }
 

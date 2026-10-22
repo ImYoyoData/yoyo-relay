@@ -7,7 +7,7 @@ use crate::config::{
 };
 use crate::snapshot::NoticeLevel;
 
-use super::{theme, widgets};
+use super::{brands, theme, widgets};
 use super::{
     AccountDraft, App, ConfirmAction, Editor, LocalKeyDraft, ManualBalanceDraft, Page,
     ProviderDraft, RouteDraft, RouteModelDraft,
@@ -17,10 +17,14 @@ impl App {
     // -- openers ------------------------------------------------------------
 
     pub(crate) fn open_new_provider(&mut self) {
-        let provider = self.store.preset_provider("openai");
+        self.open_new_provider_with_preset("openai");
+    }
+
+    pub(crate) fn open_new_provider_with_preset(&mut self, key: &str) {
+        let provider = self.store.preset_provider(key);
         self.editor = Some(Editor::Provider(ProviderDraft {
             is_new: true,
-            preset: "openai".into(),
+            preset: key.to_string(),
             provider,
         }));
     }
@@ -269,6 +273,19 @@ impl App {
         {
             self.toast(NoticeLevel::Error, "请选择所属供应商。");
             return false;
+        }
+        if account.balance.mode == BalanceMode::Auto {
+            let formula = account.balance.formula.trim();
+            if !formula.is_empty() {
+                if let Err(err) = crate::balance::validate_formula(formula) {
+                    self.toast(NoticeLevel::Error, format!("余额公式无效：{err}"));
+                    return false;
+                }
+            }
+            if !account.balance.scale.is_finite() || account.balance.scale <= 0.0 {
+                account.balance.scale = 1.0;
+            }
+            account.balance.formula = formula.to_string();
         }
         account.quota = if draft.quota_enabled {
             Some(QuotaConfig {
@@ -1253,38 +1270,19 @@ fn section(ui: &mut egui::Ui, title: &str) {
 fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
     let provider = &mut draft.provider;
     if draft.is_new {
-        ui.horizontal(|ui| {
-            ui.label("从预设开始");
-            let current_label = crate::config::presets::PRESETS
-                .iter()
-                .find(|p| p.key == draft.preset)
-                .map(|p| p.name)
-                .unwrap_or("自定义");
-            ComboBox::from_id_salt("provider_preset")
-                .selected_text(current_label)
-                .show_ui(ui, |ui| {
-                    for preset in crate::config::presets::PRESETS {
-                        if ui
-                            .selectable_label(draft.preset == preset.key, preset.name)
-                            .clicked()
-                        {
-                            let id = provider.id.clone();
-                            let created = provider.created_at;
-                            *provider = app.store.preset_provider(preset.key);
-                            provider.id = id;
-                            provider.created_at = created;
-                            draft.preset = preset.key.to_string();
-                        }
-                    }
-                });
-        });
-        if let Some(preset) = crate::config::presets::PRESETS
-            .iter()
-            .find(|p| p.key == draft.preset)
-        {
+        section(ui, "品牌预设");
+        if let Some(key) = brands::preset_gallery(ui, &draft.preset) {
+            let id = provider.id.clone();
+            let created = provider.created_at;
+            *provider = app.store.preset_provider(key);
+            provider.id = id;
+            provider.created_at = created;
+            draft.preset = key.to_string();
+        }
+        if let Some(preset) = crate::config::presets::preset(&draft.preset) {
             ui.label(
                 RichText::new(preset.description)
-                    .size(11.0)
+                    .size(10.5)
                     .color(theme::muted(ui)),
             );
         }
@@ -1292,6 +1290,21 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
     }
 
     section(ui, "基本信息");
+    let brand = brands::for_preset(Some(&draft.preset));
+    ui.horizontal(|ui| {
+        brands::tile(ui, &brand, 36.0);
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(&provider.name).size(13.0).strong());
+            ui.label(
+                RichText::new(&provider.base_url)
+                    .monospace()
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+            );
+        });
+    });
+    ui.add_space(4.0);
     egui::Grid::new("provider_basic")
         .num_columns(2)
         .spacing([14.0, 8.0])
@@ -1770,8 +1783,19 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
                             .hint_text("data.balance 或 data[0].credits"),
                     );
                     ui.end_row();
+                    ui.label("换算公式");
+                    ui.add(
+                        TextEdit::singleline(&mut balance.formula)
+                            .desired_width(380.0)
+                            .hint_text("可留空；例如 data.balance / 100"),
+                    );
+                    ui.end_row();
                     ui.label("数值倍率");
-                    ui.add(egui::DragValue::new(&mut balance.scale).speed(0.01));
+                    ui.add(
+                        egui::DragValue::new(&mut balance.scale)
+                            .speed(0.01)
+                            .range(0.0001..=1_000_000.0),
+                    );
                     ui.end_row();
                 }
                 BalanceMode::Manual => {
@@ -1793,6 +1817,45 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
                 BalanceMode::Unavailable => {}
             }
         });
+
+    if balance.mode == BalanceMode::Auto {
+        let path = if balance.json_path.trim().is_empty() {
+            "balance".to_string()
+        } else {
+            balance.json_path.trim().to_string()
+        };
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("快捷换算").size(10.0).color(theme::muted(ui)));
+            if ui.small_button("原始值").clicked() {
+                balance.formula.clear();
+                balance.scale = 1.0;
+            }
+            if ui.small_button("除以 100").clicked() {
+                balance.formula = format!("{path} / 100");
+                balance.scale = 1.0;
+            }
+            if ui.small_button("除以 1000").clicked() {
+                balance.formula = format!("{path} / 1000");
+                balance.scale = 1.0;
+            }
+            if ui.small_button("除以 10000").clicked() {
+                balance.formula = format!("{path} / 10000");
+                balance.scale = 1.0;
+            }
+            if ui.small_button("乘以 100").clicked() {
+                balance.formula = format!("{path} * 100");
+                balance.scale = 1.0;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "公式中的变量直接写 JSON 路径，支持 + - * / 与括号，例如 data.total - data.used；留空时使用 JSON 路径 × 倍率。",
+            )
+            .size(10.0)
+            .color(theme::muted(ui)),
+        );
+    }
 
     if !draft.is_new {
         let masked = app.store.masked_secret(&draft.account.api_key);
@@ -1846,12 +1909,66 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
                     }
                 });
             ui.end_row();
+            let fetching = app.snapshot.models_fetching.contains(&route.provider_id);
+            let catalog = app
+                .snapshot
+                .provider_models
+                .get(&route.provider_id)
+                .cloned();
+            if !route.provider_id.is_empty()
+                && catalog.is_none()
+                && !fetching
+                && app.models_requested.insert(route.provider_id.clone())
+            {
+                let _ = app
+                    .cmd_tx
+                    .send(crate::runtime::UiCommand::FetchProviderModels(
+                        route.provider_id.clone(),
+                    ));
+            }
             ui.label("上游模型名");
-            ui.add(
-                TextEdit::singleline(&mut route.upstream_model)
-                    .desired_width(360.0)
-                    .hint_text("发给该供应商的真实模型名"),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    TextEdit::singleline(&mut route.upstream_model)
+                        .desired_width(280.0)
+                        .hint_text("发给该供应商的真实模型名"),
+                );
+                if ui
+                    .add_enabled(
+                        !fetching,
+                        egui::Button::new(if fetching {
+                            format!("{} 获取中…", icons::SPINNER)
+                        } else {
+                            format!("{} 拉取列表", icons::LIST_MAGNIFYING_GLASS)
+                        }),
+                    )
+                    .on_hover_text("从该供应商的 /models 端点读取模型名，仍可手动输入")
+                    .clicked()
+                {
+                    let _ = app
+                        .cmd_tx
+                        .send(crate::runtime::UiCommand::FetchProviderModels(
+                            route.provider_id.clone(),
+                        ));
+                }
+                if let Some(catalog) = &catalog {
+                    if !catalog.models.is_empty() {
+                        ComboBox::from_id_salt("route_upstream_model_pick")
+                            .selected_text(format!("{} 个可选", catalog.models.len()))
+                            .width(170.0)
+                            .show_ui(ui, |ui| {
+                                for model in &catalog.models {
+                                    if ui
+                                        .selectable_label(route.upstream_model == *model, model)
+                                        .clicked()
+                                    {
+                                        route.upstream_model = model.clone();
+                                    }
+                                }
+                            });
+                    }
+                }
+            });
             ui.end_row();
             ui.label("优先级");
             ui.add(egui::DragValue::new(&mut route.priority).range(-100..=100));
@@ -1902,6 +2019,39 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
             ui.checkbox(&mut route.enabled, "参与调度");
             ui.end_row();
         });
+
+    if let Some(catalog) = app
+        .snapshot
+        .provider_models
+        .get(&route.provider_id)
+        .filter(|catalog| catalog.provider_id == route.provider_id)
+    {
+        ui.horizontal_wrapped(|ui| {
+            super::kit::badge(
+                ui,
+                if catalog.ok {
+                    "供应商模型列表"
+                } else {
+                    "获取失败"
+                },
+                if catalog.ok {
+                    theme::GREEN
+                } else {
+                    theme::ORANGE
+                },
+            );
+            ui.label(
+                RichText::new(format!("{} · {}", catalog.provider_name, catalog.message))
+                    .size(10.0)
+                    .color(theme::muted(ui)),
+            );
+            ui.label(
+                RichText::new(widgets::time_ago(catalog.at, crate::config::now_ts()))
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+            );
+        });
+    }
 
     if let Some(provider) = app.config.provider(&route.provider_id) {
         let resolved = provider.protocol_for(&route.upstream_model, route.protocol);
