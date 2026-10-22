@@ -5,18 +5,18 @@ mod balance;
 mod config;
 mod db;
 mod gateway;
+mod instance;
 mod probe;
 mod protocol;
 mod runtime;
 mod scheduler;
 mod snapshot;
+mod tray;
 mod ui;
 
-use std::fs::OpenOptions;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use fs2::FileExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::ConfigStore;
@@ -38,14 +38,24 @@ fn main() {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Autostart management does not need the config store or the single-instance lock:
-    // it must also work while YoyoRelay is already running.
+    // Autostart management does not need the single-instance lock: it must
+    // also work while YoyoRelay is already running. Persisting the flag keeps
+    // the next launch from re-enabling it from a stale config.
     if let Some(index) = args.iter().position(|a| a == "--autostart") {
         let enabled = args
             .get(index + 1)
             .map(|value| !matches!(value.as_str(), "off" | "false" | "0" | "disable"))
             .unwrap_or(true);
         autostart::set_enabled(enabled)?;
+        if let Ok(store) = ConfigStore::open() {
+            if let Ok(outcome) = store.load() {
+                let mut config = outcome.config;
+                if config.ui.autostart != enabled {
+                    config.ui.autostart = enabled;
+                    let _ = store.save(&mut config);
+                }
+            }
+        }
         println!(
             "autostart {}: {}",
             if enabled { "enabled" } else { "disabled" },
@@ -55,7 +65,14 @@ fn run() -> Result<()> {
     }
 
     let store = Arc::new(ConfigStore::open().context("初始化配置目录失败")?);
-    let _instance_lock = acquire_instance_lock(&store.paths.config_dir.join("instance.lock"))?;
+    let signals = Arc::new(instance::Signals::default());
+    let _instance_guard = match instance::acquire(&store.paths.config_dir, signals.clone())? {
+        instance::Instance::Primary(guard) => guard,
+        instance::Instance::AlreadyRunning => {
+            println!("YoyoRelay 已在运行，已请求显示已有窗口。");
+            return Ok(());
+        }
+    };
     let outcome = store.load()?;
     let headless = args.iter().any(|a| a == "--headless");
     let selftest = args.iter().any(|a| a == "--selftest");
@@ -118,6 +135,7 @@ fn run() -> Result<()> {
                 cmd_tx,
                 snap_rx,
                 initial_page,
+                signals,
             )))
         }),
     );
@@ -125,23 +143,6 @@ fn run() -> Result<()> {
         return Err(anyhow!("窗口运行失败：{err}"));
     }
     Ok(())
-}
-
-fn acquire_instance_lock(path: &std::path::Path) -> Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .with_context(|| format!("无法创建单实例锁：{}", path.display()))?;
-    file.try_lock_exclusive().map_err(|_| {
-        anyhow!("已有一个 YoyoRelay 实例在运行。请从任务栏恢复已有窗口，或先退出它。")
-    })?;
-    Ok(file)
 }
 
 fn run_headless(snap_rx: std::sync::mpsc::Receiver<Arc<snapshot::UiSnapshot>>) {

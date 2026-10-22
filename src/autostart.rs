@@ -71,6 +71,7 @@ mod imp {
 mod imp {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
 
     fn plist_path() -> Result<PathBuf> {
@@ -138,6 +139,7 @@ mod imp {
 mod imp {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     fn desktop_path() -> Result<PathBuf> {
         let config = dirs::config_dir().ok_or_else(|| anyhow!("无法定位用户配置目录"))?;

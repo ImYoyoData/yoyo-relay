@@ -5,3 +5,4 @@
 *.log
 config.corrupt-*.json
 .render-logo.html
+/window.png

@@ -22,7 +22,8 @@
 - **本地 Key**：`yr-` 前缀、模型白名单、Token/请求数独立额度、AES-256-GCM 加密存储。
 - **安全**：账号 Key 与本地 Key 加密落盘；界面与日志脱敏；请求鉴权；配置导出不含密钥。
 - **界面**：无边框自定义标题栏、浅色/深色主题、自动 DPI 缩放、图标按钮、遮罩 + 阴影弹窗、响应式列表（窄窗口切换为图标导航栏）。
-- **启动与托盘**：开机自启（Windows 注册表 / macOS LaunchAgent / Linux XDG autostart）、启动时最小化、关闭窗口时最小化到任务栏、任务栏实时请求信息（窗口标题与悬停提示显示活跃请求、Token 与代理状态）。
+- **启动、托盘与单实例**：开机自启（Windows 注册表 / macOS LaunchAgent / Linux XDG autostart）；启动时直接驻留系统托盘；关闭窗口隐藏到托盘（Windows 上窗口与任务栏按钮一起消失，代理继续运行）；托盘图标使用应用 Logo，左键恢复主窗口、右键菜单可显示或退出；重复启动程序会直接唤出已有窗口并置于前台，不会报错或启动第二个实例。
+- **任务栏信息**：窗口标题显示活跃请求、今日 Token 与代理状态，悬停任务栏按钮即可查看。
 - **设置页**：按「通用与启动 / 代理 / 调度与熔断 / 安全 / 数据 / 关于」分区，切换即保存。
 
 ## 快速开始
@@ -69,9 +70,11 @@ yoyo-relay                 # 图形界面
 yoyo-relay --headless      # 仅启动代理，Ctrl+C 退出
 yoyo-relay --selftest      # 启动代理并自动跑完四类连接测试后退出
 yoyo-relay --page usage    # 指定启动页面（overview/providers/accounts/routes/keys/usage/balances/settings）
-yoyo-relay --minimized     # 启动后直接最小化
+yoyo-relay --minimized     # 启动后直接隐藏到系统托盘
 yoyo-relay --autostart on  # 注册开机自启（off 取消）
 ```
+
+重复运行 `yoyo-relay` 不会启动第二个实例：程序会通过本机控制通道唤出正在运行的窗口（隐藏到托盘时也会恢复并置前），然后立即退出。
 
 开机自启也可以在「设置 → 通用与启动」中切换；Windows 写入当前用户 `Run` 注册表项，macOS 写入 `~/Library/LaunchAgents`，Linux 写入 `~/.config/autostart`。
 
@@ -118,6 +121,8 @@ YOYO_RELAY_HOME=/tmp/yoyo-relay-home cargo run -- --selftest
 | `probe.rs` | 供应商/账号/草稿账号/路由/本地 Key 测试与半开探测 |
 | `balance.rs` | 自动余额查询与 JSON 路径提取 |
 | `runtime.rs` | 代理生命周期、后台任务、测试任务、UI 快照 |
+| `instance.rs` | 单实例锁、本机控制通道、窗口显示/退出信号 |
+| `tray.rs` | 系统托盘图标与菜单（Logo 图标） |
 | `ui/` | 主题、组件库、八个页面、编辑器与弹窗 |
 
 ## 性能实测
@@ -136,8 +141,11 @@ YOYO_RELAY_HOME=/tmp/yoyo-relay-home cargo run -- --selftest
 
 ## 已知限制
 
-- **系统托盘未实现**：关闭到托盘目前表现为最小化到任务栏（默认关闭，可在设置中启用）。后续接入 `tray-icon`。
+- **托盘隐藏的平台差异**：Windows 上关闭窗口会连同任务栏按钮一起隐藏到托盘，并可从托盘或再次启动程序恢复；macOS / Linux 的关闭按钮目前回退为最小化到任务栏（托盘图标与“退出”菜单仍可用），原生隐藏/恢复待后续版本完善。
+- **托盘图标可能位于 Windows 的隐藏图标区**：Windows 11 默认把新托盘图标收进「^」溢出菜单，可在系统设置中把它拖到任务栏常显。
 - **任务栏信息**：通过窗口标题与任务栏悬停提示展示，不使用 Windows 任务栏叠加图标或进度条。
+- **`--headless` 与图形界面共用单实例锁**：headless 运行期间再次启动程序会直接退出，不会启动第二个代理，也不会弹出窗口。
+- **Linux 托盘依赖桌面宿主**：GNOME 需要安装 AppIndicator / KStatusNotifierItem 扩展才能看到托盘图标。
 - **GUI 内存目标未达标**：见上方“性能实测”。
 - **调试报文记录未实现**：`debug_mode` 仅保留开关，不记录请求体/响应体。
 - **余额自动查询是通用 JSON 路径方案**：需要供应商提供余额端点；未内置各家私有余额 API 适配。
