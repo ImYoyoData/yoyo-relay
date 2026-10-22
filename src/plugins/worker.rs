@@ -878,7 +878,14 @@ async fn http_request_impl(worker: &WorkerRuntime, options: Value) -> Result<Val
         .to_ascii_uppercase();
     let method = reqwest::Method::from_bytes(method.as_bytes())
         .map_err(|err| format!("HTTP 方法无效：{err}"))?;
-    let mut request = worker.env.http.request(method, url);
+    // Loopback targets (local mock servers, LM Studio, ...) must not go
+    // through the system proxy.
+    let client = if crate::gateway::is_loopback_url(url) {
+        &worker.env.http_local
+    } else {
+        &worker.env.http
+    };
+    let mut request = client.request(method, url);
     if let Some(headers) = options.get("headers").and_then(Value::as_object) {
         for (name, value) in headers {
             if let Some(value) = value.as_str() {
