@@ -191,6 +191,7 @@ pub(crate) struct WorkerEnv {
     pub models: Vec<String>,
     pub settings: PluginSettings,
     pub http: reqwest::Client,
+    pub http_local: reqwest::Client,
     pub handle: tokio::runtime::Handle,
     pub shared: Arc<Shared>,
 }
@@ -306,8 +307,10 @@ pub struct PluginHost {
     data_dir: PathBuf,
     shared: Arc<Shared>,
     workers: Mutex<BTreeMap<String, WorkerHandle>>,
+    loading: Mutex<std::collections::HashSet<String>>,
     settings: RwLock<PluginSettings>,
     http: reqwest::Client,
+    http_local: reqwest::Client,
     handle: tokio::runtime::Handle,
     endpoint: RwLock<(String, Vec<String>)>,
 }
@@ -324,13 +327,22 @@ impl PluginHost {
             .user_agent(concat!("YoyoRelay-Plugin/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let http_local = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(90))
+            .no_proxy()
+            .user_agent(concat!("YoyoRelay-Plugin/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let host = Arc::new(Self {
             plugins_dir,
             data_dir,
             shared: Arc::new(Shared::new()),
             workers: Mutex::new(BTreeMap::new()),
+            loading: Mutex::new(std::collections::HashSet::new()),
             settings: RwLock::new(PluginSettings::default()),
             http,
+            http_local,
             handle,
             endpoint: RwLock::new((String::new(), Vec::new())),
         });
@@ -514,8 +526,11 @@ impl PluginHost {
                     ..PluginManifest::default()
                 };
                 let data_dir = self.data_dir.join(&id);
-                let mut info =
-                    PluginInfo::new(id.clone(), path.clone(), path.clone(), data_dir, &manifest);
+                let root = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.plugins_dir.clone());
+                let mut info = PluginInfo::new(id.clone(), root, path.clone(), data_dir, &manifest);
                 if let Some(old) = previous.get(&id) {
                     info.status = old.status;
                     info.logs = old.logs.clone();
@@ -568,6 +583,21 @@ impl PluginHost {
         {
             return Ok(());
         }
+        {
+            let mut loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
+            if !loading.insert(id.to_string()) {
+                return Err("插件正在加载中".into());
+            }
+        }
+        let result = self.load_inner(id, settings).await;
+        self.loading
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        result
+    }
+
+    async fn load_inner(&self, id: &str, settings: &PluginSettings) -> Result<(), String> {
         let info = {
             let infos = self.shared.infos.lock().unwrap_or_else(|e| e.into_inner());
             infos.get(id).cloned()
@@ -591,6 +621,7 @@ impl PluginHost {
             models,
             settings: settings.clone(),
             http: self.http.clone(),
+            http_local: self.http_local.clone(),
             handle: self.handle.clone(),
             shared: self.shared.clone(),
         };
@@ -933,6 +964,90 @@ export async function selfTest() {
             std::fs::read_to_string(plugins.join("toolkit/main.js")).unwrap(),
             "// custom"
         );
+    }
+
+    #[test]
+    fn host_http_and_process_apis_work() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let response =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let (command, args) = if cfg!(windows) {
+            ("cmd", r#"["/C","echo hi"]"#)
+        } else {
+            ("sh", r#"["-c","echo hi"]"#)
+        };
+        let code = format!(
+            r#"
+export const name = "Net Process Test";
+export async function netTest() {{
+  const response = await host.http.request({{ url: "http://127.0.0.1:{port}/" }});
+  return {{ status: response.status, body: response.body }};
+}}
+export async function procTest() {{
+  return await host.process.run({{ command: "{command}", args: {args}, timeoutSecs: 10 }});
+}}
+"#
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("io");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("main.js"), code).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let host = PluginHost::new(dir.path(), tokio::runtime::Handle::current());
+            let settings = PluginSettings {
+                allow_network: true,
+                allow_process: true,
+                disabled: Vec::new(),
+            };
+            host.apply_settings(settings.clone());
+            host.load_all_enabled().await;
+            let views = host.views();
+            assert_eq!(
+                views[0].status,
+                PluginStatus::Running,
+                "{:?}",
+                views[0].last_error
+            );
+
+            let net = host
+                .invoke("io", "netTest", serde_json::json!({}))
+                .await
+                .expect("netTest")
+                .expect("value");
+            assert_eq!(net.get("status").and_then(Value::as_u64), Some(200));
+            assert_eq!(net.get("body").and_then(Value::as_str), Some("ok"));
+
+            let process = host
+                .invoke("io", "procTest", serde_json::json!({}))
+                .await
+                .expect("procTest")
+                .expect("value");
+            assert_eq!(process.get("success").and_then(Value::as_bool), Some(true));
+            assert!(process
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("hi"));
+
+            host.unload_all().await;
+        });
     }
 
     #[test]
