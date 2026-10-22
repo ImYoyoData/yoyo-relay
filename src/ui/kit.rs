@@ -1146,6 +1146,37 @@ pub fn danger_button(ui: &mut Ui, icon: &str, text: &str) -> Response {
     )
 }
 
+pub fn brand_logo(ui: &mut Ui, texture: &egui::TextureHandle, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
+}
+
+pub fn toggle_switch(ui: &mut Ui, value: &mut bool) -> Response {
+    let t = theme::tokens(ui);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::click());
+    if response.clicked() {
+        *value = !*value;
+    }
+    let on = *value;
+    let bg = if on {
+        t.primary
+    } else if t.dark_mode {
+        Color32::from_rgb(55, 62, 76)
+    } else {
+        Color32::from_rgb(203, 210, 222)
+    };
+    ui.painter().rect_filled(rect, 11.0, bg);
+    let cx = if on {
+        rect.right() - 11.0
+    } else {
+        rect.left() + 11.0
+    };
+    ui.painter()
+        .circle_filled(Pos2::new(cx, rect.center().y), 8.0, Color32::WHITE);
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,35 +1212,4 @@ mod tests {
         assert_eq!(points[2].requests, 1);
         assert_eq!(points[2].cost_micros, 3);
     }
-}
-
-pub fn brand_logo(ui: &mut Ui, texture: &egui::TextureHandle, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-    ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
-}
-
-pub fn toggle_switch(ui: &mut Ui, value: &mut bool) -> Response {
-    let t = theme::tokens(ui);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::click());
-    if response.clicked() {
-        *value = !*value;
-    }
-    let on = *value;
-    let bg = if on {
-        t.primary
-    } else if t.dark_mode {
-        Color32::from_rgb(55, 62, 76)
-    } else {
-        Color32::from_rgb(203, 210, 222)
-    };
-    ui.painter().rect_filled(rect, 11.0, bg);
-    let cx = if on {
-        rect.right() - 11.0
-    } else {
-        rect.left() + 11.0
-    };
-    ui.painter()
-        .circle_filled(Pos2::new(cx, rect.center().y), 8.0, Color32::WHITE);
-    response
 }

@@ -165,7 +165,12 @@ pub fn acquire(config_dir: &Path, signals: Arc<Signals>) -> Result<Instance> {
         .with_context(|| format!("无法创建单实例锁：{}", lock_path.display()))?;
 
     if lock.try_lock_exclusive().is_err() {
-        notify_running(&info_path)?;
+        // Another instance owns the lock. A failed reveal (for example a
+        // headless instance, or one still starting up) must not turn a
+        // double-click into an error dialog; the caller exits quietly.
+        if let Err(err) = notify_running(&info_path) {
+            tracing::warn!("已有实例在运行，但未能唤出窗口：{err:#}");
+        }
         return Ok(Instance::AlreadyRunning);
     }
 

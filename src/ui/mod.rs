@@ -1217,7 +1217,7 @@ impl eframe::App for App {
                 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
                 if let Ok(handle) = frame.window_handle() {
                     if let RawWindowHandle::Win32(win) = handle.as_raw() {
-                        self.signals.attach_window(win.hwnd.get() as isize);
+                        self.signals.attach_window(win.hwnd.get());
                     }
                 }
             }
