@@ -114,6 +114,8 @@ impl App {
         let catalog = self.snapshot.provider_models.get(&provider.id);
         let test_key = format!("provider:{}", provider.id);
         let running = self.snapshot.running_tests.contains(&test_key);
+        let speed_key = format!("speed:{}", provider.id);
+        let speed_running = self.snapshot.running_tests.contains(&speed_key);
         let brand = brands::for_provider(provider);
         let mut action: Option<CardAction> = None;
         super::kit::surface(ui, |ui| {
@@ -166,6 +168,20 @@ impl App {
                         && !running
                     {
                         action = Some(CardAction::Test);
+                    }
+                    if super::kit::icon_button(
+                        ui,
+                        if speed_running {
+                            icons::SPINNER
+                        } else {
+                            icons::GAUGE
+                        },
+                        "测速：依次测量该供应商全部启用的账号（tok/s）",
+                    )
+                    .clicked()
+                        && !speed_running
+                    {
+                        action = Some(CardAction::SpeedTest);
                     }
                 });
             });
@@ -237,8 +253,16 @@ impl App {
                             super::kit::badge(ui, "余额", theme::MUTED);
                         }
                     }
+                    if let Some(speed) = self.snapshot.tests.get(&speed_key) {
+                        if let Some(tps) = speed.tokens_per_sec {
+                            super::kit::badge(ui, &format!("{tps:.0} tok/s"), theme::GREEN);
+                        }
+                    }
                     if !running {
                         widgets::test_badge(ui, &self.snapshot, &test_key);
+                    }
+                    if speed_running {
+                        ui.spinner();
                     }
                 });
             });
@@ -250,6 +274,7 @@ impl App {
                     self.confirm = Some(ConfirmAction::DeleteProvider(provider.id.clone()))
                 }
                 CardAction::Test => self.start_test("provider", &provider.id),
+                CardAction::SpeedTest => self.start_test("speed_provider", &provider.id),
                 CardAction::Accounts => {
                     self.page = Page::Accounts;
                     self.search.clear();
@@ -263,5 +288,6 @@ enum CardAction {
     Edit,
     Delete,
     Test,
+    SpeedTest,
     Accounts,
 }

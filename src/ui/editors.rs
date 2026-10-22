@@ -3,14 +3,15 @@ use egui_phosphor::regular as icons;
 
 use crate::config::{
     new_id, now_ts, Account, AuthMode, BalanceConfig, BalanceMode, ClientModelProfile, ModelRoute,
-    PrefixRule, Protocol, ProtocolStrategyMode, ProviderKind, QuotaConfig, QuotaWindow, RouteMode,
+    PrefixRule, PriceCurrency, Protocol, ProtocolStrategyMode, ProviderKind, QuotaConfig,
+    QuotaWindow, RouteMode,
 };
 use crate::snapshot::NoticeLevel;
 
-use super::{brands, theme, widgets};
+use super::{brands, kit, theme, widgets};
 use super::{
-    AccountDraft, App, ConfirmAction, Editor, LocalKeyDraft, ManualBalanceDraft, Page,
-    ProviderDraft, RouteDraft, RouteModelDraft,
+    AccountDraft, App, BalanceSetupDraft, ConfirmAction, Editor, LocalKeyDraft, ManualBalanceDraft,
+    Page, ProviderDraft, RouteDraft, RouteModelDraft,
 };
 
 impl App {
@@ -198,6 +199,26 @@ impl App {
             max_tokens: 0,
             max_requests: 0,
             enabled: true,
+        }));
+    }
+
+    /// Open the shared balance configuration editor from the Balances page.
+    pub(crate) fn open_balance_setup(&mut self, account_id: &str) {
+        let Some(account) = self.config.account(account_id).cloned() else {
+            self.toast(NoticeLevel::Error, "账号不存在。");
+            return;
+        };
+        let provider_name = self
+            .config
+            .provider(&account.provider_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "—".into());
+        self.editor = Some(Editor::BalanceSetup(BalanceSetupDraft {
+            account_id: account.id.clone(),
+            account_name: account.name.clone(),
+            provider_name,
+            percent_used: 0.0,
+            balance: account.balance.clone(),
         }));
     }
 
@@ -563,6 +584,34 @@ impl App {
         true
     }
 
+    fn save_balance_setup(&mut self, draft: &BalanceSetupDraft) -> bool {
+        let backup = self.config.clone();
+        let Some(account) = self
+            .config
+            .accounts
+            .iter_mut()
+            .find(|a| a.id == draft.account_id)
+        else {
+            self.toast(NoticeLevel::Error, "账号不存在。");
+            return false;
+        };
+        let mut balance = draft.balance.clone();
+        balance.currency = crate::config::normalize_currency(&balance.currency);
+        balance.scale = if balance.scale == 0.0 {
+            1.0
+        } else {
+            balance.scale
+        };
+        balance.quota_total = balance.quota_total.max(0.0);
+        account.balance = balance;
+        if !self.persist() {
+            self.config = backup;
+            return false;
+        }
+        self.toast(NoticeLevel::Success, "余额设置已保存");
+        true
+    }
+
     fn save_manual_balance(&mut self, draft: &ManualBalanceDraft) -> bool {
         let backup = self.config.clone();
         let Some(account) = self
@@ -599,7 +648,13 @@ impl App {
             RouteModel,
             Key,
             Balance,
+            BalanceSetup,
         }
+        let balance_setup_subtitle = if let Editor::BalanceSetup(d) = &editor {
+            format!("{} · {}", d.account_name, d.provider_name)
+        } else {
+            String::new()
+        };
         let (kind, title, subtitle) = match &editor {
             Editor::Provider(d) => (
                 EditorKind::Provider,
@@ -647,6 +702,11 @@ impl App {
                 "录入手动余额",
                 "从当前时间起按请求花费估算递减。",
             ),
+            Editor::BalanceSetup(_) => (
+                EditorKind::BalanceSetup,
+                "余额设置",
+                balance_setup_subtitle.as_str(),
+            ),
         };
         let mut action = None;
         let closed = super::kit::modal_shell(
@@ -666,6 +726,7 @@ impl App {
                         Editor::RouteModel(draft) => route_model_form(self, ui, draft),
                         Editor::LocalKey(draft) => local_key_form(ui, draft),
                         Editor::ManualBalance(draft) => manual_balance_form(self, ui, draft),
+                        Editor::BalanceSetup(draft) => balance_setup_form(self, ui, draft),
                     });
             },
             |ui| {
@@ -694,6 +755,11 @@ impl App {
                             action = Some(EditorAction::Save);
                         }
                     }
+                    EditorKind::BalanceSetup => {
+                        if super::kit::primary_button(ui, icons::CHECK, "保存设置").clicked() {
+                            action = Some(EditorAction::Save);
+                        }
+                    }
                 }
                 if super::kit::secondary_button(ui, "", "取消").clicked() {
                     action = Some(EditorAction::Cancel);
@@ -715,6 +781,7 @@ impl App {
                     Editor::RouteModel(draft) => self.save_route_model(draft),
                     Editor::LocalKey(draft) => self.create_local_key(draft),
                     Editor::ManualBalance(draft) => self.save_manual_balance(draft),
+                    Editor::BalanceSetup(draft) => self.save_balance_setup(draft),
                 };
                 if !saved {
                     self.editor = Some(editor);
@@ -879,6 +946,12 @@ impl App {
                     "确认重置",
                 )
             }
+            ConfirmAction::ClearCalls => (
+                "清空调用明细",
+                "将删除全部调用记录，用量统计、趋势与余额估算将随之归零。供应商、账号与路由配置不受影响。此操作不可撤销。".to_string(),
+                true,
+                "确认清空",
+            ),
             ConfirmAction::ImportConfig(path) => (
                 "导入配置",
                 format!(
@@ -979,6 +1052,10 @@ impl App {
                     Err(err) => self.toast(NoticeLevel::Error, format!("生成 Key 失败：{err}")),
                 }
             }
+            ConfirmAction::ClearCalls => {
+                let _ = self.cmd_tx.send(crate::runtime::UiCommand::ClearUsage);
+                self.toast(NoticeLevel::Info, "正在清空调用明细…");
+            }
             ConfirmAction::ImportConfig(path) => {
                 match self
                     .store
@@ -1051,6 +1128,49 @@ impl App {
                                 .color(theme::muted(ui)),
                         );
                     });
+                    if let Some(tps) = result.tokens_per_sec {
+                        ui.add_space(6.0);
+                        egui::Frame::new()
+                            .fill(theme::soft_for(ui, theme::ACCENT))
+                            .corner_radius(10)
+                            .inner_margin(egui::Margin::symmetric(12, 9))
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        RichText::new(icons::GAUGE).size(18.0).color(theme::ACCENT),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("{tps:.1}"))
+                                            .size(22.0)
+                                            .strong()
+                                            .color(theme::ACCENT),
+                                    );
+                                    ui.label(
+                                        RichText::new("tokens / 秒")
+                                            .size(10.5)
+                                            .color(theme::muted(ui)),
+                                    );
+                                    if let Some(ttft) = result.first_token_ms {
+                                        ui.separator();
+                                        ui.label(
+                                            RichText::new(format!("首字 {ttft} ms"))
+                                                .size(10.5)
+                                                .color(theme::muted(ui)),
+                                        );
+                                    }
+                                    if let Some(tokens) = result.tokens {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "生成 {} tokens",
+                                                widgets::format_count(tokens)
+                                            ))
+                                            .size(10.5)
+                                            .color(theme::muted(ui)),
+                                        );
+                                    }
+                                });
+                            });
+                    }
                     ui.add_space(6.0);
                     ui.label(RichText::new(&result.message).size(12.5));
                     ui.add_space(8.0);
@@ -1097,6 +1217,118 @@ impl App {
         );
         if closed || close {
             self.test_key = None;
+        }
+    }
+
+    /// Name and store the price table staged by the route editor.
+    pub(crate) fn show_price_plan_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut plan) = self.saving_price_plan.clone() else {
+            return;
+        };
+        let mut save = false;
+        let mut cancel = false;
+        let title = "存为价格方案";
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_price_plan"),
+            title,
+            "保存后可在任意上游的计费价格中一键套用，也可在设置里导出",
+            520.0,
+            |ui| {
+                ui.label(RichText::new("方案名称").size(11.0).color(theme::muted(ui)));
+                ui.add(
+                    TextEdit::singleline(&mut plan.name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("例如：GLM-4 峰谷价"),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("备注（可选）")
+                        .size(11.0)
+                        .color(theme::muted(ui)),
+                );
+                ui.add(
+                    TextEdit::singleline(&mut plan.note)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("价格来源、生效日期等"),
+                );
+                ui.add_space(10.0);
+                let symbol = plan.currency.symbol();
+                egui::Frame::new()
+                    .fill(theme::subtle_fill(ui))
+                    .corner_radius(9)
+                    .inner_margin(egui::Margin::symmetric(11, 9))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · 输入 {symbol}{:.4} · 命中 {symbol}{:.4} · 输出 {symbol}{:.4}",
+                                plan.currency.label(),
+                                plan.base.input_per_mtok,
+                                plan.base.cached_input_per_mtok,
+                                plan.base.output_per_mtok
+                            ))
+                            .size(10.5)
+                            .color(theme::text(ui)),
+                        );
+                        if !plan.periods.is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} 个峰谷时段：{}",
+                                    plan.periods.len(),
+                                    plan.periods
+                                        .iter()
+                                        .map(|p| format!("{} {}", p.name, p.schedule_label()))
+                                        .collect::<Vec<_>>()
+                                        .join(" · ")
+                                ))
+                                .size(10.0)
+                                .color(theme::muted(ui)),
+                            );
+                        }
+                    });
+            },
+            |ui| {
+                if super::kit::primary_button(ui, icons::BOOKMARK_SIMPLE, "保存方案").clicked()
+                {
+                    save = true;
+                }
+                if super::kit::secondary_button(ui, "", "取消").clicked() {
+                    cancel = true;
+                }
+            },
+        );
+        if closed || cancel {
+            self.saving_price_plan = None;
+            return;
+        }
+        if save {
+            if plan.name.trim().is_empty() {
+                self.toast(NoticeLevel::Warning, "请填写方案名称。");
+                self.saving_price_plan = Some(plan);
+                return;
+            }
+            let normalized = plan.normalized();
+            let replaced = self
+                .config
+                .price_plans
+                .iter_mut()
+                .find(|existing| existing.name.eq_ignore_ascii_case(&normalized.name))
+                .map(|existing| *existing = normalized.clone())
+                .is_some();
+            if !replaced {
+                self.config.price_plans.push(normalized);
+            }
+            if self.persist() {
+                self.toast(
+                    NoticeLevel::Success,
+                    if replaced {
+                        "价格方案已更新"
+                    } else {
+                        "价格方案已保存"
+                    },
+                );
+            }
+            self.saving_price_plan = None;
         }
     }
 
@@ -1412,6 +1644,7 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
                         ProtocolStrategyMode::Static,
                         ProtocolStrategyMode::ModelPrefix,
                         ProtocolStrategyMode::Explicit,
+                        ProtocolStrategyMode::Ingress,
                     ] {
                         ui.selectable_value(
                             &mut provider.protocol_strategy.mode,
@@ -2079,42 +2312,332 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
         );
     }
 
-    section(ui, "价格与能力");
-    egui::Grid::new("route_more")
-        .num_columns(2)
-        .spacing([14.0, 8.0])
-        .show(ui, |ui| {
-            ui.label("能力标签");
-            ui.add(
-                TextEdit::singleline(&mut draft.capabilities_text)
-                    .desired_width(360.0)
-                    .hint_text("chat,tools,vision（逗号分隔）"),
-            );
-            ui.end_row();
-            ui.label("输入价格");
-            ui.add(
-                egui::DragValue::new(&mut route.input_price_per_mtok)
-                    .speed(0.01)
-                    .prefix("$ ")
-                    .suffix(" / Mtok"),
-            );
-            ui.end_row();
-            ui.label("输出价格");
-            ui.add(
-                egui::DragValue::new(&mut route.output_price_per_mtok)
-                    .speed(0.01)
-                    .prefix("$ ")
-                    .suffix(" / Mtok"),
-            );
-            ui.end_row();
-        });
+    section(ui, "能力标签");
+    ui.add(
+        TextEdit::singleline(&mut draft.capabilities_text)
+            .desired_width(360.0)
+            .hint_text("chat,tools,vision（逗号分隔）"),
+    );
     ui.label(
         RichText::new(
-            "价格按 USD/Mtok 记录。上下文窗口、最大输出与思考等级在「路由模型」中统一设置。",
+            "能力标签会出现在 /v1/models 与路由卡片上；上下文窗口与思考等级在「路由模型」中设置。",
         )
         .size(10.5)
         .color(theme::muted(ui)),
     );
+
+    ui.add_space(6.0);
+    pricing_section(app, ui, route);
+}
+
+/// Price editor for one upstream. Handles currency, the base tier and
+/// peak/off-peak windows. Kept separate from the route form because it is the
+/// most detail-heavy part of the configuration.
+fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
+    let mut pricing = route.effective_pricing();
+    let mut changed = false;
+
+    section(ui, "计费价格");
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("计价币种").size(11.0).color(theme::muted(ui)));
+        for currency in [PriceCurrency::Usd, PriceCurrency::Cny] {
+            let active = pricing.currency == currency;
+            let label = if active {
+                RichText::new(currency.label())
+                    .size(10.5)
+                    .color(egui::Color32::WHITE)
+            } else {
+                RichText::new(currency.label()).size(10.5)
+            };
+            let button = egui::Button::new(label)
+                .fill(if active {
+                    theme::ACCENT
+                } else {
+                    theme::tokens(ui).card
+                })
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    if active {
+                        theme::ACCENT
+                    } else {
+                        theme::tokens(ui).card_border
+                    },
+                ))
+                .corner_radius(7);
+            if ui.add(button).clicked() && !active {
+                pricing.currency = currency;
+                changed = true;
+            }
+        }
+        ui.label(
+            RichText::new("总花费始终折算为 USD 统计，币种只影响录入与展示口径")
+                .size(10.0)
+                .color(theme::muted(ui)),
+        );
+    });
+
+    ui.add_space(6.0);
+    let symbol = pricing.currency.symbol();
+    egui::Grid::new("route_price_base")
+        .num_columns(3)
+        .spacing([12.0, 7.0])
+        .show(ui, |ui| {
+            ui.label(RichText::new("计费项").size(10.5).color(theme::muted(ui)));
+            ui.label(
+                RichText::new(format!("基础价（{symbol}/百万 tokens）"))
+                    .size(10.5)
+                    .color(theme::muted(ui)),
+            );
+            ui.label(RichText::new("说明").size(10.5).color(theme::muted(ui)));
+            ui.end_row();
+
+            ui.label("输入（未命中缓存）");
+            if price_input(ui, &mut pricing.base.input_per_mtok, symbol) {
+                changed = true;
+            }
+            ui.label(
+                RichText::new("常规输入单价")
+                    .size(10.0)
+                    .color(theme::muted(ui)),
+            );
+            ui.end_row();
+
+            ui.label("输入（命中缓存）");
+            if price_input(ui, &mut pricing.base.cached_input_per_mtok, symbol) {
+                changed = true;
+            }
+            ui.label(
+                RichText::new("留空或 0 表示按常规输入价计费")
+                    .size(10.0)
+                    .color(theme::muted(ui)),
+            );
+            ui.end_row();
+
+            ui.label("输出");
+            if price_input(ui, &mut pricing.base.output_per_mtok, symbol) {
+                changed = true;
+            }
+            ui.label(
+                RichText::new("生成 token 单价")
+                    .size(10.0)
+                    .color(theme::muted(ui)),
+            );
+            ui.end_row();
+        });
+
+    ui.add_space(8.0);
+    kit::section_label(ui, "峰谷时段（可选）");
+    ui.label(
+        RichText::new(
+            "为不同时间段设置独立价格。未落入任何时段时使用上面的基础价；跨午夜的时段把结束小时设得比开始小时小即可。",
+        )
+        .size(10.0)
+        .color(theme::muted(ui)),
+    );
+    ui.add_space(4.0);
+
+    let mut remove: Option<usize> = None;
+    for (index, period) in pricing.periods.iter_mut().enumerate() {
+        egui::Frame::new()
+            .fill(theme::subtle_fill(ui))
+            .corner_radius(9)
+            .inner_margin(egui::Margin::symmetric(11, 9))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut period.name)
+                            .desired_width(120.0)
+                            .hint_text("时段名称"),
+                    );
+                    ui.label(RichText::new("时间").size(10.0).color(theme::muted(ui)));
+                    if hour_input(ui, &mut period.start_hour) {
+                        changed = true;
+                    }
+                    ui.label(RichText::new("→").size(10.0).color(theme::muted(ui)));
+                    if hour_input(ui, &mut period.end_hour) {
+                        changed = true;
+                    }
+                    ui.label(
+                        RichText::new(period.schedule_label())
+                            .size(9.5)
+                            .color(theme::muted(ui)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除该时段").clicked()
+                        {
+                            remove = Some(index);
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("适用").size(10.0).color(theme::muted(ui)));
+                    for (day, name) in ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+                        .iter()
+                        .enumerate()
+                    {
+                        let day = day as u8;
+                        let mut active = period.days.contains(&day);
+                        let text = RichText::new(*name).size(10.0);
+                        let button = egui::Button::new(if active {
+                            text.color(egui::Color32::WHITE)
+                        } else {
+                            text.color(theme::text(ui))
+                        })
+                        .fill(if active {
+                            theme::ACCENT
+                        } else {
+                            theme::tokens(ui).card
+                        })
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            if active {
+                                theme::ACCENT
+                            } else {
+                                theme::border_color(ui)
+                            },
+                        ))
+                        .corner_radius(6)
+                        .min_size(egui::Vec2::new(38.0, 21.0));
+                        if ui.add(button).clicked() {
+                            active = !active;
+                            if active {
+                                period.days.push(day);
+                                period.days.sort_unstable();
+                                period.days.dedup();
+                            } else {
+                                period.days.retain(|d| *d != day);
+                            }
+                            changed = true;
+                        }
+                    }
+                    ui.label(
+                        RichText::new(if period.days.is_empty() {
+                            "（未选择 = 每天）"
+                        } else {
+                            ""
+                        })
+                        .size(9.5)
+                        .color(theme::muted(ui)),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("输入").size(10.0).color(theme::muted(ui)));
+                    if price_input(ui, &mut period.tier.input_per_mtok, symbol) {
+                        changed = true;
+                    }
+                    ui.label(RichText::new("命中").size(10.0).color(theme::muted(ui)));
+                    if price_input(ui, &mut period.tier.cached_input_per_mtok, symbol) {
+                        changed = true;
+                    }
+                    ui.label(RichText::new("输出").size(10.0).color(theme::muted(ui)));
+                    if price_input(ui, &mut period.tier.output_per_mtok, symbol) {
+                        changed = true;
+                    }
+                });
+            });
+        ui.add_space(4.0);
+    }
+    if let Some(index) = remove {
+        pricing.periods.remove(index);
+        changed = true;
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        if kit::secondary_labeled(ui, icons::PLUS, "添加时段").clicked() {
+            let mut period = crate::config::PricePeriod::default();
+            // Start new windows from the base tier so the user only edits the
+            // numbers that differ between peak and off-peak.
+            period.tier = pricing.base;
+            pricing.periods.push(period);
+            changed = true;
+        }
+        if !app.config.price_plans.is_empty() {
+            let mut apply: Option<crate::config::PricePlan> = None;
+            ComboBox::from_id_salt("price_plan_pick")
+                .selected_text(format!("{} 套用方案", icons::BOOKMARK_SIMPLE))
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    for plan in &app.config.price_plans {
+                        if ui.selectable_label(false, &plan.name).clicked() {
+                            apply = Some(plan.clone());
+                        }
+                    }
+                });
+            if let Some(plan) = apply {
+                pricing = crate::config::RoutePricing {
+                    currency: plan.currency,
+                    base: plan.base,
+                    periods: plan.periods.clone(),
+                };
+                changed = true;
+            }
+        }
+        if kit::secondary_labeled(ui, icons::BOOKMARK_SIMPLE, "存为方案").clicked() {
+            app.saving_price_plan = Some(crate::config::PricePlan {
+                name: format!("{} · {}", route.client_model, pricing.currency.code()),
+                note: String::new(),
+                currency: pricing.currency,
+                base: pricing.base,
+                periods: pricing.periods.clone(),
+            });
+        }
+    });
+
+    if changed {
+        let normalized = pricing.normalized();
+        // Keep the legacy USD fields in sync so older builds and exports that
+        // only read them still show a plausible price.
+        if normalized.currency == PriceCurrency::Usd {
+            route.input_price_per_mtok = normalized.base.input_per_mtok;
+            route.output_price_per_mtok = normalized.base.output_per_mtok;
+        } else {
+            route.input_price_per_mtok = 0.0;
+            route.output_price_per_mtok = 0.0;
+        }
+        route.pricing = normalized;
+    }
+
+    ui.add_space(4.0);
+    let period_summary = if pricing.periods.is_empty() {
+        "全天使用基础价".to_string()
+    } else {
+        format!(
+            "{} 个时段：{}",
+            pricing.periods.len(),
+            pricing
+                .periods
+                .iter()
+                .map(|p| p.schedule_label())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        )
+    };
+    kit::info_row(ui, icons::CLOCK, &period_summary);
+}
+
+/// Price input with a currency prefix and a Mtok suffix.
+fn price_input(ui: &mut egui::Ui, value: &mut f64, symbol: &str) -> bool {
+    ui.add(
+        egui::DragValue::new(value)
+            .speed(0.01)
+            .range(0.0..=1_000_000.0)
+            .fixed_decimals(4)
+            .prefix(format!("{symbol} "))
+            .suffix(" / Mtok"),
+    )
+    .changed()
+}
+
+fn hour_input(ui: &mut egui::Ui, hour: &mut u8) -> bool {
+    ui.add(
+        egui::DragValue::new(hour)
+            .range(0..=24)
+            .speed(1.0)
+            .suffix(":00"),
+    )
+    .changed()
 }
 
 fn modality_toggle(ui: &mut egui::Ui, values: &mut Vec<String>, value: &str, label: &str) -> bool {
@@ -2559,5 +3082,191 @@ fn manual_balance_form(app: &App, ui: &mut egui::Ui, draft: &mut ManualBalanceDr
         )
         .size(11.0)
         .color(theme::muted(ui)),
+    );
+}
+
+/// Full balance editor shared with the account editor. Both write the same
+/// `Account.balance`, so changes are visible in either place immediately.
+fn balance_setup_form(app: &App, ui: &mut egui::Ui, draft: &mut BalanceSetupDraft) {
+    let _ = app;
+    let balance = &mut draft.balance;
+    balance.currency = crate::config::normalize_currency(&balance.currency);
+
+    section(ui, "查询方式");
+    egui::Grid::new("balance_setup_mode")
+        .num_columns(2)
+        .spacing([14.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("模式");
+            ComboBox::from_id_salt("balance_setup_kind")
+                .selected_text(balance.mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        BalanceMode::Auto,
+                        BalanceMode::Manual,
+                        BalanceMode::Unavailable,
+                    ] {
+                        ui.selectable_value(&mut balance.mode, mode, mode.label());
+                    }
+                });
+            ui.end_row();
+            ui.label("币种");
+            ui.add(
+                TextEdit::singleline(&mut balance.currency)
+                    .desired_width(90.0)
+                    .hint_text("USD / CNY"),
+            );
+            ui.label(
+                RichText::new("余额、总额度与阈值都使用该币种")
+                    .size(10.0)
+                    .color(theme::muted(ui)),
+            );
+            ui.end_row();
+            match balance.mode {
+                BalanceMode::Auto => {
+                    ui.label("查询 URL");
+                    ui.add(
+                        TextEdit::singleline(balance.url.get_or_insert_with(String::new))
+                            .desired_width(380.0)
+                            .hint_text("GET https://provider.example.com/api/balance"),
+                    );
+                    ui.end_row();
+                    ui.label("JSON 路径");
+                    ui.add(
+                        TextEdit::singleline(&mut balance.json_path)
+                            .desired_width(380.0)
+                            .hint_text("data.balance 或 data[0].credits"),
+                    );
+                    ui.end_row();
+                    ui.label("换算公式");
+                    ui.add(
+                        TextEdit::singleline(&mut balance.formula)
+                            .desired_width(380.0)
+                            .hint_text("可留空；例如 data.balance / 100"),
+                    );
+                    ui.end_row();
+                    ui.label("数值倍率");
+                    ui.add(
+                        egui::DragValue::new(&mut balance.scale)
+                            .speed(0.01)
+                            .range(0.0001..=1_000_000.0),
+                    );
+                    ui.end_row();
+                }
+                BalanceMode::Manual => {
+                    ui.label("手动余额");
+                    let symbol = match balance.currency.as_str() {
+                        "CNY" => "¥ ",
+                        "USD" => "$ ",
+                        _ => "",
+                    };
+                    ui.add(
+                        egui::DragValue::new(&mut balance.manual_amount)
+                            .speed(0.1)
+                            .prefix(symbol)
+                            .range(0.0..=1_000_000_000.0),
+                    );
+                    ui.end_row();
+                }
+                BalanceMode::Unavailable => {}
+            }
+        });
+
+    if balance.mode == BalanceMode::Auto {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if super::kit::toggle_switch(ui, &mut balance.percent_used).changed() {
+                if balance.percent_used && balance.quota_total <= 0.0 {
+                    balance.quota_total = 100.0;
+                }
+            }
+            ui.label(
+                RichText::new("接口返回「已用百分比」而不是金额")
+                    .size(11.0)
+                    .strong()
+                    .color(theme::text(ui)),
+            );
+        });
+        if balance.percent_used {
+            ui.label(
+                RichText::new("自动刷新时会按 (100 − 已用%) ÷ 100 × 总额度 换算为剩余金额。")
+                    .size(10.0)
+                    .color(theme::muted(ui)),
+            );
+        }
+        ui.label(
+            RichText::new("公式与路径修改后会立即用于下一次「刷新余额」。")
+                .size(10.0)
+                .color(theme::muted(ui)),
+        );
+    }
+
+    section(ui, "百分比快捷换算");
+    ui.label(
+        RichText::new("接口只给百分比时，填总额度和已用百分比，这里直接算出剩余金额。")
+            .size(10.5)
+            .color(theme::muted(ui)),
+    );
+    ui.add_space(4.0);
+    let symbol = match balance.currency.as_str() {
+        "CNY" => "¥ ",
+        "USD" => "$ ",
+        _ => "",
+    };
+    let mut percent = draft.percent_used.clamp(0.0, 100.0);
+    egui::Grid::new("balance_percent_calc")
+        .num_columns(2)
+        .spacing([14.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("总额度");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut balance.quota_total)
+                        .speed(1.0)
+                        .prefix(symbol)
+                        .range(0.0..=1_000_000_000.0),
+                )
+                .changed()
+            {
+                balance.quota_total = balance.quota_total.max(0.0);
+            }
+            ui.end_row();
+            ui.label("已用百分比");
+            ui.add(
+                egui::DragValue::new(&mut percent)
+                    .speed(0.5)
+                    .range(0.0..=100.0)
+                    .suffix(" %"),
+            );
+            ui.end_row();
+            ui.label("剩余金额");
+            let remaining = (100.0 - percent) / 100.0 * balance.quota_total.max(0.0);
+            ui.label(
+                RichText::new(format!("{symbol}{remaining:.2}"))
+                    .size(14.0)
+                    .strong()
+                    .color(theme::GREEN),
+            );
+            ui.end_row();
+        });
+    let remaining = (100.0 - percent) / 100.0 * balance.quota_total.max(0.0);
+    draft.percent_used = percent;
+    ui.horizontal_wrapped(|ui| {
+        if super::kit::secondary_button(ui, icons::CALCULATOR, "填入手动余额").clicked() {
+            balance.mode = BalanceMode::Manual;
+            balance.manual_amount = remaining;
+            balance.manual_updated_at = now_ts();
+        }
+        ui.label(
+            RichText::new("会切换到「手动」模式，之后按请求花费递减。")
+                .size(10.0)
+                .color(theme::muted(ui)),
+        );
+    });
+    ui.add_space(4.0);
+    super::kit::info_row(
+        ui,
+        icons::INFO,
+        "余额设置的改动与「账号 → 编辑 → 余额」完全互通，保存后立即生效。",
     );
 }

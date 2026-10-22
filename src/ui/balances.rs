@@ -166,6 +166,7 @@ impl App {
                     self.toast(NoticeLevel::Info, "已发起余额刷新");
                 }
                 BalanceAction::Manual(id) => self.open_manual_balance(&id),
+                BalanceAction::Setup(id) => self.open_balance_setup(&id),
             }
         }
         ui.add_space(6.0);
@@ -258,8 +259,21 @@ impl App {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if super::kit::icon_button(ui, icons::PENCIL_SIMPLE, "手动录入/修改余额")
-                            .clicked()
+                        if super::kit::icon_button(
+                            ui,
+                            icons::PENCIL_SIMPLE,
+                            "余额设置：查询方式、JSON 路径、公式、百分比换算",
+                        )
+                        .clicked()
+                        {
+                            *action = Some(BalanceAction::Setup(balance.account_id.clone()));
+                        }
+                        if super::kit::icon_button(
+                            ui,
+                            icons::CURRENCY_CIRCLE_DOLLAR,
+                            "手动录入余额",
+                        )
+                        .clicked()
                         {
                             *action = Some(BalanceAction::Manual(balance.account_id.clone()));
                         }
@@ -286,4 +300,5 @@ impl App {
 enum BalanceAction {
     Refresh(String),
     Manual(String),
+    Setup(String),
 }

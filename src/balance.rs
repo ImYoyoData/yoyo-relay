@@ -127,6 +127,15 @@ async fn fetch_balance(
     if !amount.is_finite() {
         bail!("余额计算结果不是有效数字");
     }
+    if account.balance.percent_used {
+        if account.balance.quota_total <= 0.0 {
+            bail!("余额接口返回百分比，但账号没有填写总额度");
+        }
+        // The endpoint reports how much has been used; convert to remaining
+        // money: (100 - used%) / 100 * total.
+        let used = amount.clamp(0.0, 100.0);
+        amount = (100.0 - used) / 100.0 * account.balance.quota_total;
+    }
     Ok(amount)
 }
 

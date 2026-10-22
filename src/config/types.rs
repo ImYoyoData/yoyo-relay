@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const CONFIG_SCHEMA_VERSION: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Top-level configuration
@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub routes: Vec<ModelRoute>,
     /// Client-facing model metadata. Routes reference these by client model name.
     pub model_profiles: Vec<ClientModelProfile>,
+    /// Reusable pricing tables that routes can apply in one click.
+    pub price_plans: Vec<PricePlan>,
     pub local_keys: Vec<LocalKey>,
 }
 
@@ -34,6 +36,7 @@ impl Default for AppConfig {
             accounts: Vec::new(),
             routes: Vec::new(),
             model_profiles: Vec::new(),
+            price_plans: Vec::new(),
             local_keys: Vec::new(),
         }
     }
@@ -151,6 +154,11 @@ impl AppConfig {
             .cloned()
             .collect()
     }
+
+    #[allow(dead_code)]
+    pub fn price_plan(&self, name: &str) -> Option<&PricePlan> {
+        self.price_plans.iter().find(|plan| plan.name == name)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +266,14 @@ pub struct TaskbarBadgeConfig {
     pub show_queued: bool,
     pub show_success: bool,
     pub show_cost: bool,
+    /// Live aggregate decode throughput (tokens per second).
+    pub show_speed: bool,
+    /// Draw the capsule on a transparent background instead of a solid card.
+    pub transparent_bg: bool,
+    /// Override the automatic (theme/backdrop based) badge text colour.
+    pub custom_text_color: bool,
+    /// `#RRGGBB` text colour used when `custom_text_color` is enabled.
+    pub text_color: String,
     /// Overall scale of the badge (text, padding and height).
     pub scale: f32,
     /// Horizontal nudge in physical pixels, relative to the default anchor.
@@ -281,6 +297,10 @@ impl Default for TaskbarBadgeConfig {
             show_queued: false,
             show_success: true,
             show_cost: false,
+            show_speed: true,
+            transparent_bg: false,
+            custom_text_color: false,
+            text_color: "#111827".to_string(),
             scale: 1.0,
             offset_x: 0,
             offset_y: 0,
@@ -317,6 +337,7 @@ impl TaskbarBadgeConfig {
             || self.show_queued
             || self.show_success
             || self.show_cost
+            || self.show_speed
     }
 }
 
@@ -357,6 +378,18 @@ pub struct UiConfig {
     pub fx_source: String,
     /// Windows taskbar badge composition and placement.
     pub taskbar: TaskbarBadgeConfig,
+    /// Check GitHub for a newer release in the background.
+    pub auto_update_check: bool,
+    /// Hours between automatic update checks.
+    pub update_check_hours: u64,
+    /// The version the user asked not to be prompted about again.
+    pub update_dismissed_version: String,
+    /// Last release metadata seen, kept so the red dot survives a restart
+    /// before the next network check.
+    pub update_latest_version: String,
+    pub update_latest_url: String,
+    pub update_latest_notes: String,
+    pub update_checked_at: i64,
     pub onboarding_done: bool,
 }
 
@@ -417,6 +450,13 @@ impl Default for UiConfig {
             fx_updated_at: 0,
             fx_source: String::new(),
             taskbar: TaskbarBadgeConfig::default(),
+            auto_update_check: true,
+            update_check_hours: 12,
+            update_dismissed_version: String::new(),
+            update_latest_version: String::new(),
+            update_latest_url: String::new(),
+            update_latest_notes: String::new(),
+            update_checked_at: 0,
             onboarding_done: false,
         }
     }
@@ -531,6 +571,10 @@ pub enum ProtocolStrategyMode {
     Static,
     ModelPrefix,
     Explicit,
+    /// Forward the caller's protocol unchanged (true passthrough). Requests
+    /// using a different protocol still go through conversion with the static
+    /// protocol as the fallback.
+    Ingress,
 }
 
 impl ProtocolStrategyMode {
@@ -539,6 +583,7 @@ impl ProtocolStrategyMode {
             ProtocolStrategyMode::Static => "固定协议",
             ProtocolStrategyMode::ModelPrefix => "按模型前缀",
             ProtocolStrategyMode::Explicit => "由路由指定",
+            ProtocolStrategyMode::Ingress => "跟随调用方（直通）",
         }
     }
 }
@@ -622,7 +667,8 @@ impl Provider {
     /// Resolve the upstream protocol for a given upstream model.
     pub fn protocol_for(&self, upstream_model: &str, explicit: Option<Protocol>) -> Protocol {
         match self.protocol_strategy.mode {
-            ProtocolStrategyMode::Static => self.static_protocol,
+            // Without an ingress hint, fall back to the configured protocol.
+            ProtocolStrategyMode::Ingress | ProtocolStrategyMode::Static => self.static_protocol,
             ProtocolStrategyMode::Explicit => explicit.unwrap_or(self.static_protocol),
             ProtocolStrategyMode::ModelPrefix => {
                 let mut best: Option<(&str, Protocol)> = None;
@@ -641,6 +687,24 @@ impl Provider {
                     .unwrap_or(self.static_protocol)
             }
         }
+    }
+
+    /// Resolve the upstream protocol, honouring the "follow caller" mode when
+    /// the ingress protocol is known. With this mode a client that speaks the
+    /// same protocol as the upstream is forwarded byte-for-byte; only other
+    /// ingress protocols are converted.
+    pub fn protocol_for_ingress(
+        &self,
+        upstream_model: &str,
+        explicit: Option<Protocol>,
+        ingress: Option<Protocol>,
+    ) -> Protocol {
+        if self.protocol_strategy.mode == ProtocolStrategyMode::Ingress {
+            if let Some(ingress) = ingress {
+                return ingress;
+            }
+        }
+        self.protocol_for(upstream_model, explicit)
     }
 
     pub fn join_url(&self, path: &str) -> String {
@@ -803,6 +867,12 @@ pub struct BalanceConfig {
     pub formula: String,
     pub scale: f64,
     pub currency: String,
+    /// The endpoint returns the used percentage (0–100) instead of money.
+    /// It is converted to a balance with `(100 - used) / 100 * quota_total`.
+    pub percent_used: bool,
+    /// Total subscription/quota amount in `currency`, used by percent mode and
+    /// by the percentage quick converter in the balance editor.
+    pub quota_total: f64,
 }
 
 impl Default for BalanceConfig {
@@ -816,6 +886,8 @@ impl Default for BalanceConfig {
             formula: String::new(),
             scale: 1.0,
             currency: "USD".to_string(),
+            percent_used: false,
+            quota_total: 0.0,
         }
     }
 }
@@ -859,6 +931,218 @@ impl Default for Account {
 // Routes
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Pricing
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceCurrency {
+    #[default]
+    #[serde(alias = "USD", alias = "Usd")]
+    Usd,
+    #[serde(alias = "CNY", alias = "Cny", alias = "RMB")]
+    Cny,
+}
+
+impl PriceCurrency {
+    pub fn code(self) -> &'static str {
+        match self {
+            PriceCurrency::Usd => "USD",
+            PriceCurrency::Cny => "CNY",
+        }
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            PriceCurrency::Usd => "$",
+            PriceCurrency::Cny => "¥",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PriceCurrency::Usd => "USD 美元",
+            PriceCurrency::Cny => "CNY 人民币",
+        }
+    }
+}
+
+/// One per-million-token price triple.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct PriceTier {
+    pub input_per_mtok: f64,
+    /// Price for prompt tokens served from the provider's cache. `0.0` keeps
+    /// cached tokens at the regular input price.
+    pub cached_input_per_mtok: f64,
+    pub output_per_mtok: f64,
+}
+
+impl PriceTier {
+    pub fn is_zero(&self) -> bool {
+        self.input_per_mtok == 0.0
+            && self.cached_input_per_mtok == 0.0
+            && self.output_per_mtok == 0.0
+    }
+
+    /// Cost in millions-of-currency units (i.e. the base unit) for a request.
+    pub fn amount(&self, prompt_tokens: u64, cached_tokens: u64, completion_tokens: u64) -> f64 {
+        let cached = cached_tokens.min(prompt_tokens);
+        let uncached = prompt_tokens.saturating_sub(cached);
+        let cached_rate = if self.cached_input_per_mtok > 0.0 {
+            self.cached_input_per_mtok
+        } else {
+            self.input_per_mtok
+        };
+        (uncached as f64 * self.input_per_mtok
+            + cached as f64 * cached_rate
+            + completion_tokens as f64 * self.output_per_mtok)
+            / 1_000_000.0
+    }
+}
+
+/// A time-of-day price window. Peak/off-peak tariffs are expressed by giving
+/// each window its own price triple; hours outside every window use the base
+/// tier.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct PricePeriod {
+    pub name: String,
+    /// Inclusive local start hour, 0–23.
+    pub start_hour: u8,
+    /// Exclusive local end hour, 0–24. A smaller end hour wraps past midnight.
+    pub end_hour: u8,
+    /// Weekdays the window applies to, 0 = Monday … 6 = Sunday. Empty means
+    /// every day.
+    pub days: Vec<u8>,
+    pub tier: PriceTier,
+}
+
+impl Default for PricePeriod {
+    fn default() -> Self {
+        Self {
+            name: "峰时".to_string(),
+            start_hour: 9,
+            end_hour: 18,
+            days: Vec::new(),
+            tier: PriceTier::default(),
+        }
+    }
+}
+
+impl PricePeriod {
+    pub fn normalized(&self) -> Self {
+        let mut copy = self.clone();
+        copy.name = if copy.name.trim().is_empty() {
+            "时段".to_string()
+        } else {
+            copy.name.trim().to_string()
+        };
+        copy.start_hour = copy.start_hour.min(23);
+        copy.end_hour = copy.end_hour.min(24);
+        copy.days.retain(|d| *d < 7);
+        copy.days.sort_unstable();
+        copy.days.dedup();
+        copy.tier.input_per_mtok = sanitize_price(copy.tier.input_per_mtok);
+        copy.tier.cached_input_per_mtok = sanitize_price(copy.tier.cached_input_per_mtok);
+        copy.tier.output_per_mtok = sanitize_price(copy.tier.output_per_mtok);
+        copy
+    }
+
+    /// Does this window cover the given local time?
+    pub fn matches(&self, at: chrono::DateTime<chrono::Local>) -> bool {
+        use chrono::{Datelike, Timelike};
+        if !self.days.is_empty()
+            && !self
+                .days
+                .contains(&(at.weekday().num_days_from_monday() as u8))
+        {
+            return false;
+        }
+        let hour = at.hour() as u8;
+        if self.start_hour == self.end_hour {
+            // A zero-length window is treated as a full day.
+            return true;
+        }
+        if self.start_hour < self.end_hour {
+            hour >= self.start_hour && hour < self.end_hour
+        } else {
+            hour >= self.start_hour || hour < self.end_hour
+        }
+    }
+
+    /// `09:00–18:00` style label, plus weekday hints.
+    pub fn schedule_label(&self) -> String {
+        let hours = if self.start_hour == self.end_hour {
+            "全天".to_string()
+        } else {
+            format!("{:02}:00–{:02}:00", self.start_hour, self.end_hour)
+        };
+        if self.days.is_empty() {
+            hours
+        } else {
+            format!("{hours} · {}", weekday_label(&self.days))
+        }
+    }
+}
+
+pub fn weekday_label(days: &[u8]) -> String {
+    const NAMES: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
+    if days.is_empty() {
+        return "每天".to_string();
+    }
+    if days.len() == 7 {
+        return "每天".to_string();
+    }
+    days.iter()
+        .filter(|d| **d < 7)
+        .map(|d| format!("周{}", NAMES[*d as usize]))
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+fn sanitize_price(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1_000_000.0)
+    } else {
+        0.0
+    }
+}
+
+/// A reusable price table that can be shared between routes and exported.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct PricePlan {
+    pub name: String,
+    pub note: String,
+    pub currency: PriceCurrency,
+    pub base: PriceTier,
+    pub periods: Vec<PricePeriod>,
+}
+
+impl Default for PricePlan {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            note: String::new(),
+            currency: PriceCurrency::Usd,
+            base: PriceTier::default(),
+            periods: Vec::new(),
+        }
+    }
+}
+
+impl PricePlan {
+    pub fn normalized(&self) -> Self {
+        let mut copy = self.clone();
+        copy.name = copy.name.trim().to_string();
+        copy.note = copy.note.trim().to_string();
+        copy.periods = copy.periods.iter().map(PricePeriod::normalized).collect();
+        copy
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteMode {
@@ -893,10 +1177,62 @@ pub struct ModelRoute {
     pub max_context_tokens: Option<u64>,
     /// Third-layer fallback: another client-model mapping chain.
     pub fallback_client_model: Option<String>,
+    /// Legacy USD/Mtok fields. Kept so v3 configurations load unchanged;
+    /// `pricing.base` is the source of truth going forward.
     pub input_price_per_mtok: f64,
     pub output_price_per_mtok: f64,
+    #[serde(default)]
+    pub pricing: RoutePricing,
     pub enabled: bool,
     pub created_at: i64,
+}
+
+/// How a route is billed: a currency plus a base tier and optional
+/// time-of-day windows (peak / off-peak tariffs).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct RoutePricing {
+    pub currency: PriceCurrency,
+    pub base: PriceTier,
+    pub periods: Vec<PricePeriod>,
+}
+
+impl RoutePricing {
+    pub fn normalized(&self) -> Self {
+        Self {
+            currency: self.currency,
+            base: PriceTier {
+                input_per_mtok: sanitize_price(self.base.input_per_mtok),
+                cached_input_per_mtok: sanitize_price(self.base.cached_input_per_mtok),
+                output_per_mtok: sanitize_price(self.base.output_per_mtok),
+            },
+            periods: self.periods.iter().map(PricePeriod::normalized).collect(),
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.base.is_zero() && self.periods.iter().all(|period| period.tier.is_zero())
+    }
+
+    /// The tier that applies at `at`, falling back to the base tier.
+    pub fn tier_at(&self, at: chrono::DateTime<chrono::Local>) -> PriceTier {
+        self.periods
+            .iter()
+            .find(|period| period.matches(at))
+            .map(|period| period.tier)
+            .unwrap_or(self.base)
+    }
+
+    pub fn amount_at(
+        &self,
+        prompt_tokens: u64,
+        cached_tokens: u64,
+        completion_tokens: u64,
+        at: chrono::DateTime<chrono::Local>,
+    ) -> f64 {
+        self.tier_at(at)
+            .amount(prompt_tokens, cached_tokens, completion_tokens)
+    }
 }
 
 impl Default for ModelRoute {
@@ -914,6 +1250,7 @@ impl Default for ModelRoute {
             fallback_client_model: None,
             input_price_per_mtok: 0.0,
             output_price_per_mtok: 0.0,
+            pricing: RoutePricing::default(),
             enabled: true,
             created_at: 0,
         }
@@ -921,10 +1258,72 @@ impl Default for ModelRoute {
 }
 
 impl ModelRoute {
+    /// Pricing with legacy USD fields folded in. v3 configurations only stored
+    /// a flat input/output pair, so an empty `pricing` block inherits them.
+    pub fn effective_pricing(&self) -> RoutePricing {
+        if !self.pricing.is_zero()
+            || (self.input_price_per_mtok == 0.0 && self.output_price_per_mtok == 0.0)
+        {
+            return self.pricing.clone();
+        }
+        RoutePricing {
+            currency: PriceCurrency::Usd,
+            base: PriceTier {
+                input_per_mtok: self.input_price_per_mtok,
+                cached_input_per_mtok: 0.0,
+                output_per_mtok: self.output_price_per_mtok,
+            },
+            periods: Vec::new(),
+        }
+    }
+
+    /// Cost in micro-USD, using the base tier only. Period-aware billing goes
+    /// through [`Self::cost_micros_at`].
+    #[allow(dead_code)]
     pub fn cost_micros(&self, prompt_tokens: u64, completion_tokens: u64) -> u64 {
-        let input = (prompt_tokens as f64) * self.input_price_per_mtok / 1_000_000.0;
-        let output = (completion_tokens as f64) * self.output_price_per_mtok / 1_000_000.0;
-        ((input + output) * 1_000_000.0).round() as u64
+        self.cost_micros_at(prompt_tokens, 0, completion_tokens, chrono::Local::now())
+    }
+
+    /// Cost in micro-USD for a request that happened at `at`.
+    ///
+    /// Prices may be quoted in CNY; `currency_per_usd` is the route currency's
+    /// units per 1 USD, so every stored cost stays USD-denominated and totals
+    /// remain summable across providers.
+    #[allow(dead_code)]
+    pub fn cost_micros_at(
+        &self,
+        prompt_tokens: u64,
+        cached_tokens: u64,
+        completion_tokens: u64,
+        at: chrono::DateTime<chrono::Local>,
+    ) -> u64 {
+        let pricing = self.effective_pricing();
+        let amount = pricing.amount_at(prompt_tokens, cached_tokens, completion_tokens, at);
+        let usd = match pricing.currency {
+            PriceCurrency::Usd => amount,
+            PriceCurrency::Cny => amount / 7.2,
+        };
+        (usd * 1_000_000.0).round().max(0.0) as u64
+    }
+
+    /// Same as [`Self::cost_micros_at`] but with an explicit FX rate supplied
+    /// by the live rate table.
+    pub fn cost_micros_with_fx(
+        &self,
+        prompt_tokens: u64,
+        cached_tokens: u64,
+        completion_tokens: u64,
+        at: chrono::DateTime<chrono::Local>,
+        units_per_usd: f64,
+    ) -> u64 {
+        let pricing = self.effective_pricing();
+        let amount = pricing.amount_at(prompt_tokens, cached_tokens, completion_tokens, at);
+        let rate = if units_per_usd.is_finite() && units_per_usd > 0.0 {
+            units_per_usd
+        } else {
+            1.0
+        };
+        ((amount / rate).max(0.0) * 1_000_000.0).round() as u64
     }
 }
 
@@ -1070,5 +1469,158 @@ pub fn normalize_currency(currency: &str) -> String {
         "" => "USD".to_string(),
         "RMB" => "CNY".to_string(),
         _ => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(hour: u32, weekday_offset: i64) -> chrono::DateTime<chrono::Local> {
+        // 2026-10-19 is a Monday.
+        let base = chrono::Local
+            .with_ymd_and_hms(2026, 10, 19, hour, 30, 0)
+            .single()
+            .unwrap();
+        base + chrono::Duration::days(weekday_offset)
+    }
+
+    fn tier(input: f64, cached: f64, output: f64) -> PriceTier {
+        PriceTier {
+            input_per_mtok: input,
+            cached_input_per_mtok: cached,
+            output_per_mtok: output,
+        }
+    }
+
+    #[test]
+    fn price_tier_bills_cached_tokens_at_cached_rate() {
+        let price = tier(3.0, 0.3, 15.0);
+        // 1M prompt tokens of which 400k hit the cache, plus 100k output.
+        let amount = price.amount(1_000_000, 400_000, 100_000);
+        let expected = 0.6 * 3.0 + 0.4 * 0.3 + 0.1 * 15.0;
+        assert!((amount - expected).abs() < 1e-9, "{amount} != {expected}");
+    }
+
+    #[test]
+    fn cached_rate_of_zero_falls_back_to_input_rate() {
+        let price = tier(2.0, 0.0, 4.0);
+        assert!((price.amount(1_000_000, 500_000, 0) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn peak_period_overrides_base_price() {
+        let pricing = RoutePricing {
+            currency: PriceCurrency::Cny,
+            base: tier(1.0, 0.0, 2.0),
+            periods: vec![PricePeriod {
+                name: "峰时".into(),
+                start_hour: 9,
+                end_hour: 18,
+                days: Vec::new(),
+                tier: tier(4.0, 0.0, 8.0),
+            }],
+        };
+        let peak = pricing.amount_at(1_000_000, 0, 0, at(10, 0));
+        let off_peak = pricing.amount_at(1_000_000, 0, 0, at(20, 0));
+        assert!((peak - 4.0).abs() < 1e-9);
+        assert!((off_peak - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn weekday_filter_and_midnight_wrap() {
+        let period = PricePeriod {
+            name: "夜间".into(),
+            start_hour: 22,
+            end_hour: 6,
+            days: vec![0, 1], // Monday, Tuesday
+            tier: tier(1.0, 0.0, 1.0),
+        };
+        assert!(period.matches(at(23, 0)), "Monday 23:00 should match");
+        assert!(period.matches(at(3, 0)), "Monday 03:00 should match");
+        assert!(!period.matches(at(12, 0)), "Monday noon should not match");
+        assert!(
+            !period.matches(at(23, 2)),
+            "Wednesday 23:00 is outside the weekday list"
+        );
+    }
+
+    #[test]
+    fn legacy_usd_fields_are_folded_into_pricing() {
+        let route = ModelRoute {
+            input_price_per_mtok: 2.5,
+            output_price_per_mtok: 10.0,
+            ..ModelRoute::default()
+        };
+        let effective = route.effective_pricing();
+        assert_eq!(effective.currency, PriceCurrency::Usd);
+        assert!((effective.base.input_per_mtok - 2.5).abs() < 1e-9);
+        assert!((effective.base.output_per_mtok - 10.0).abs() < 1e-9);
+        // 1M input + 1M output at those rates = $12.50 = 12_500_000 micro-USD.
+        assert_eq!(route.cost_micros(1_000_000, 1_000_000), 12_500_000);
+    }
+
+    #[test]
+    fn explicit_pricing_wins_over_legacy_fields() {
+        let route = ModelRoute {
+            input_price_per_mtok: 99.0,
+            output_price_per_mtok: 99.0,
+            pricing: RoutePricing {
+                currency: PriceCurrency::Usd,
+                base: tier(1.0, 0.0, 1.0),
+                periods: Vec::new(),
+            },
+            ..ModelRoute::default()
+        };
+        assert!((route.effective_pricing().base.input_per_mtok - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cny_pricing_is_converted_to_usd_micros() {
+        let route = ModelRoute {
+            pricing: RoutePricing {
+                currency: PriceCurrency::Cny,
+                base: tier(7.2, 0.0, 7.2),
+                periods: Vec::new(),
+            },
+            ..ModelRoute::default()
+        };
+        // 7.2 CNY per Mtok is 1 USD per Mtok with the live-rate fallback.
+        let micros = route.cost_micros_with_fx(1_000_000, 0, 1_000_000, at(12, 0), 7.2);
+        assert_eq!(micros, 2_000_000);
+    }
+
+    #[test]
+    fn period_normalization_clamps_and_drops_empty_tiers() {
+        let period = PricePeriod {
+            name: "  ".into(),
+            start_hour: 30,
+            end_hour: 40,
+            days: vec![9, 1, 1, 2],
+            tier: PriceTier::default(),
+        };
+        let normalized = period.normalized();
+        assert_eq!(normalized.name, "时段");
+        assert_eq!(normalized.start_hour, 23);
+        assert_eq!(normalized.end_hour, 24);
+        assert_eq!(normalized.days, vec![1, 2]);
+    }
+
+    #[test]
+    fn badge_config_reports_content_with_speed_only() {
+        let config = TaskbarBadgeConfig {
+            show_status: false,
+            show_active: false,
+            show_tokens: false,
+            show_requests: false,
+            show_queued: false,
+            show_success: false,
+            show_cost: false,
+            show_speed: true,
+            ..TaskbarBadgeConfig::default()
+        };
+        assert!(config.has_content());
+        assert!(!config.transparent_bg);
     }
 }

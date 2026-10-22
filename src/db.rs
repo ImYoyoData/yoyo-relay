@@ -19,6 +19,7 @@ pub struct UsageRecord {
     pub stream: bool,
     pub cancelled: bool,
     pub prompt_tokens: u64,
+    pub cached_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cost_micros: u64,
@@ -31,6 +32,7 @@ pub struct Totals {
     pub requests: u64,
     pub ok: u64,
     pub prompt_tokens: u64,
+    pub cached_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cost_micros: u64,
@@ -69,6 +71,7 @@ pub struct SeriesPoint {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct RecentRequest {
+    pub id: i64,
     pub ts: i64,
     pub request_id: String,
     pub account_id: String,
@@ -80,9 +83,83 @@ pub struct RecentRequest {
     pub ok: bool,
     pub stream: bool,
     pub cancelled: bool,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub cost_micros: u64,
     pub latency_ms: u64,
     pub local_key_id: Option<String>,
+}
+
+/// One full request record for the call-detail table.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct UsageDetail {
+    pub id: i64,
+    pub ts: i64,
+    pub request_id: String,
+    pub account_id: String,
+    pub provider_id: String,
+    pub local_key_id: Option<String>,
+    pub client_model: String,
+    pub upstream_model: String,
+    pub protocol: String,
+    pub status: u16,
+    pub ok: bool,
+    pub stream: bool,
+    pub cancelled: bool,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_micros: u64,
+    pub latency_ms: u64,
+    pub kind: String,
+}
+
+/// Optional filters for the call-detail page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsageFilter {
+    pub client_model: Option<String>,
+    pub account_id: Option<String>,
+    pub provider_id: Option<String>,
+    pub local_key_id: Option<String>,
+    /// `None` = all, `Some(true)` = successful, `Some(false)` = failed.
+    pub ok: Option<bool>,
+}
+
+impl UsageFilter {
+    fn where_clause(&self) -> (String, Vec<Option<String>>, Option<i64>) {
+        let mut clauses = Vec::new();
+        let mut values: Vec<Option<String>> = Vec::new();
+        if let Some(model) = &self.client_model {
+            clauses.push("client_model = ?");
+            values.push(Some(model.clone()));
+        }
+        if let Some(account) = &self.account_id {
+            clauses.push("account_id = ?");
+            values.push(Some(account.clone()));
+        }
+        if let Some(provider) = &self.provider_id {
+            clauses.push("provider_id = ?");
+            values.push(Some(provider.clone()));
+        }
+        if let Some(key) = &self.local_key_id {
+            clauses.push("local_key_id = ?");
+            values.push(Some(key.clone()));
+        }
+        // `ok` is bound separately by the callers so integer and string
+        // parameters stay in separate lists.
+        let sql = if clauses.is_empty() {
+            "1=1".to_string()
+        } else {
+            clauses.join(" AND ")
+        };
+        // The `ok` flag is an integer in SQLite; keep it separate so the
+        // string parameters stay in a uniform vector.
+        (sql, values, self.ok.map(|ok| ok as i64))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +202,7 @@ impl Db {
                 stream INTEGER NOT NULL DEFAULT 0,
                 cancelled INTEGER NOT NULL DEFAULT 0,
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_micros INTEGER NOT NULL DEFAULT 0,
@@ -150,6 +228,18 @@ impl Db {
             );
             "#,
         )?;
+        // Databases created before the cached-token column existed need the
+        // column added in place; CREATE TABLE IF NOT EXISTS will not do it.
+        let has_cached: bool = conn
+            .prepare("PRAGMA table_info(usage_requests)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "cached_tokens");
+        if !has_cached {
+            conn.execute_batch(
+                "ALTER TABLE usage_requests ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -167,9 +257,9 @@ impl Db {
         conn.execute(
             "INSERT INTO usage_requests
              (ts, request_id, account_id, provider_id, local_key_id, client_model, upstream_model,
-              protocol, status, ok, stream, cancelled, prompt_tokens, completion_tokens,
-              total_tokens, cost_micros, latency_ms, kind)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+              protocol, status, ok, stream, cancelled, prompt_tokens, cached_tokens,
+              completion_tokens, total_tokens, cost_micros, latency_ms, kind)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 rec.ts,
                 rec.request_id,
@@ -184,6 +274,7 @@ impl Db {
                 rec.stream as i64,
                 rec.cancelled as i64,
                 rec.prompt_tokens as i64,
+                rec.cached_tokens as i64,
                 rec.completion_tokens as i64,
                 rec.total_tokens as i64,
                 rec.cost_micros as i64,
@@ -191,7 +282,111 @@ impl Db {
                 rec.kind,
             ],
         )?;
+        // Keep the history bounded: only the newest 1000 rows are retained.
+        conn.execute(
+            "DELETE FROM usage_requests WHERE id <= (
+                 SELECT id FROM usage_requests ORDER BY id DESC LIMIT 1 OFFSET 1000
+             )",
+            [],
+        )?;
         Ok(())
+    }
+
+    /// Total matching rows for the call-detail page.
+    pub fn usage_count(&self, filter: &UsageFilter) -> Result<u64> {
+        let (sql, values, ok) = filter.where_clause();
+        let conn = self.lock();
+        let query = format!(
+            "SELECT COUNT(*) FROM usage_requests WHERE {sql}{}",
+            if ok.is_some() { " AND ok = ?" } else { "" }
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let mut index = 1;
+        for value in &values {
+            stmt.raw_bind_parameter(index, value)?;
+            index += 1;
+        }
+        if let Some(ok) = ok {
+            stmt.raw_bind_parameter(index, ok)?;
+        }
+        let count: i64 = stmt
+            .raw_query()
+            .next()?
+            .map(|row| row.get(0))
+            .transpose()?
+            .unwrap_or(0);
+        Ok(count as u64)
+    }
+
+    /// One page of full records, newest first.
+    pub fn usage_page(
+        &self,
+        filter: &UsageFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<UsageDetail>> {
+        let (sql, values, ok) = filter.where_clause();
+        let conn = self.lock();
+        let query = format!(
+            "SELECT id, ts, request_id, account_id, provider_id, local_key_id,
+                    client_model, upstream_model, protocol, status, ok, stream, cancelled,
+                    prompt_tokens, cached_tokens, completion_tokens, total_tokens,
+                    cost_micros, latency_ms, kind
+             FROM usage_requests WHERE {sql}{}
+             ORDER BY id DESC LIMIT ? OFFSET ?",
+            if ok.is_some() { " AND ok = ?" } else { "" }
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let mut index = 1;
+        for value in &values {
+            stmt.raw_bind_parameter(index, value)?;
+            index += 1;
+        }
+        if let Some(ok) = ok {
+            stmt.raw_bind_parameter(index, ok)?;
+            index += 1;
+        }
+        stmt.raw_bind_parameter(index, limit as i64)?;
+        stmt.raw_bind_parameter(index + 1, offset as i64)?;
+        let mut raw_rows = stmt.raw_query();
+        let mut out = Vec::new();
+        while let Some(r) = raw_rows.next()? {
+            out.push(UsageDetail {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                request_id: r.get(2)?,
+                account_id: r.get(3)?,
+                provider_id: r.get(4)?,
+                local_key_id: r.get(5)?,
+                client_model: r.get(6)?,
+                upstream_model: r.get(7)?,
+                protocol: r.get(8)?,
+                status: r.get::<_, i64>(9)? as u16,
+                ok: r.get::<_, i64>(10)? != 0,
+                stream: r.get::<_, i64>(11)? != 0,
+                cancelled: r.get::<_, i64>(12)? != 0,
+                prompt_tokens: r.get::<_, i64>(13)? as u64,
+                cached_tokens: r.get::<_, i64>(14)? as u64,
+                completion_tokens: r.get::<_, i64>(15)? as u64,
+                total_tokens: r.get::<_, i64>(16)? as u64,
+                cost_micros: r.get::<_, i64>(17)? as u64,
+                latency_ms: r.get::<_, i64>(18)? as u64,
+                kind: r.get(19)?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn delete_usage(&self, id: i64) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.execute("DELETE FROM usage_requests WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    pub fn clear_usage(&self) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn.execute("DELETE FROM usage_requests", [])?;
+        Ok(n)
     }
 
     pub fn sum_account_since(&self, account_id: &str, since: i64) -> Result<(u64, u64)> {
@@ -237,7 +432,8 @@ impl Db {
         let conn = self.lock();
         let row = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(ok),0),
-                    COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+                    COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cached_tokens),0),
+                    COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0),
                     COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0)
              FROM usage_requests WHERE ts >= ?1 AND (?2 IS NULL OR local_key_id = ?2)",
@@ -247,10 +443,11 @@ impl Db {
                     requests: r.get::<_, i64>(0)? as u64,
                     ok: r.get::<_, i64>(1)? as u64,
                     prompt_tokens: r.get::<_, i64>(2)? as u64,
-                    completion_tokens: r.get::<_, i64>(3)? as u64,
-                    total_tokens: r.get::<_, i64>(4)? as u64,
-                    cost_micros: r.get::<_, i64>(5)? as u64,
-                    avg_latency_ms: r.get::<_, i64>(6)? as u64,
+                    cached_tokens: r.get::<_, i64>(3)? as u64,
+                    completion_tokens: r.get::<_, i64>(4)? as u64,
+                    total_tokens: r.get::<_, i64>(5)? as u64,
+                    cost_micros: r.get::<_, i64>(6)? as u64,
+                    avg_latency_ms: r.get::<_, i64>(7)? as u64,
                 })
             },
         )?;
@@ -261,7 +458,8 @@ impl Db {
         let conn = self.lock();
         let row = conn.query_row(
             "SELECT COUNT(*), COALESCE(SUM(ok),0),
-                    COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+                    COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cached_tokens),0),
+                    COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0),
                     COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0)
              FROM usage_requests WHERE ts >= ?1 AND client_model = ?2",
@@ -271,10 +469,11 @@ impl Db {
                     requests: r.get::<_, i64>(0)? as u64,
                     ok: r.get::<_, i64>(1)? as u64,
                     prompt_tokens: r.get::<_, i64>(2)? as u64,
-                    completion_tokens: r.get::<_, i64>(3)? as u64,
-                    total_tokens: r.get::<_, i64>(4)? as u64,
-                    cost_micros: r.get::<_, i64>(5)? as u64,
-                    avg_latency_ms: r.get::<_, i64>(6)? as u64,
+                    cached_tokens: r.get::<_, i64>(3)? as u64,
+                    completion_tokens: r.get::<_, i64>(4)? as u64,
+                    total_tokens: r.get::<_, i64>(5)? as u64,
+                    cost_micros: r.get::<_, i64>(6)? as u64,
+                    avg_latency_ms: r.get::<_, i64>(7)? as u64,
                 })
             },
         )?;
@@ -299,7 +498,8 @@ impl Db {
         };
         let sql = format!(
             "SELECT {column}, COUNT(*), COALESCE(SUM(ok),0),
-                    COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+                    COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cached_tokens),0),
+                    COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0),
                     COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0)
              FROM usage_requests WHERE ts >= ?1 AND (?2 IS NULL OR local_key_id = ?2)
@@ -314,10 +514,11 @@ impl Db {
                     requests: r.get::<_, i64>(1)? as u64,
                     ok: r.get::<_, i64>(2)? as u64,
                     prompt_tokens: r.get::<_, i64>(3)? as u64,
-                    completion_tokens: r.get::<_, i64>(4)? as u64,
-                    total_tokens: r.get::<_, i64>(5)? as u64,
-                    cost_micros: r.get::<_, i64>(6)? as u64,
-                    avg_latency_ms: r.get::<_, i64>(7)? as u64,
+                    cached_tokens: r.get::<_, i64>(4)? as u64,
+                    completion_tokens: r.get::<_, i64>(5)? as u64,
+                    total_tokens: r.get::<_, i64>(6)? as u64,
+                    cost_micros: r.get::<_, i64>(7)? as u64,
+                    avg_latency_ms: r.get::<_, i64>(8)? as u64,
                 },
             })
         })?;
@@ -336,7 +537,8 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT client_model, upstream_model, COUNT(*), COALESCE(SUM(ok),0),
-                    COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+                    COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cached_tokens),0),
+                    COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0)
              FROM usage_requests WHERE ts >= ?1 AND (?2 IS NULL OR local_key_id = ?2)
              GROUP BY client_model, upstream_model
@@ -350,9 +552,10 @@ impl Db {
                     requests: r.get::<_, i64>(2)? as u64,
                     ok: r.get::<_, i64>(3)? as u64,
                     prompt_tokens: r.get::<_, i64>(4)? as u64,
-                    completion_tokens: r.get::<_, i64>(5)? as u64,
-                    total_tokens: r.get::<_, i64>(6)? as u64,
-                    cost_micros: r.get::<_, i64>(7)? as u64,
+                    cached_tokens: r.get::<_, i64>(5)? as u64,
+                    completion_tokens: r.get::<_, i64>(6)? as u64,
+                    total_tokens: r.get::<_, i64>(7)? as u64,
+                    cost_micros: r.get::<_, i64>(8)? as u64,
                     avg_latency_ms: 0,
                 },
             })
@@ -397,26 +600,32 @@ impl Db {
     pub fn recent_requests(&self, limit: usize) -> Result<Vec<RecentRequest>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT ts, request_id, account_id, provider_id, client_model, upstream_model,
-                    protocol, status, ok, stream, cancelled, total_tokens, latency_ms, local_key_id
-             FROM usage_requests ORDER BY ts DESC, id DESC LIMIT ?1",
+            "SELECT id, ts, request_id, account_id, provider_id, client_model, upstream_model,
+                    protocol, status, ok, stream, cancelled, prompt_tokens, cached_tokens,
+                    completion_tokens, total_tokens, cost_micros, latency_ms, local_key_id
+             FROM usage_requests ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
             Ok(RecentRequest {
-                ts: r.get(0)?,
-                request_id: r.get(1)?,
-                account_id: r.get(2)?,
-                provider_id: r.get(3)?,
-                client_model: r.get(4)?,
-                upstream_model: r.get(5)?,
-                protocol: r.get(6)?,
-                status: r.get::<_, i64>(7)? as u16,
-                ok: r.get::<_, i64>(8)? != 0,
-                stream: r.get::<_, i64>(9)? != 0,
-                cancelled: r.get::<_, i64>(10)? != 0,
-                total_tokens: r.get::<_, i64>(11)? as u64,
-                latency_ms: r.get::<_, i64>(12)? as u64,
-                local_key_id: r.get(13)?,
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                request_id: r.get(2)?,
+                account_id: r.get(3)?,
+                provider_id: r.get(4)?,
+                client_model: r.get(5)?,
+                upstream_model: r.get(6)?,
+                protocol: r.get(7)?,
+                status: r.get::<_, i64>(8)? as u16,
+                ok: r.get::<_, i64>(9)? != 0,
+                stream: r.get::<_, i64>(10)? != 0,
+                cancelled: r.get::<_, i64>(11)? != 0,
+                prompt_tokens: r.get::<_, i64>(12)? as u64,
+                cached_tokens: r.get::<_, i64>(13)? as u64,
+                completion_tokens: r.get::<_, i64>(14)? as u64,
+                total_tokens: r.get::<_, i64>(15)? as u64,
+                cost_micros: r.get::<_, i64>(16)? as u64,
+                latency_ms: r.get::<_, i64>(17)? as u64,
+                local_key_id: r.get(18)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -532,6 +741,7 @@ mod tests {
             stream: true,
             cancelled: false,
             prompt_tokens: tokens,
+            cached_tokens: 0,
             completion_tokens: 0,
             total_tokens: tokens,
             cost_micros: 100,
@@ -585,6 +795,115 @@ mod tests {
         let pairs = db.model_upstream_since_key(0, Some("k1")).unwrap();
         assert_eq!(pairs.len(), 1);
         assert!(!db.series_since_key(0, 3600, Some("k1")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sums_cached_tokens_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        let mut rec = sample("a1", 100, true);
+        rec.cached_tokens = 40;
+        db.record_usage(&rec).unwrap();
+        let mut second = sample("a1", 50, true);
+        second.cached_tokens = 10;
+        db.record_usage(&second).unwrap();
+
+        let totals = db.totals_since(0).unwrap();
+        assert_eq!(totals.prompt_tokens, 150);
+        assert_eq!(totals.cached_tokens, 50);
+        let groups = db.group_since("account", 0).unwrap();
+        assert_eq!(groups[0].totals.cached_tokens, 50);
+    }
+
+    #[test]
+    fn adds_cached_column_to_legacy_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE usage_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    request_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL DEFAULT '',
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    local_key_id TEXT,
+                    client_model TEXT NOT NULL DEFAULT '',
+                    upstream_model TEXT NOT NULL DEFAULT '',
+                    protocol TEXT NOT NULL DEFAULT '',
+                    status INTEGER NOT NULL DEFAULT 0,
+                    ok INTEGER NOT NULL DEFAULT 0,
+                    stream INTEGER NOT NULL DEFAULT 0,
+                    cancelled INTEGER NOT NULL DEFAULT 0,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_micros INTEGER NOT NULL DEFAULT 0,
+                    latency_ms INTEGER NOT NULL DEFAULT 0,
+                    kind TEXT NOT NULL DEFAULT 'chat'
+                );
+                INSERT INTO usage_requests (ts, request_id, prompt_tokens, completion_tokens, total_tokens)
+                VALUES (1, 'old', 10, 5, 15);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let totals = db.totals_since(0).unwrap();
+        assert_eq!(totals.total_tokens, 15);
+        assert_eq!(totals.cached_tokens, 0);
+        // New writes work after the in-place migration.
+        db.record_usage(&sample("a1", 5, true)).unwrap();
+        assert_eq!(db.totals_since(0).unwrap().requests, 2);
+    }
+
+    #[test]
+    fn pages_filters_and_deletes_call_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        for index in 0..25 {
+            let mut rec = sample(if index % 2 == 0 { "a1" } else { "a2" }, 10, index != 3);
+            rec.client_model = if index < 10 { "gpt-4o" } else { "claude" }.into();
+            db.record_usage(&rec).unwrap();
+        }
+
+        let page = db.usage_page(&UsageFilter::default(), 0, 20).unwrap();
+        assert_eq!(page.len(), 20);
+        assert_eq!(db.usage_count(&UsageFilter::default()).unwrap(), 25);
+        let page = db.usage_page(&UsageFilter::default(), 20, 20).unwrap();
+        assert_eq!(page.len(), 5);
+
+        let filter = UsageFilter {
+            client_model: Some("gpt-4o".into()),
+            ..UsageFilter::default()
+        };
+        assert_eq!(db.usage_count(&filter).unwrap(), 10);
+        assert_eq!(
+            db.usage_page(&filter, 0, 20).unwrap()[0].client_model,
+            "gpt-4o"
+        );
+
+        let failed = UsageFilter {
+            ok: Some(false),
+            ..UsageFilter::default()
+        };
+        assert_eq!(db.usage_count(&failed).unwrap(), 1);
+
+        let id = page[0].id;
+        assert!(db.delete_usage(id).unwrap());
+        assert_eq!(db.usage_count(&UsageFilter::default()).unwrap(), 24);
+        assert_eq!(db.clear_usage().unwrap(), 24);
+        assert_eq!(db.usage_count(&UsageFilter::default()).unwrap(), 0);
+    }
+
+    #[test]
+    fn keeps_only_newest_thousand_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("t.db")).unwrap();
+        for _ in 0..1005 {
+            db.record_usage(&sample("a1", 1, true)).unwrap();
+        }
+        assert_eq!(db.usage_count(&UsageFilter::default()).unwrap(), 1000);
     }
 
     #[test]

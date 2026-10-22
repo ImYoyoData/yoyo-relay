@@ -105,11 +105,20 @@ impl App {
                 icons::COINS,
                 "Token",
                 widgets::format_count(totals.total_tokens),
-                format!(
-                    "入 {} · 出 {}",
-                    widgets::format_count(totals.prompt_tokens),
-                    widgets::format_count(totals.completion_tokens)
-                ),
+                if totals.cached_tokens > 0 {
+                    format!(
+                        "入 {} · 出 {} · 缓存命中 {}",
+                        widgets::format_count(totals.prompt_tokens),
+                        widgets::format_count(totals.completion_tokens),
+                        widgets::format_count(totals.cached_tokens)
+                    )
+                } else {
+                    format!(
+                        "入 {} · 出 {}",
+                        widgets::format_count(totals.prompt_tokens),
+                        widgets::format_count(totals.completion_tokens)
+                    )
+                },
                 theme::BLUE_INFO,
             ),
             (

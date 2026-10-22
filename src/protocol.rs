@@ -72,6 +72,9 @@ pub fn route_supports_ingress(route: &ModelRoute, ingress: Ingress, upstream: Pr
 #[allow(dead_code)]
 pub struct Usage {
     pub input_tokens: u64,
+    /// Prompt tokens served from the provider's prompt cache. Billed at the
+    /// route's cached-input rate when one is configured.
+    pub cached_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub estimated: bool,
@@ -88,6 +91,7 @@ impl Usage {
 
     fn absorb_max(&mut self, other: &Usage) {
         self.input_tokens = self.input_tokens.max(other.input_tokens);
+        self.cached_tokens = self.cached_tokens.max(other.cached_tokens);
         self.output_tokens = self.output_tokens.max(other.output_tokens);
         if other.total_tokens > 0 {
             self.total_tokens = self.total_tokens.max(other.total_tokens);
@@ -220,51 +224,54 @@ pub fn convert_nonstream_response(
 }
 
 pub fn extract_nonstream_usage(protocol: Protocol, value: &Value) -> Usage {
+    value
+        .get("usage")
+        .and_then(Value::as_object)
+        .map(|usage| usage_from_object(protocol, usage))
+        .unwrap_or_default()
+}
+
+/// Read a `usage` object in the given protocol dialect, including prompt-cache
+/// hit counts. Shared by the non-stream and SSE paths so both bill identically.
+pub fn usage_from_object(protocol: Protocol, usage: &serde_json::Map<String, Value>) -> Usage {
+    let num = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let mut u = Usage::default();
     match protocol {
         Protocol::OpenAiChat => {
-            if let Some(usage) = value.get("usage").and_then(Value::as_object) {
-                u.input_tokens = usage
-                    .get("prompt_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                u.output_tokens = usage
-                    .get("completion_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                u.total_tokens = usage
-                    .get("total_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-            }
+            u.input_tokens = num("prompt_tokens");
+            u.output_tokens = num("completion_tokens");
+            u.total_tokens = num("total_tokens");
+            u.cached_tokens = usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
         }
         Protocol::AnthropicMessages => {
-            if let Some(usage) = value.get("usage").and_then(Value::as_object) {
-                u.input_tokens = usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                u.output_tokens = usage
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-            }
+            // Anthropic reports cache reads and writes separately from
+            // `input_tokens`; all three are prompt tokens for billing purposes.
+            let fresh = num("input_tokens");
+            let cache_read = num("cache_read_input_tokens");
+            let cache_write = num("cache_creation_input_tokens");
+            let cached = if num("cached_tokens") > 0 {
+                num("cached_tokens")
+            } else {
+                cache_read
+            };
+            u.input_tokens = fresh + cache_read + cache_write;
+            u.cached_tokens = cached;
+            u.output_tokens = num("output_tokens");
+            u.total_tokens = u.input_tokens + u.output_tokens;
         }
         Protocol::OpenAiResponses => {
-            if let Some(usage) = value.get("usage").and_then(Value::as_object) {
-                u.input_tokens = usage
-                    .get("input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                u.output_tokens = usage
-                    .get("output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                u.total_tokens = usage
-                    .get("total_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-            }
+            u.input_tokens = num("input_tokens");
+            u.output_tokens = num("output_tokens");
+            u.total_tokens = num("total_tokens");
+            u.cached_tokens = usage
+                .get("input_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
         }
     }
     u
@@ -1100,6 +1107,7 @@ fn anthropic_response_to_chat(value: &Value, client_model: &str) -> Value {
         }],
         "usage": Usage {
             input_tokens: usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+            cached_tokens: 0,
             output_tokens: usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
             total_tokens: 0,
             estimated: false,
@@ -1335,6 +1343,7 @@ fn responses_response_to_chat(value: &Value, client_model: &str) -> Value {
         }],
         "usage": Usage {
             input_tokens: usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+            cached_tokens: 0,
             output_tokens: usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
             total_tokens: usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
             estimated: false,
@@ -1441,6 +1450,9 @@ pub struct StreamTranslator {
     resp_text: String,
     resp_tools: HashMap<u64, RespToolState>,
     resp_next_output: usize,
+    /// Characters of assistant text the upstream has emitted so far. The
+    /// gateway divides this to drive the live tokens-per-second meter.
+    produced_chars: usize,
 }
 
 impl StreamTranslator {
@@ -1473,6 +1485,7 @@ impl StreamTranslator {
             resp_text_output: None,
             resp_content_open: false,
             resp_text: String::new(),
+            produced_chars: 0,
             resp_tools: HashMap::new(),
             resp_next_output: 0,
         }
@@ -1480,6 +1493,17 @@ impl StreamTranslator {
 
     pub fn usage(&self) -> Usage {
         self.usage
+    }
+
+    /// Characters of generated assistant text seen so far.
+    pub fn produced_chars(&self) -> usize {
+        self.produced_chars
+    }
+
+    /// Add upstream-generated text to the throughput counter. Called from the
+    /// upstream-dialect parsers, before conversion to the client dialect.
+    fn note_produced(&mut self, text: &str) {
+        self.produced_chars = self.produced_chars.saturating_add(text.chars().count());
     }
 
     /// A terminal error frame in the client's own dialect.
@@ -1588,6 +1612,32 @@ impl StreamTranslator {
             return vec![raw_frame(ev.event.as_deref(), data)];
         };
         self.collect_usage_from_event(&value);
+        // Passthrough streams never run through the dialect parsers, so count
+        // generated text here to keep the live meter accurate.
+        match self.ingress {
+            Protocol::OpenAiChat => {
+                if let Some(text) = value
+                    .pointer("/choices/0/delta/content")
+                    .and_then(Value::as_str)
+                {
+                    self.note_produced(text);
+                }
+            }
+            Protocol::AnthropicMessages => {
+                if value.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+                    if let Some(text) = value.pointer("/delta/text").and_then(Value::as_str) {
+                        self.note_produced(text);
+                    }
+                }
+            }
+            Protocol::OpenAiResponses => {
+                if value.get("type").and_then(Value::as_str) == Some("response.output_text.delta") {
+                    if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                        self.note_produced(text);
+                    }
+                }
+            }
+        }
         if self.ingress == Protocol::OpenAiResponses
             && value.get("type").and_then(Value::as_str) == Some("response.completed")
         {
@@ -1610,60 +1660,19 @@ impl StreamTranslator {
     }
 
     fn collect_usage_from_event(&mut self, value: &Value) {
-        let mut u = Usage::default();
-        match self.upstream {
-            Protocol::OpenAiChat => {
-                if let Some(usage) = value.get("usage").and_then(Value::as_object) {
-                    u.input_tokens = usage
-                        .get("prompt_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    u.output_tokens = usage
-                        .get("completion_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    u.total_tokens = usage
-                        .get("total_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                }
-            }
-            Protocol::AnthropicMessages => {
-                let usage = value
-                    .pointer("/message/usage")
-                    .or_else(|| value.get("usage"));
-                if let Some(usage) = usage.and_then(Value::as_object) {
-                    u.input_tokens = usage
-                        .get("input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    u.output_tokens = usage
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                }
-            }
-            Protocol::OpenAiResponses => {
-                let usage = value
-                    .pointer("/response/usage")
-                    .or_else(|| value.get("usage"));
-                if let Some(usage) = usage.and_then(Value::as_object) {
-                    u.input_tokens = usage
-                        .get("input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    u.output_tokens = usage
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    u.total_tokens = usage
-                        .get("total_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                }
-            }
+        let usage = match self.upstream {
+            Protocol::OpenAiChat => value.get("usage"),
+            Protocol::AnthropicMessages => value
+                .pointer("/message/usage")
+                .or_else(|| value.get("usage")),
+            Protocol::OpenAiResponses => value
+                .pointer("/response/usage")
+                .or_else(|| value.get("usage")),
+        };
+        if let Some(usage) = usage.and_then(Value::as_object) {
+            let u = usage_from_object(self.upstream, usage);
+            self.usage.absorb_max(&u);
         }
-        self.usage.absorb_max(&u);
     }
 
     // -- chat ingress <- anthropic upstream --------------------------------
@@ -1721,6 +1730,7 @@ impl StreamTranslator {
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            self.note_produced(text);
                             if !text.is_empty() {
                                 out.push(self.chat_content_chunk(text));
                             }
@@ -1800,6 +1810,7 @@ impl StreamTranslator {
         let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             if !text.is_empty() {
+                self.note_produced(text);
                 out.extend(self.anthropic_text_delta(text));
             }
         }
@@ -1983,6 +1994,7 @@ impl StreamTranslator {
             }
             "response.output_text.delta" => {
                 if let Some(text) = data.get("delta").and_then(Value::as_str) {
+                    self.note_produced(text);
                     if !text.is_empty() {
                         out.push(self.chat_content_chunk(text));
                     }
@@ -2137,6 +2149,7 @@ impl StreamTranslator {
                     .get("prompt_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
+                cached_tokens: 0,
                 output_tokens: usage
                     .get("completion_tokens")
                     .and_then(Value::as_u64)
@@ -2159,6 +2172,7 @@ impl StreamTranslator {
         let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             if !text.is_empty() {
+                self.note_produced(text);
                 if self.resp_text_item.is_none() {
                     let item_id = format!("msg_{}", short_id());
                     let output_index = self.resp_next_output;
@@ -2590,6 +2604,170 @@ fn parse_sse_frame(frame: &str) -> Option<SseEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_openai_cache_hits() {
+        let value = json!({
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 50,
+                "total_tokens": 1050,
+                "prompt_tokens_details": {"cached_tokens": 800}
+            }
+        });
+        let usage = extract_nonstream_usage(Protocol::OpenAiChat, &value);
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cached_tokens, 800);
+        assert_eq!(usage.total(), 1050);
+    }
+
+    #[test]
+    fn anthropic_cache_reads_count_as_prompt_tokens() {
+        // Anthropic reports cache reads outside `input_tokens`; both are billed
+        // prompt tokens, so they must be summed for accurate costing.
+        let value = json!({
+            "usage": {
+                "input_tokens": 120,
+                "cache_read_input_tokens": 880,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 40
+            }
+        });
+        let usage = extract_nonstream_usage(Protocol::AnthropicMessages, &value);
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cached_tokens, 880);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(usage.total(), 1040);
+    }
+
+    #[test]
+    fn responses_usage_reads_cached_input_details() {
+        let value = json!({
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 25,
+                "total_tokens": 525,
+                "input_tokens_details": {"cached_tokens": 400}
+            }
+        });
+        let usage = extract_nonstream_usage(Protocol::OpenAiResponses, &value);
+        assert_eq!(usage.cached_tokens, 400);
+        assert_eq!(usage.total(), 525);
+    }
+
+    #[test]
+    fn every_ingress_upstream_pair_converts() {
+        let protocols = [
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+        ];
+        let ingress_body = |protocol: Protocol| match protocol {
+            Protocol::OpenAiChat => json!({
+                "model": "client",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16
+            }),
+            Protocol::AnthropicMessages => json!({
+                "model": "client",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16
+            }),
+            Protocol::OpenAiResponses => json!({
+                "model": "client",
+                "input": "hi",
+                "max_output_tokens": 16
+            }),
+        };
+        let ingress = |protocol: Protocol| match protocol {
+            Protocol::OpenAiChat => Ingress::Chat,
+            Protocol::AnthropicMessages => Ingress::Anthropic,
+            Protocol::OpenAiResponses => Ingress::Responses,
+        };
+        let upstream_response = |protocol: Protocol| match protocol {
+            Protocol::OpenAiChat => json!({
+                "id": "chatcmpl-x",
+                "object": "chat.completion",
+                "model": "up",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+            Protocol::AnthropicMessages => json!({
+                "id": "msg_x",
+                "type": "message",
+                "role": "assistant",
+                "model": "up",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+            Protocol::OpenAiResponses => json!({
+                "id": "resp_x",
+                "object": "response",
+                "model": "up",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_x",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            }),
+        };
+
+        for client in protocols {
+            for upstream in protocols {
+                let body = ingress_body(client);
+                let converted = build_upstream_body(ingress(client), upstream, &body, "up")
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "request conversion {} -> {} failed: {err}",
+                            client.label(),
+                            upstream.label()
+                        )
+                    });
+                assert_eq!(converted["model"], "up");
+
+                let response = upstream_response(upstream);
+                convert_nonstream_response(ingress(client), upstream, response, "client")
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "response conversion {} -> {} failed: {err}",
+                            upstream.label(),
+                            client.label()
+                        )
+                    });
+            }
+        }
+    }
+
+    #[test]
+    fn chat_stream_from_responses_events() {
+        let mut translator =
+            StreamTranslator::new(Protocol::OpenAiChat, Protocol::OpenAiResponses, "client");
+        let start = SseEvent {
+            event: Some("response.created".into()),
+            data:
+                json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress"}})
+                    .to_string(),
+        };
+        translator.translate(&start);
+        let delta = SseEvent {
+            event: Some("response.output_text.delta".into()),
+            data: json!({
+                "type": "response.output_text.delta",
+                "delta": "hello"
+            })
+            .to_string(),
+        };
+        let frames = translator.translate(&delta);
+        assert!(frames.iter().any(|frame| frame.contains("hello")));
+    }
 
     #[test]
     fn chat_to_anthropic_keeps_system_and_tools() {

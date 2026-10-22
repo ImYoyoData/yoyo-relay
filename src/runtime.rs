@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::balance;
 use crate::config::{now_ts, AppConfig, BalanceMode, ConfigStore};
-use crate::db::{self, Db};
+use crate::db::{self, Db, UsageFilter};
 use crate::gateway::Gateway;
 use crate::probe::{self, TestLevel, TestResult};
 use crate::scheduler::{AccountState as SchedState, Scheduler};
@@ -33,8 +33,16 @@ pub enum UiCommand {
     SetUsageFilter {
         local_key: Option<String>,
     },
+    SetCallsPage(usize),
+    SetCallsFilter(UsageFilter),
+    DeleteUsage(i64),
+    ClearUsage,
     TestProvider(String),
     TestAccount(String),
+    /// Measure decode throughput for one account.
+    SpeedTestAccount(String),
+    /// Measure decode throughput for every enabled account of a provider.
+    SpeedTestProvider(String),
     TestAccountDraft {
         provider_id: String,
         name: String,
@@ -53,6 +61,10 @@ pub enum UiCommand {
         manual: bool,
     },
     RefreshBalance(Option<String>),
+    /// Check GitHub for a new release. `manual` surfaces failures as notices.
+    CheckUpdate {
+        manual: bool,
+    },
     CleanupNow,
     Shutdown,
 }
@@ -110,6 +122,8 @@ struct Shared {
     provider_models: Mutex<HashMap<String, ProviderModelsView>>,
     models_fetching: Mutex<HashSet<String>>,
     fx_refreshing: AtomicBool,
+    update_checking: AtomicBool,
+    update_error: Mutex<Option<String>>,
     warnings: Mutex<Vec<String>>,
 }
 
@@ -128,6 +142,8 @@ impl Shared {
             provider_models: Mutex::new(HashMap::new()),
             models_fetching: Mutex::new(HashSet::new()),
             fx_refreshing: AtomicBool::new(false),
+            update_checking: AtomicBool::new(false),
+            update_error: Mutex::new(None),
             warnings: Mutex::new(warnings),
         }
     }
@@ -233,6 +249,8 @@ pub struct Runtime {
     snapshot_tx: std::sync::mpsc::Sender<Arc<UiSnapshot>>,
     proxy: Option<ProxyHandle>,
     usage: UsageParams,
+    calls_page: usize,
+    calls_filter: UsageFilter,
     last_probe_check: Instant,
     last_balance_refresh: Instant,
     last_fx_refresh: Instant,
@@ -275,6 +293,8 @@ impl Runtime {
                 last_built: None,
                 view: UsageView::default(),
             },
+            calls_page: 0,
+            calls_filter: UsageFilter::default(),
             last_probe_check: Instant::now(),
             last_balance_refresh: Instant::now() - Duration::from_secs(3600),
             // Refresh rates on the first periodic tick so a fresh install gets
@@ -287,8 +307,12 @@ impl Runtime {
     async fn run(mut self) {
         self.start_proxy().await;
         self.emit_snapshot();
-        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        // Emit twice as often while requests are in flight so the live
+        // tokens-per-second badge stays responsive; fall back to a slower
+        // cadence when idle to keep the aggregation queries cheap.
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut idle_ticks: u8 = 0;
         loop {
             tokio::select! {
                 cmd = self.cmd_rx.recv() => {
@@ -304,6 +328,13 @@ impl Runtime {
                     }
                 }
                 _ = tick.tick() => {
+                    let busy = self.gateway.queue_depth().0 > 0
+                        || self.gateway.speed.tokens_per_sec() > 0.0;
+                    idle_ticks = if busy { 0 } else { idle_ticks.saturating_add(1) };
+                    if !busy && idle_ticks % 2 == 0 {
+                        // Skip the expensive snapshot on alternate idle ticks.
+                        continue;
+                    }
                     self.periodic().await;
                     if !self.emit_snapshot() {
                         break;
@@ -387,8 +418,38 @@ impl Runtime {
                     self.usage.last_built = None;
                 }
             }
+            UiCommand::SetCallsPage(page) => {
+                self.calls_page = page;
+            }
+            UiCommand::SetCallsFilter(filter) => {
+                if self.calls_filter != filter {
+                    self.calls_filter = filter;
+                    self.calls_page = 0;
+                }
+            }
+            UiCommand::DeleteUsage(id) => match self.db.delete_usage(id) {
+                Ok(true) => self
+                    .shared
+                    .push_notice(NoticeLevel::Success, "调用记录已删除。"),
+                Ok(false) => self
+                    .shared
+                    .push_notice(NoticeLevel::Info, "记录不存在或已被清理。"),
+                Err(err) => self
+                    .shared
+                    .push_notice(NoticeLevel::Error, format!("删除记录失败：{err}")),
+            },
+            UiCommand::ClearUsage => match self.db.clear_usage() {
+                Ok(n) => self
+                    .shared
+                    .push_notice(NoticeLevel::Success, format!("已清空 {n} 条调用明细。")),
+                Err(err) => self
+                    .shared
+                    .push_notice(NoticeLevel::Error, format!("清空失败：{err}")),
+            },
             UiCommand::TestProvider(id) => self.spawn_test("provider", id),
             UiCommand::TestAccount(id) => self.spawn_test("account", id),
+            UiCommand::SpeedTestAccount(id) => self.spawn_speed_test("account", id),
+            UiCommand::SpeedTestProvider(id) => self.spawn_speed_test("provider", id),
             UiCommand::TestAccountDraft {
                 provider_id,
                 name,
@@ -405,6 +466,7 @@ impl Runtime {
             UiCommand::FetchProviderModels(provider_id) => self.spawn_model_list_fetch(provider_id),
             UiCommand::RefreshFxRates { manual } => self.spawn_fx_refresh(manual),
             UiCommand::RefreshBalance(only) => self.spawn_balance_refresh(only, true),
+            UiCommand::CheckUpdate { manual } => self.spawn_update_check(manual),
             UiCommand::CleanupNow => match self.db.cleanup(self.gateway.config().ui.retention_days)
             {
                 Ok(n) => self.shared.push_notice(
@@ -533,6 +595,14 @@ impl Runtime {
             self.spawn_balance_refresh(None, false);
         }
 
+        let update_interval = Duration::from_secs(cfg.ui.update_check_hours.max(1) * 3600);
+        if cfg.ui.auto_update_check
+            && (now - cfg.ui.update_checked_at) >= update_interval.as_secs() as i64
+            && !self.shared.update_checking.load(Ordering::SeqCst)
+        {
+            self.spawn_update_check(false);
+        }
+
         let fx_interval = Duration::from_secs(cfg.ui.fx_refresh_hours.max(1) * 3600);
         if cfg.ui.fx_auto
             && self.last_fx_refresh.elapsed() >= fx_interval
@@ -584,11 +654,32 @@ impl Runtime {
                         detail: String::new(),
                         models: Vec::new(),
                         tokens: None,
+                        tokens_per_sec: None,
+                        first_token_ms: None,
                         at: now_ts(),
                     };
                     r.level = TestLevel::Error;
                     r
                 }
+            };
+            shared.set_running(&key, false);
+            shared.insert_test(result);
+        });
+    }
+
+    fn spawn_speed_test(&self, kind: &str, id: String) {
+        let key = format!("speed:{id}");
+        if self.shared.is_running(&key) {
+            return;
+        }
+        self.shared.set_running(&key, true);
+        let gateway = self.gateway.clone();
+        let shared = self.shared.clone();
+        let kind = kind.to_string();
+        tokio::spawn(async move {
+            let result = match kind.as_str() {
+                "provider" => probe::test_speed_provider(&gateway, &id).await,
+                _ => probe::test_speed_account(&gateway, &id, None).await,
             };
             shared.set_running(&key, false);
             shared.insert_test(result);
@@ -706,6 +797,67 @@ impl Runtime {
             if let Ok(mut fetching) = shared.models_fetching.lock() {
                 fetching.remove(&provider_id);
             }
+        });
+    }
+
+    fn spawn_update_check(&self, manual: bool) {
+        if self.shared.update_checking.swap(true, Ordering::SeqCst) {
+            if manual {
+                self.shared
+                    .push_notice(NoticeLevel::Info, "更新检查已在进行中。");
+            }
+            return;
+        }
+        let gateway = self.gateway.clone();
+        let shared = self.shared.clone();
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            let client = gateway.client_for("https://api.github.com").clone();
+            let result = crate::update::fetch_latest_release(&client).await;
+            match result {
+                Ok(release) => {
+                    let current = env!("CARGO_PKG_VERSION");
+                    let newer = crate::update::is_newer(&release.version, current);
+                    let mut cfg = (*gateway.config()).clone();
+                    cfg.ui.update_latest_version = release.version.clone();
+                    cfg.ui.update_latest_url = release.url.clone();
+                    cfg.ui.update_latest_notes = release.notes.clone();
+                    cfg.ui.update_checked_at = now_ts();
+                    if let Err(err) = store.save(&mut cfg) {
+                        shared.push_notice(NoticeLevel::Error, format!("更新信息保存失败：{err}"));
+                    } else {
+                        gateway.update_config(Arc::new(cfg));
+                    }
+                    if let Ok(mut slot) = shared.update_error.lock() {
+                        *slot = None;
+                    }
+                    if manual {
+                        if newer {
+                            shared.push_notice(
+                                NoticeLevel::Success,
+                                format!(
+                                    "发现新版本 v{}（当前 v{current}），可在标题栏查看。",
+                                    release.version
+                                ),
+                            );
+                        } else {
+                            shared.push_notice(
+                                NoticeLevel::Info,
+                                format!("当前已是最新版本 v{current}。"),
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut slot) = shared.update_error.lock() {
+                        *slot = Some(format!("{err:#}"));
+                    }
+                    if manual {
+                        shared.push_notice(NoticeLevel::Warning, format!("检查更新失败：{err:#}"));
+                    }
+                }
+            }
+            shared.update_checking.store(false, Ordering::SeqCst);
         });
     }
 
@@ -944,6 +1096,27 @@ impl Runtime {
         }
 
         let usage = self.build_usage(&cfg);
+        const CALLS_PAGE_SIZE: usize = 20;
+        let calls_total = self.db.usage_count(&self.calls_filter).unwrap_or(0);
+        let max_page = ((calls_total as usize).saturating_sub(1)) / CALLS_PAGE_SIZE;
+        if self.calls_page > max_page {
+            self.calls_page = max_page;
+        }
+        let calls_rows = self
+            .db
+            .usage_page(
+                &self.calls_filter,
+                self.calls_page * CALLS_PAGE_SIZE,
+                CALLS_PAGE_SIZE,
+            )
+            .unwrap_or_default();
+        let calls = CallsView {
+            rows: calls_rows,
+            total: calls_total,
+            page: self.calls_page,
+            page_size: CALLS_PAGE_SIZE,
+            filter: self.calls_filter.clone(),
+        };
         let recent = self.db.recent_requests(40).unwrap_or_default();
 
         let notices = self
@@ -1043,12 +1216,14 @@ impl Runtime {
             breaker,
             active_requests,
             queued_requests,
+            tokens_per_sec: self.gateway.speed.tokens_per_sec(),
             providers,
             accounts,
             route_groups,
             local_keys,
             balances,
             usage,
+            calls,
             recent,
             tests,
             running_tests,
@@ -1075,6 +1250,27 @@ impl Runtime {
                 .lock()
                 .map(|set| set.clone())
                 .unwrap_or_default(),
+            update: UpdateView {
+                current: env!("CARGO_PKG_VERSION").to_string(),
+                latest: cfg.ui.update_latest_version.clone(),
+                url: cfg.ui.update_latest_url.clone(),
+                notes: cfg.ui.update_latest_notes.clone(),
+                checked_at: cfg.ui.update_checked_at,
+                available: !cfg.ui.update_latest_version.is_empty()
+                    && crate::update::is_newer(
+                        &cfg.ui.update_latest_version,
+                        env!("CARGO_PKG_VERSION"),
+                    ),
+                dismissed: crate::update::normalize_version(&cfg.ui.update_dismissed_version)
+                    == crate::update::normalize_version(&cfg.ui.update_latest_version),
+                checking: self.shared.update_checking.load(Ordering::SeqCst),
+                error: self
+                    .shared
+                    .update_error
+                    .lock()
+                    .map(|slot| slot.clone())
+                    .unwrap_or(None),
+            },
             fx_rates: cfg.ui.fx_rates.clone(),
             fx_updated_at: cfg.ui.fx_updated_at,
             fx_source: cfg.ui.fx_source.clone(),
@@ -1195,6 +1391,17 @@ impl Runtime {
                     }
                     previous_protocol = Some((protocol.label().to_string(), route.mode));
                 }
+                let pricing = route.effective_pricing();
+                let price_label = if pricing.is_zero() {
+                    String::new()
+                } else {
+                    format!(
+                        "{} {} / {} 每 Mtok",
+                        pricing.currency.symbol(),
+                        format_price_value(pricing.base.input_per_mtok),
+                        format_price_value(pricing.base.output_per_mtok)
+                    )
+                };
                 rows.push(RouteRowView {
                     route_id: route.id.clone(),
                     provider_id: provider.id.clone(),
@@ -1209,6 +1416,8 @@ impl Runtime {
                     warning,
                     enabled: route.enabled,
                     fallback: false,
+                    price_label,
+                    price_periods: pricing.periods.len(),
                 });
             }
             let mut notes = Vec::new();
@@ -1319,6 +1528,17 @@ impl Runtime {
             bucket_secs: bucket,
         };
         self.usage.view.clone()
+    }
+}
+
+/// Compact price rendering for route rows.
+fn format_price_value(value: f64) -> String {
+    if value == 0.0 {
+        "0".to_string()
+    } else if value >= 1.0 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.4}")
     }
 }
 

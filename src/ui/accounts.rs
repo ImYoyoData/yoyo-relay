@@ -178,6 +178,13 @@ impl App {
         let state_icon = state_icon(&state);
         let test_key = format!("account:{}", account.id);
         let running = self.snapshot.running_tests.contains(&test_key);
+        let speed_key = format!("speed:{}", account.id);
+        let speed_running = self.snapshot.running_tests.contains(&speed_key);
+        let speed = self
+            .snapshot
+            .tests
+            .get(&speed_key)
+            .and_then(|result| result.tokens_per_sec);
         let mut action: Option<RowAction> = None;
         egui::Frame::new()
             .fill(theme::subtle_fill(ui))
@@ -288,6 +295,23 @@ impl App {
                         {
                             action = Some(RowAction::Test(account.id.clone()));
                         }
+                        if super::kit::icon_button(
+                            ui,
+                            if speed_running {
+                                icons::SPINNER
+                            } else {
+                                icons::GAUGE
+                            },
+                            "测速：测量该账号的生成速度（tok/s）",
+                        )
+                        .clicked()
+                            && !speed_running
+                        {
+                            action = Some(RowAction::SpeedTest(account.id.clone()));
+                        }
+                        if let Some(tps) = speed {
+                            super::kit::badge(ui, &format!("{tps:.0} tok/s"), theme::GREEN);
+                        }
                         if !running {
                             widgets::test_badge(ui, &self.snapshot, &test_key);
                         }
@@ -353,6 +377,7 @@ impl App {
             });
         match action {
             Some(RowAction::Test(id)) => self.start_test("account", &id),
+            Some(RowAction::SpeedTest(id)) => self.start_test("speed_account", &id),
             Some(RowAction::Edit(id)) => self.open_edit_account(&id),
             Some(RowAction::Toggle(id, enabled)) => self.set_account_enabled(&id, enabled),
             Some(RowAction::Delete(id)) => self.confirm = Some(ConfirmAction::DeleteAccount(id)),
@@ -382,6 +407,7 @@ impl App {
 
 enum RowAction {
     Test(String),
+    SpeedTest(String),
     Edit(String),
     Toggle(String, bool),
     Delete(String),

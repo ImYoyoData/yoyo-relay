@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::db::{RecentRequest, SeriesPoint, Totals};
+use crate::db::{RecentRequest, SeriesPoint, Totals, UsageDetail, UsageFilter};
 use crate::probe::TestResult;
 use crate::scheduler::{AccountState, BreakerSnapshot, QuotaSnapshot};
 
@@ -85,6 +85,20 @@ pub enum AlertLevel {
 pub struct Alert {
     pub level: AlertLevel,
     pub text: String,
+}
+
+/// Cached release lookup result shown in the title bar and update modal.
+#[derive(Clone, Debug, Default)]
+pub struct UpdateView {
+    pub current: String,
+    pub latest: String,
+    pub url: String,
+    pub notes: String,
+    pub checked_at: i64,
+    pub available: bool,
+    pub dismissed: bool,
+    pub checking: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -197,6 +211,10 @@ pub struct RouteRowView {
     pub warning: Option<String>,
     pub enabled: bool,
     pub fallback: bool,
+    /// Price summary such as `¥ 2.00 / 8.00 每 Mtok`; empty when unpriced.
+    pub price_label: String,
+    /// Number of peak/off-peak windows, 0 when the route uses a flat price.
+    pub price_periods: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +230,16 @@ pub struct UsageGroupView {
     pub key: String,
     pub label: String,
     pub totals: Totals,
+}
+
+/// One page of the call-detail table.
+#[derive(Clone, Debug, Default)]
+pub struct CallsView {
+    pub rows: Vec<UsageDetail>,
+    pub total: u64,
+    pub page: usize,
+    pub page_size: usize,
+    pub filter: UsageFilter,
 }
 
 #[derive(Clone, Debug)]
@@ -285,12 +313,16 @@ pub struct UiSnapshot {
     pub breaker: BreakerSnapshot,
     pub active_requests: usize,
     pub queued_requests: usize,
+    /// Live completion throughput over the last few seconds.
+    pub tokens_per_sec: f64,
+    pub update: UpdateView,
     pub providers: Vec<ProviderHealth>,
     pub accounts: Vec<AccountView>,
     pub route_groups: Vec<RouteGroupView>,
     pub local_keys: Vec<LocalKeyView>,
     pub balances: Vec<BalanceView>,
     pub usage: UsageView,
+    pub calls: CallsView,
     pub recent: Vec<RecentRequest>,
     pub tests: HashMap<String, TestResult>,
     pub running_tests: HashSet<String>,
@@ -327,12 +359,15 @@ impl Default for UiSnapshot {
             },
             active_requests: 0,
             queued_requests: 0,
+            tokens_per_sec: 0.0,
+            update: UpdateView::default(),
             providers: Vec::new(),
             accounts: Vec::new(),
             route_groups: Vec::new(),
             local_keys: Vec::new(),
             balances: Vec::new(),
             usage: UsageView::default(),
+            calls: CallsView::default(),
             recent: Vec::new(),
             tests: HashMap::new(),
             running_tests: HashSet::new(),
