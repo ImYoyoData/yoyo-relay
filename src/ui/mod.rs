@@ -260,6 +260,11 @@ pub struct App {
     pub(crate) last_dark: Option<bool>,
     pub(crate) closing: bool,
     pub(crate) last_zoom: f32,
+    pub(crate) signals: Arc<crate::instance::Signals>,
+    pub(crate) tray: Option<crate::tray::Tray>,
+    pub(crate) tray_ready: bool,
+    pub(crate) ctx_attached: bool,
+    pub(crate) native_attached: bool,
 }
 
 impl App {
@@ -270,6 +275,7 @@ impl App {
         cmd_tx: mpsc::UnboundedSender<UiCommand>,
         snap_rx: std::sync::mpsc::Receiver<Arc<UiSnapshot>>,
         initial_page: Page,
+        signals: Arc<crate::instance::Signals>,
     ) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         let show_onboarding = !config.ui.onboarding_done && config.providers.is_empty();
@@ -315,6 +321,11 @@ impl App {
             last_dark: None,
             closing: false,
             last_zoom: 1.0,
+            signals,
+            tray: None,
+            tray_ready: false,
+            ctx_attached: false,
+            native_attached: false,
         };
         #[cfg(debug_assertions)]
         if let Ok(tab) = std::env::var("YOYO_RELAY_SETTINGS_TAB") {
@@ -427,6 +438,29 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
+    pub(crate) fn show_window(&mut self, ctx: &egui::Context) {
+        self.closing = false;
+        self.startup_minimize_at = None;
+        self.signals.mark_hidden(false);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Closing with "close to tray" enabled removes the window and its taskbar
+    /// entry; the tray menu (or a second launch) brings it back.
+    pub(crate) fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        // Hiding natively is only safe to restore on Windows: there a hidden
+        // window ignores redraw requests, but Win32 can reveal it directly.
+        // Other platforms fall back to a taskbar minimize.
+        self.signals.mark_hidden(true);
+        if self.tray.is_some() && cfg!(windows) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+    }
+
     fn poll_snapshot(&mut self, ctx: &egui::Context) {
         let mut latest = None;
         while let Ok(snapshot) = self.snap_rx.try_recv() {
@@ -454,8 +488,7 @@ impl App {
         if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
             if self.config.ui.close_to_tray {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                self.toast(NoticeLevel::Info, "窗口已最小化，代理将继续在后台运行。");
+                self.hide_to_tray(ctx);
             } else {
                 self.closing = true;
                 let _ = self.cmd_tx.send(UiCommand::Shutdown);
@@ -604,15 +637,17 @@ impl App {
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let close_hint = if self.config.ui.close_to_tray {
-                                    "最小化到任务栏"
+                                    if cfg!(windows) {
+                                        "隐藏到系统托盘"
+                                    } else {
+                                        "最小化到任务栏"
+                                    }
                                 } else {
                                     "退出 YoyoRelay"
                                 };
                                 if kit::window_button(ui, icons::X, close_hint, true).clicked() {
                                     if self.config.ui.close_to_tray {
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(
-                                            true,
-                                        ));
+                                        self.hide_to_tray(ctx);
                                     } else {
                                         self.quit(ctx);
                                     }
@@ -637,6 +672,7 @@ impl App {
                                 }
                                 if kit::window_button(ui, icons::MINUS, "最小化", false).clicked()
                                 {
+                                    self.signals.mark_hidden(true);
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                                 }
                                 ui.add_space(4.0);
@@ -1168,7 +1204,39 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let _ = &frame;
+        if !self.ctx_attached {
+            self.signals.attach(ctx);
+            self.signals.attach_quit(self.cmd_tx.clone());
+            self.ctx_attached = true;
+        }
+        if !self.native_attached {
+            #[cfg(windows)]
+            {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = frame.window_handle() {
+                    if let RawWindowHandle::Win32(win) = handle.as_raw() {
+                        self.signals.attach_window(win.hwnd.get() as isize);
+                    }
+                }
+            }
+            self.native_attached = true;
+        }
+        if !self.tray_ready {
+            // Deferred until the first frame: macOS needs the event loop to be
+            // running before the status item is created.
+            self.tray = crate::tray::install(self.signals.clone());
+            self.tray_ready = true;
+        }
+        if self.signals.take_quit() {
+            self.quit(ctx);
+        } else if self.signals.take_show() {
+            self.show_window(ctx);
+        }
+        if !ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            self.signals.mark_hidden(false);
+        }
         self.poll_snapshot(ctx);
         self.apply_theme(ctx);
         self.sync_autostart();
@@ -1177,7 +1245,7 @@ impl eframe::App for App {
             let now = Instant::now();
             if now >= at {
                 self.startup_minimize_at = None;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                self.hide_to_tray(ctx);
             } else {
                 ctx.request_repaint_after(at - now);
             }

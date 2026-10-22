@@ -22,39 +22,50 @@ impl App {
         );
 
         let mut switch_tab = None;
+        let total_width = ui.available_width();
+        let tab_width = 196.0_f32.min((total_width * 0.3).max(150.0));
+        let content_width = (total_width - tab_width - 14.0).max(240.0);
         ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(Vec2::new(196.0, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(196.0);
-                kit::surface(ui, |ui| {
-                    for tab in SettingsTab::all() {
-                        if kit::nav_item(
-                            ui,
-                            tab.icon(),
-                            tab.label(),
-                            self.settings_tab == tab,
-                            None,
-                        )
-                        .clicked()
-                        {
-                            switch_tab = Some(tab);
+            ui.allocate_ui_with_layout(
+                Vec2::new(tab_width, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(tab_width);
+                    kit::surface(ui, |ui| {
+                        for tab in SettingsTab::all() {
+                            if kit::nav_item(
+                                ui,
+                                tab.icon(),
+                                tab.label(),
+                                self.settings_tab == tab,
+                                None,
+                            )
+                            .clicked()
+                            {
+                                switch_tab = Some(tab);
+                            }
+                            ui.add_space(2.0);
                         }
-                        ui.add_space(2.0);
-                    }
-                });
-            });
+                    });
+                },
+            );
             ui.add_space(14.0);
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width());
-                match self.settings_tab {
-                    SettingsTab::General => self.settings_general(ui),
-                    SettingsTab::Proxy => self.settings_proxy(ui),
-                    SettingsTab::Scheduler => self.settings_scheduler(ui),
-                    SettingsTab::Security => self.settings_security(ui),
-                    SettingsTab::Data => self.settings_data(ui),
-                    SettingsTab::About => self.settings_about(ui),
-                }
-                ui.add_space(24.0);
-            });
+            ui.allocate_ui_with_layout(
+                Vec2::new(content_width, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(content_width);
+                    match self.settings_tab {
+                        SettingsTab::General => self.settings_general(ui),
+                        SettingsTab::Proxy => self.settings_proxy(ui),
+                        SettingsTab::Scheduler => self.settings_scheduler(ui),
+                        SettingsTab::Security => self.settings_security(ui),
+                        SettingsTab::Data => self.settings_data(ui),
+                        SettingsTab::About => self.settings_about(ui),
+                    }
+                    ui.add_space(24.0);
+                },
+            );
         });
         if let Some(tab) = switch_tab {
             self.settings_tab = tab;
@@ -67,6 +78,16 @@ impl App {
         let mut changed = false;
         let mut manage_keys = false;
         let mut test_key = false;
+        let close_label = if cfg!(windows) {
+            "关闭窗口时隐藏到托盘"
+        } else {
+            "关闭窗口时最小化"
+        };
+        let close_desc = if cfg!(windows) {
+            "点击关闭按钮时把窗口和任务栏图标一起隐藏，代理继续运行；托盘菜单可重新打开或退出"
+        } else {
+            "当前平台会最小化到任务栏；托盘菜单仍可退出应用"
+        };
 
         kit::section_card(
             ui,
@@ -91,30 +112,24 @@ impl App {
                 setting_row(
                     ui,
                     icons::APP_WINDOW,
-                    "启动时最小化",
-                    "启动后不显示主窗口，代理继续在后台运行；适合配合开机自启",
+                    "启动时最小化到托盘",
+                    "启动后不显示主窗口，直接驻留系统托盘，代理在后台运行；适合配合开机自启",
                     |ui| {
                         if kit::toggle_switch(ui, &mut self.config.ui.start_minimized).changed() {
                             changed = true;
                         }
                     },
                 );
-                setting_row(
-                    ui,
-                    icons::X,
-                    "关闭窗口时最小化",
-                    "点击关闭按钮时隐藏窗口并保持代理运行，而不是直接退出",
-                    |ui| {
-                        if kit::toggle_switch(ui, &mut self.config.ui.close_to_tray).changed() {
-                            changed = true;
-                        }
-                    },
-                );
+                setting_row(ui, icons::X, close_label, close_desc, |ui| {
+                    if kit::toggle_switch(ui, &mut self.config.ui.close_to_tray).changed() {
+                        changed = true;
+                    }
+                });
                 setting_row_last(
                     ui,
                     icons::BROWSER,
                     "任务栏显示请求信息",
-                    "窗口标题与任务栏悬停提示显示活跃请求、今日 Token 与代理状态",
+                    "窗口标题显示活跃请求、今日 Token 与代理状态，悬停任务栏按钮即可查看",
                     |ui| {
                         if kit::toggle_switch(ui, &mut self.config.ui.show_taskbar_stats).changed()
                         {
@@ -126,7 +141,11 @@ impl App {
                 kit::info_row(
                     ui,
                     icons::INFO,
-                    "系统托盘图标将在后续版本提供；当前最小化会保留任务栏入口，代理持续运行。",
+                    if cfg!(windows) {
+                        "托盘图标始终使用 YoyoRelay 标志：左键单击恢复主窗口，右键菜单提供「显示主窗口」与「退出」。重复启动程序会直接唤出已有窗口，不会报错。"
+                    } else {
+                        "托盘图标始终使用 YoyoRelay 标志，右键菜单可显示主窗口或退出。重复启动程序会直接唤出已有窗口，不会报错。"
+                    },
                 );
             },
         );
@@ -142,7 +161,7 @@ impl App {
             },
             |ui| {
                 ui.horizontal(|ui| {
-                    setting_label(ui, icons::MOON, "主题", "浅色、深色或跟随系统");
+                    setting_label(ui, icons::MOON, "主题");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let mut theme_mode = self.config.ui.theme;
                         if let Some(mode) = kit::segmented(
@@ -163,14 +182,10 @@ impl App {
                         }
                     });
                 });
+                setting_desc(ui, "浅色、深色或跟随系统");
                 kit::divider(ui);
                 ui.horizontal(|ui| {
-                    setting_label(
-                        ui,
-                        icons::ARROWS_OUT,
-                        "界面缩放",
-                        "自动按显示器 DPI 调整；窗口过密时可手动降低",
-                    );
+                    setting_label(ui, icons::ARROWS_OUT, "界面缩放");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let current = if self.config.ui.ui_scale <= 0.05 {
                             0.0
@@ -194,6 +209,7 @@ impl App {
                         }
                     });
                 });
+                setting_desc(ui, "自动按显示器 DPI 调整；窗口过密时可手动降低");
                 kit::divider(ui);
                 setting_row(
                     ui,
@@ -207,12 +223,7 @@ impl App {
                     },
                 );
                 ui.horizontal(|ui| {
-                    setting_label(
-                        ui,
-                        icons::WARNING_CIRCLE,
-                        "低余额阈值",
-                        "低于该值时在概览与余额页提示",
-                    );
+                    setting_label(ui, icons::WARNING_CIRCLE, "低余额阈值");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(
@@ -227,13 +238,9 @@ impl App {
                         }
                     });
                 });
+                setting_desc(ui, "低于该值时在概览与余额页提示");
                 ui.horizontal(|ui| {
-                    setting_label(
-                        ui,
-                        icons::ARROWS_CLOCKWISE,
-                        "余额刷新间隔",
-                        "自动查询余额的频率",
-                    );
+                    setting_label(ui, icons::ARROWS_CLOCKWISE, "余额刷新间隔");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(
@@ -247,6 +254,7 @@ impl App {
                         }
                     });
                 });
+                setting_desc(ui, "自动查询余额的频率");
             },
         );
         ui.add_space(12.0);
@@ -639,12 +647,7 @@ impl App {
             },
             |ui| {
                 ui.horizontal(|ui| {
-                    setting_label(
-                        ui,
-                        icons::CALENDAR,
-                        "用量保留",
-                        "超过该天数的请求记录会定期清理",
-                    );
+                    setting_label(ui, icons::CALENDAR, "用量保留");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui
                             .add(
@@ -658,6 +661,7 @@ impl App {
                         }
                     });
                 });
+                setting_desc(ui, "超过该天数的请求记录会定期清理");
                 kit::divider(ui);
                 path_row(ui, icons::FOLDER, "配置目录", &config_dir, &mut copy_config);
                 path_row(ui, icons::DATABASE, "数据库", &db_path, &mut copy_db);
@@ -857,24 +861,28 @@ impl App {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn setting_label(ui: &mut Ui, icon: &str, title: &str, desc: &str) {
+fn setting_label(ui: &mut Ui, icon: &str, title: &str) {
     let t = theme::tokens(ui);
     kit::icon_chip(ui, icon, t.primary, 30.0);
     ui.add_space(2.0);
-    ui.vertical(|ui| {
-        ui.label(RichText::new(title).size(12.0).strong().color(t.text));
-        ui.label(RichText::new(desc).size(9.5).color(t.muted));
-    });
+    ui.label(RichText::new(title).size(12.0).strong().color(t.text));
+}
+
+fn setting_desc(ui: &mut Ui, desc: &str) {
+    let t = theme::tokens(ui);
+    ui.add(egui::Label::new(RichText::new(desc).size(9.5).color(t.muted)).wrap());
 }
 
 fn setting_row(ui: &mut Ui, icon: &str, title: &str, desc: &str, control: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
-        setting_label(ui, icon, title, desc);
+        setting_label(ui, icon, title);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.set_height(30.0);
             control(ui);
         });
     });
+    setting_desc(ui, desc);
+    ui.add_space(4.0);
     kit::divider(ui);
 }
 
@@ -886,12 +894,13 @@ fn setting_row_last(
     control: impl FnOnce(&mut Ui),
 ) {
     ui.horizontal(|ui| {
-        setting_label(ui, icon, title, desc);
+        setting_label(ui, icon, title);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.set_height(30.0);
             control(ui);
         });
     });
+    setting_desc(ui, desc);
 }
 
 fn path_row(ui: &mut Ui, icon: &str, label: &str, value: &str, copied: &mut bool) {
