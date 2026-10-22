@@ -1,0 +1,957 @@
+//! Provider / account / route / local-key test probes.
+//!
+//! These are diagnostics only: they never write to the usage database.
+
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::config::{now_ts, Account, Protocol, Provider};
+use crate::gateway::{apply_auth, readable_reqwest_error, upstream_error_message, Gateway};
+use crate::protocol::{
+    build_upstream_body, extract_nonstream_usage, route_supports_ingress, Ingress,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestLevel {
+    Success,
+    Warning,
+    AuthFailed,
+    RateLimited,
+    Unreachable,
+    Error,
+}
+
+impl TestLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            TestLevel::Success => "可用",
+            TestLevel::Warning => "警告",
+            TestLevel::AuthFailed => "鉴权失败",
+            TestLevel::RateLimited => "限流",
+            TestLevel::Unreachable => "不可达",
+            TestLevel::Error => "失败",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TestResult {
+    pub key: String,
+    pub kind: String,
+    pub title: String,
+    pub level: TestLevel,
+    pub status: Option<u16>,
+    pub latency_ms: u64,
+    pub message: String,
+    pub detail: String,
+    pub models: Vec<String>,
+    pub tokens: Option<u64>,
+    pub at: i64,
+}
+
+impl TestResult {
+    fn new(key: &str, kind: &str, title: &str) -> Self {
+        Self {
+            key: key.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            level: TestLevel::Error,
+            status: None,
+            latency_ms: 0,
+            message: String::new(),
+            detail: String::new(),
+            models: Vec::new(),
+            tokens: None,
+            at: now_ts(),
+        }
+    }
+}
+
+struct ProbeResponse {
+    status: Option<u16>,
+    latency_ms: u64,
+    body: String,
+    error: Option<String>,
+}
+
+async fn send_probe(
+    gw: &Gateway,
+    provider: &Provider,
+    key: &str,
+    method: &str,
+    url: &str,
+    body: Option<&Value>,
+    timeout_secs: u64,
+) -> ProbeResponse {
+    let started = Instant::now();
+    let mut req = if method == "GET" {
+        gw.client_for(url).get(url)
+    } else {
+        gw.http.post(url)
+    };
+    req = req.header(reqwest::header::ACCEPT, "application/json");
+    if let Some(body) = body {
+        req = req
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(body);
+    }
+    req = match apply_auth(req, &provider.auth, key) {
+        Ok(r) => r,
+        Err(err) => {
+            return ProbeResponse {
+                status: None,
+                latency_ms: started.elapsed().as_millis() as u64,
+                body: String::new(),
+                error: Some(format!("鉴权头配置无效：{err}")),
+            }
+        }
+    };
+    for h in &provider.extra_headers {
+        if !h.name.trim().is_empty() {
+            req = req.header(h.name.trim(), h.value.as_str());
+        }
+    }
+    if !provider
+        .extra_headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("anthropic-version"))
+    {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+    let resp = tokio::time::timeout(Duration::from_secs(timeout_secs.max(3)), req.send()).await;
+    match resp {
+        Err(_) => ProbeResponse {
+            status: None,
+            latency_ms: started.elapsed().as_millis() as u64,
+            body: String::new(),
+            error: Some(format!("连接超时（{timeout_secs}s）")),
+        },
+        Ok(Err(err)) => ProbeResponse {
+            status: None,
+            latency_ms: started.elapsed().as_millis() as u64,
+            body: String::new(),
+            error: Some(readable_reqwest_error(&err)),
+        },
+        Ok(Ok(resp)) => {
+            let status = resp.status().as_u16();
+            let body = tokio::time::timeout(Duration::from_secs(15), resp.text())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            ProbeResponse {
+                status: Some(status),
+                latency_ms: started.elapsed().as_millis() as u64,
+                body,
+                error: None,
+            }
+        }
+    }
+}
+
+fn parse_models(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn models_endpoint(provider: &Provider) -> String {
+    provider.join_url("models")
+}
+
+fn default_test_model(provider: &Provider) -> String {
+    if let Some(m) = &provider.test_model {
+        if !m.trim().is_empty() {
+            return m.clone();
+        }
+    }
+    match provider.static_protocol {
+        Protocol::AnthropicMessages => "claude-3-5-haiku-20241022".into(),
+        Protocol::OpenAiResponses => "gpt-4o-mini".into(),
+        Protocol::OpenAiChat => "gpt-4o-mini".into(),
+    }
+}
+
+fn minimal_body(protocol: Protocol, model: &str) -> Value {
+    match protocol {
+        Protocol::OpenAiChat => json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "stream": false
+        }),
+        Protocol::AnthropicMessages => json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1
+        }),
+        Protocol::OpenAiResponses => json!({
+            "model": model,
+            "input": "ping",
+            "max_output_tokens": 16,
+            "stream": false
+        }),
+    }
+}
+
+fn minimal_url(provider: &Provider, protocol: Protocol) -> String {
+    let path = match protocol {
+        Protocol::OpenAiChat => "chat/completions",
+        Protocol::AnthropicMessages => "messages",
+        Protocol::OpenAiResponses => "responses",
+    };
+    provider.join_url(path)
+}
+
+async fn probe_credentials(
+    gw: &Gateway,
+    provider: &Provider,
+    key: &str,
+    model_hint: Option<&str>,
+    allow_models_endpoint: bool,
+) -> ProbeResultData {
+    if key.trim().is_empty() && provider.auth.mode != crate::config::AuthMode::None {
+        // Still try: some local gateways don't require auth; report auth failure if rejected.
+    }
+    let timeout = provider.timeout_secs.unwrap_or(15).max(5);
+    let mut detail = String::new();
+    if allow_models_endpoint {
+        let url = models_endpoint(provider);
+        let resp = send_probe(gw, provider, key, "GET", &url, None, timeout).await;
+        detail.push_str(&format!(
+            "GET {url} → {}\n",
+            resp.status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "连接失败".into())
+        ));
+        if let Some(err) = &resp.error {
+            return ProbeResultData {
+                level: TestLevel::Unreachable,
+                status: None,
+                latency_ms: resp.latency_ms,
+                message: err.clone(),
+                detail,
+                models: Vec::new(),
+                tokens: None,
+            };
+        }
+        match resp.status {
+            Some(200) => {
+                let models = parse_models(&resp.body);
+                let message = if models.is_empty() {
+                    "连接成功，鉴权有效（未返回模型列表）".to_string()
+                } else {
+                    format!("连接成功，鉴权有效，返回 {} 个模型", models.len())
+                };
+                detail.push_str(&format!("延迟 {}ms\n", resp.latency_ms));
+                return ProbeResultData {
+                    level: TestLevel::Success,
+                    status: Some(200),
+                    latency_ms: resp.latency_ms,
+                    message,
+                    detail,
+                    models,
+                    tokens: None,
+                };
+            }
+            Some(401) | Some(403) => {
+                return ProbeResultData {
+                    level: TestLevel::AuthFailed,
+                    status: resp.status,
+                    latency_ms: resp.latency_ms,
+                    message: "Key 无效或无权限".into(),
+                    detail,
+                    models: Vec::new(),
+                    tokens: None,
+                };
+            }
+            Some(429) => {
+                return ProbeResultData {
+                    level: TestLevel::RateLimited,
+                    status: resp.status,
+                    latency_ms: resp.latency_ms,
+                    message: "当前被限流，冷却后可恢复".into(),
+                    detail,
+                    models: Vec::new(),
+                    tokens: None,
+                };
+            }
+            Some(404) | Some(405) | None => {
+                detail.push_str("该端点不支持 /models，改用最小请求探测\n");
+            }
+            Some(status) if status >= 500 => {
+                return ProbeResultData {
+                    level: TestLevel::Error,
+                    status: Some(status),
+                    latency_ms: resp.latency_ms,
+                    message: format!("上游服务器错误（HTTP {status}）"),
+                    detail,
+                    models: Vec::new(),
+                    tokens: None,
+                };
+            }
+            Some(_) => {
+                detail.push_str("改用最小请求探测\n");
+            }
+        }
+    }
+
+    let model = model_hint
+        .map(str::to_string)
+        .unwrap_or_else(|| default_test_model(provider));
+    let protocol = provider.protocol_for(&model, None);
+    let body = minimal_body(protocol, &model);
+    let url = minimal_url(provider, protocol);
+    let resp = send_probe(gw, provider, key, "POST", &url, Some(&body), timeout).await;
+    detail.push_str(&format!(
+        "POST {url} → {}\n",
+        resp.status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "连接失败".into())
+    ));
+    if let Some(err) = &resp.error {
+        return ProbeResultData {
+            level: TestLevel::Unreachable,
+            status: None,
+            latency_ms: resp.latency_ms,
+            message: err.clone(),
+            detail,
+            models: Vec::new(),
+            tokens: None,
+        };
+    }
+    let status = resp.status.unwrap_or(0);
+    let usage = serde_json::from_str::<Value>(&resp.body)
+        .map(|v| extract_nonstream_usage(protocol, &v))
+        .ok();
+    match status {
+        200..=299 => {
+            detail.push_str(&format!(
+                "延迟 {}ms\n协议 {}\n模型 {}\n",
+                resp.latency_ms,
+                protocol.label(),
+                model
+            ));
+            if let Some(u) = usage {
+                detail.push_str(&format!(
+                    "消耗 {} tokens（测试请求，不计入额度）\n",
+                    u.total()
+                ));
+            }
+            ProbeResultData {
+                level: TestLevel::Success,
+                status: Some(status),
+                latency_ms: resp.latency_ms,
+                message: format!("可用（HTTP {status}）"),
+                detail,
+                models: Vec::new(),
+                tokens: usage.map(|u| u.total()),
+            }
+        }
+        401 | 403 => ProbeResultData {
+            level: TestLevel::AuthFailed,
+            status: Some(status),
+            latency_ms: resp.latency_ms,
+            message: "Key 无效或无权限".into(),
+            detail,
+            models: Vec::new(),
+            tokens: None,
+        },
+        429 => ProbeResultData {
+            level: TestLevel::RateLimited,
+            status: Some(status),
+            latency_ms: resp.latency_ms,
+            message: "当前被限流，冷却后可恢复".into(),
+            detail,
+            models: Vec::new(),
+            tokens: None,
+        },
+        404 => ProbeResultData {
+            level: TestLevel::Error,
+            status: Some(status),
+            latency_ms: resp.latency_ms,
+            message: format!("模型或路径不存在：{}", upstream_error_message(&resp.body)),
+            detail,
+            models: Vec::new(),
+            tokens: None,
+        },
+        _ => ProbeResultData {
+            level: TestLevel::Error,
+            status: Some(status),
+            latency_ms: resp.latency_ms,
+            message: format!("HTTP {status}：{}", upstream_error_message(&resp.body)),
+            detail,
+            models: Vec::new(),
+            tokens: None,
+        },
+    }
+}
+
+struct ProbeResultData {
+    level: TestLevel,
+    status: Option<u16>,
+    latency_ms: u64,
+    message: String,
+    detail: String,
+    models: Vec<String>,
+    tokens: Option<u64>,
+}
+
+pub async fn test_provider(gw: &Gateway, provider_id: &str) -> TestResult {
+    let cfg = gw.config();
+    let mut result = TestResult::new(&format!("provider:{provider_id}"), "provider", "供应商测试");
+    let Some(provider) = cfg.provider(provider_id).cloned() else {
+        result.message = "供应商不存在".into();
+        return result;
+    };
+    result.title = provider.name.clone();
+
+    let mut accounts = cfg.accounts_of(&provider.id);
+    accounts.retain(|a| a.enabled);
+    accounts.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+    let model_hint = provider.test_model.clone();
+    let mut attempts: Vec<String> = Vec::new();
+    let mut best: Option<ProbeResultData> = None;
+
+    if accounts.is_empty() {
+        let data = probe_credentials(gw, &provider, "", model_hint.as_deref(), true).await;
+        attempts.push(format!("无账号凭据（无鉴权）：{}", data.message));
+        best = Some(data);
+    } else {
+        for account in &accounts {
+            let key = match gw.master.decrypt(&account.api_key) {
+                Ok(k) => k,
+                Err(err) => {
+                    attempts.push(format!("账号「{}」：Key 无法解密（{err}）", account.name));
+                    continue;
+                }
+            };
+            let key_mask = crate::config::mask_secret(&key);
+            let data = probe_credentials(gw, &provider, &key, model_hint.as_deref(), true).await;
+            attempts.push(format!(
+                "账号「{}」({key_mask})：{} — {}",
+                account.name,
+                data.level.label(),
+                data.message
+            ));
+            if data.level == TestLevel::Success {
+                best = Some(data);
+                break;
+            }
+            let rank = |level: TestLevel| match level {
+                TestLevel::Success => 5,
+                TestLevel::Unreachable => 4,
+                TestLevel::Error => 3,
+                TestLevel::AuthFailed => 2,
+                TestLevel::Warning | TestLevel::RateLimited => 1,
+            };
+            if best
+                .as_ref()
+                .map(|current| rank(data.level) > rank(current.level))
+                .unwrap_or(true)
+            {
+                best = Some(data);
+            }
+        }
+    }
+
+    let Some(data) = best else {
+        result.level = TestLevel::Error;
+        result.message = "没有可用的测试凭据".into();
+        result.detail = attempts.join("\n");
+        return result;
+    };
+    result.level = data.level;
+    result.status = data.status;
+    result.latency_ms = data.latency_ms;
+    result.message = data.message;
+    result.models = data.models;
+    result.tokens = data.tokens;
+    result.detail = format!(
+        "供应商: {}\nBase URL: {}\n尝试记录:\n{}\n{}\n延迟: {}ms",
+        provider.name,
+        provider.base_url,
+        attempts.join("\n"),
+        data.detail.trim_end(),
+        data.latency_ms
+    );
+    result
+}
+
+pub async fn test_account(gw: &Gateway, account_id: &str) -> TestResult {
+    let cfg = gw.config();
+    let mut result = TestResult::new(&format!("account:{account_id}"), "account", "账号测试");
+    let Some(account) = cfg.account(account_id).cloned() else {
+        result.message = "账号不存在".into();
+        return result;
+    };
+    result.title = account.name.clone();
+    let Some(provider) = cfg.provider(&account.provider_id).cloned() else {
+        result.message = "账号所属供应商不存在".into();
+        return result;
+    };
+    let key = match gw.master.decrypt(&account.api_key) {
+        Ok(k) => k,
+        Err(err) => {
+            result.message = format!("Key 无法解密：{err}");
+            return result;
+        }
+    };
+    let model_hint = cfg
+        .routes
+        .iter()
+        .find(|r| r.provider_id == provider.id)
+        .map(|r| r.upstream_model.clone())
+        .or_else(|| provider.test_model.clone());
+    let data = probe_credentials(gw, &provider, &key, model_hint.as_deref(), true).await;
+    result.level = data.level;
+    result.status = data.status;
+    result.latency_ms = data.latency_ms;
+    result.message = data.message;
+    result.models = data.models;
+    result.tokens = data.tokens;
+    result.detail = format!(
+        "供应商: {}\n账号: {}\nKey: {}\n{}\n延迟: {}ms",
+        provider.name,
+        account.name,
+        crate::config::mask_secret(&key),
+        data.detail.trim_end(),
+        data.latency_ms
+    );
+    result
+}
+
+/// Test a not-yet-saved account draft. Nothing is persisted and no usage is recorded.
+pub async fn test_account_draft(
+    gw: &Gateway,
+    provider_id: &str,
+    name: &str,
+    api_key: &str,
+    model_hint: Option<String>,
+) -> TestResult {
+    let cfg = gw.config();
+    let mut result = TestResult::new("draft:account", "draft", "账号预检");
+    result.title = if name.trim().is_empty() {
+        "未命名账号".to_string()
+    } else {
+        name.trim().to_string()
+    };
+    let Some(provider) = cfg.provider(provider_id).cloned() else {
+        result.message = "账号所属供应商不存在".into();
+        return result;
+    };
+    if api_key.trim().is_empty() && provider.auth.mode != crate::config::AuthMode::None {
+        result.level = TestLevel::Error;
+        result.message = "请先填写 API Key 再测试。".into();
+        result.detail = format!(
+            "供应商: {}
+Key: 未填写",
+            provider.name
+        );
+        return result;
+    }
+    let data = probe_credentials(gw, &provider, api_key.trim(), model_hint.as_deref(), true).await;
+    result.level = data.level;
+    result.status = data.status;
+    result.latency_ms = data.latency_ms;
+    result.message = data.message;
+    result.models = data.models;
+    result.tokens = data.tokens;
+    result.detail = format!(
+        "供应商: {}
+账号: {}
+Key: {}
+{}
+延迟: {}ms
+（预检请求，不计入额度）",
+        provider.name,
+        result.title,
+        if api_key.trim().is_empty() {
+            "无".to_string()
+        } else {
+            crate::config::mask_secret(api_key.trim())
+        },
+        data.detail.trim_end(),
+        data.latency_ms
+    );
+    result
+}
+
+pub async fn test_route(gw: &Gateway, route_id: &str) -> TestResult {
+    let cfg = gw.config();
+    let mut result = TestResult::new(&format!("route:{route_id}"), "route", "路由测试");
+    let Some(route) = cfg.route(route_id).cloned() else {
+        result.message = "路由不存在".into();
+        return result;
+    };
+    result.title = format!("{} → {}", route.client_model, route.upstream_model);
+    let Some(provider) = cfg.provider(&route.provider_id).cloned() else {
+        result.message = "路由引用的供应商不存在".into();
+        return result;
+    };
+    let protocol = provider.protocol_for(&route.upstream_model, route.protocol);
+    let ingress = match protocol {
+        Protocol::AnthropicMessages => Ingress::Anthropic,
+        Protocol::OpenAiResponses => Ingress::Responses,
+        Protocol::OpenAiChat => Ingress::Chat,
+    };
+    let client_body = match ingress {
+        Ingress::Chat => json!({
+            "model": route.client_model,
+            "messages": [{"role":"user","content":"ping"}],
+            "max_tokens": 1,
+            "stream": false
+        }),
+        Ingress::Anthropic => json!({
+            "model": route.client_model,
+            "messages": [{"role":"user","content":"ping"}],
+            "max_tokens": 1
+        }),
+        Ingress::Responses => json!({
+            "model": route.client_model,
+            "input": "ping",
+            "max_output_tokens": 16,
+            "stream": false
+        }),
+        Ingress::Generic => json!({"model": route.client_model}),
+    };
+    let upstream_body =
+        match build_upstream_body(ingress, protocol, &client_body, &route.upstream_model) {
+            Ok(v) => v,
+            Err(err) => {
+                result.message = format!("协议转换失败：{err}");
+                return result;
+            }
+        };
+    let url = crate::gateway::upstream_url_public(&provider, protocol);
+    let mut preview = format!(
+        "客户端模型: {}\n→ 供应商: {}\n→ 上游模型: {}\n→ 协议: {}\n→ 路径: POST {}",
+        route.client_model,
+        provider.name,
+        route.upstream_model,
+        protocol.label(),
+        url
+    );
+    if !route_supports_ingress(&route, ingress, protocol) {
+        result.message = format!(
+            "该路由的协议组合（{} → {}）当前不支持测试",
+            ingress.protocol().map(|p| p.label()).unwrap_or("generic"),
+            protocol.label()
+        );
+        result.detail = preview;
+        return result;
+    }
+
+    let mut accounts = cfg.accounts_of(&provider.id);
+    accounts.retain(|a| a.enabled);
+    accounts.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+    if accounts.is_empty() {
+        result.message = "该供应商没有启用的账号".into();
+        preview.push_str("\n→ 账号: 无");
+        result.detail = preview;
+        return result;
+    }
+
+    let timeout = provider.timeout_secs.unwrap_or(30).max(5);
+    let mut last_failure: Option<ProbeResultData> = None;
+    let mut hard_stop = false;
+    for account in &accounts {
+        let state = gw
+            .scheduler
+            .state_of(account, chrono::Utc::now().timestamp());
+        let key = match gw.master.decrypt(&account.api_key) {
+            Ok(k) => k,
+            Err(err) => {
+                preview.push_str(&format!(
+                    "\n→ 账号「{}」：Key 无法解密（{err}）",
+                    account.name
+                ));
+                continue;
+            }
+        };
+        let started = Instant::now();
+        let mut req = gw
+            .client_for(&url)
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&upstream_body);
+        req = match apply_auth(req, &provider.auth, &key) {
+            Ok(r) => r,
+            Err(err) => {
+                preview.push_str(&format!(
+                    "\n→ 账号「{}」：鉴权头配置无效（{err}）",
+                    account.name
+                ));
+                continue;
+            }
+        };
+        for h in &provider.extra_headers {
+            if !h.name.trim().is_empty() {
+                req = req.header(h.name.trim(), h.value.as_str());
+            }
+        }
+        if protocol == Protocol::AnthropicMessages
+            && !provider
+                .extra_headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("anthropic-version"))
+        {
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+        let sent = tokio::time::timeout(Duration::from_secs(timeout), req.send()).await;
+        let (status, body, error, latency) = match sent {
+            Err(_) => (
+                None,
+                String::new(),
+                Some(format!("连接超时（{timeout}s）")),
+                started.elapsed().as_millis() as u64,
+            ),
+            Ok(Err(err)) => (
+                None,
+                String::new(),
+                Some(readable_reqwest_error(&err)),
+                started.elapsed().as_millis() as u64,
+            ),
+            Ok(Ok(resp)) => {
+                let status = resp.status().as_u16();
+                let body = tokio::time::timeout(Duration::from_secs(30), resp.text())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default();
+                (
+                    Some(status),
+                    body,
+                    None,
+                    started.elapsed().as_millis() as u64,
+                )
+            }
+        };
+        let label = format!("账号「{}」({})", account.name, state.badge());
+        if let Some(err) = error {
+            preview.push_str(&format!("\n→ {label}: ❌ {err}"));
+            result.level = TestLevel::Unreachable;
+            result.latency_ms = latency;
+            result.message = err.clone();
+            hard_stop = true;
+            break;
+        }
+        let status = status.unwrap_or(0);
+        let usage = serde_json::from_str::<Value>(&body)
+            .ok()
+            .map(|v| extract_nonstream_usage(protocol, &v));
+        let token_text = usage
+            .map(|u| format!(" · 消耗 {} tokens", u.total()))
+            .unwrap_or_default();
+        if (200..300).contains(&status) {
+            preview.push_str(&format!(
+                "\n→ {label}: ✅ HTTP {status} · 延迟 {latency}ms{token_text}"
+            ));
+            result.level = TestLevel::Success;
+            result.status = Some(status);
+            result.latency_ms = latency;
+            result.tokens = usage.map(|u| u.total());
+            result.message = format!("HTTP 200 · 延迟 {latency}ms{token_text}");
+            preview.push_str("\n结果: ✅ 测试请求成功（不计入额度）");
+            result.detail = preview;
+            return result;
+        }
+        preview.push_str(&format!(
+            "\n→ {label}: ❌ HTTP {status} · {}",
+            upstream_error_message(&body)
+        ));
+        let data = ProbeResultData {
+            level: match status {
+                401 | 403 => TestLevel::AuthFailed,
+                429 => TestLevel::RateLimited,
+                _ => TestLevel::Error,
+            },
+            status: Some(status),
+            latency_ms: latency,
+            message: format!("HTTP {status}：{}", upstream_error_message(&body)),
+            detail: String::new(),
+            models: Vec::new(),
+            tokens: usage.map(|u| u.total()),
+        };
+        result.status = Some(status);
+        result.latency_ms = latency;
+        result.message = data.message.clone();
+        result.level = data.level;
+        result.tokens = data.tokens;
+        if status == 400 || status == 413 || status == 422 {
+            hard_stop = true;
+            break;
+        }
+        last_failure = Some(data);
+    }
+    if hard_stop {
+        result.detail = preview;
+        return result;
+    }
+    if let Some(data) = last_failure {
+        result.level = data.level;
+        result.status = data.status;
+        result.latency_ms = data.latency_ms;
+        result.message = data.message;
+        result.tokens = data.tokens;
+    }
+    preview.push_str("\n结果: ❌ 所有可用账号的测试均失败");
+    result.detail = preview;
+    result
+}
+
+pub async fn test_local_key(gw: &Gateway, key_id: &str) -> TestResult {
+    let cfg = gw.config();
+    let mut result = TestResult::new(&format!("local_key:{key_id}"), "local_key", "本地 Key 测试");
+    let Some(key) = cfg.local_key(key_id).cloned() else {
+        result.message = "本地 Key 不存在".into();
+        return result;
+    };
+    result.title = key.name.clone();
+    let plain = match gw.master.decrypt(&key.key) {
+        Ok(k) => k,
+        Err(err) => {
+            result.message = format!("Key 无法解密：{err}");
+            return result;
+        }
+    };
+    let endpoint = format!("{}/v1/models", gw.endpoint());
+    let started = Instant::now();
+    let resp = gw
+        .client_for(&endpoint)
+        .get(&endpoint)
+        .bearer_auth(&plain)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(err) => {
+            result.level = TestLevel::Unreachable;
+            result.message = format!("代理未运行或端口未监听：{}", readable_reqwest_error(&err));
+            result.detail = format!("GET {endpoint}\n{err}");
+            return result;
+        }
+    };
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    let latency = started.elapsed().as_millis() as u64;
+    result.status = Some(status);
+    result.latency_ms = latency;
+    if status == 401 {
+        result.level = TestLevel::AuthFailed;
+        result.message = "本地 Key 鉴权失败".into();
+        result.detail = format!("GET {endpoint} → 401\n{body}");
+        return result;
+    }
+    if status != 200 {
+        result.level = TestLevel::Error;
+        result.message = format!("/v1/models 返回 HTTP {status}");
+        result.detail = format!("GET {endpoint} → {status}\n{body}");
+        return result;
+    }
+    let models = parse_models(&body);
+    let mut detail = format!(
+        "GET {endpoint} → 200\n延迟: {latency}ms\n可见模型: {}\n",
+        if models.is_empty() {
+            "无".to_string()
+        } else {
+            models.join(", ")
+        }
+    );
+    let mut level = TestLevel::Success;
+    let mut message = format!("本地 Key 可用，可见 {} 个模型", models.len());
+    if cfg.server.auth_enabled {
+        if !key.allowed_models.is_empty() && !key.allowed_models.iter().any(|m| m == "*") {
+            let probe_model = "__yoyo_disallowed_probe__";
+            if key.allows_model(probe_model) {
+                detail.push_str("白名单包含通配符，跳过拒绝校验\n");
+            } else {
+                let url = format!("{}/v1/chat/completions", gw.endpoint());
+                let probe = gw
+                    .client_for(&url)
+                    .post(&url)
+                    .bearer_auth(&plain)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .json(&json!({
+                        "model": probe_model,
+                        "messages": [{"role":"user","content":"x"}],
+                        "max_tokens": 1
+                    }))
+                    .timeout(Duration::from_secs(10))
+                    .send()
+                    .await;
+                match probe {
+                    Ok(r) if r.status().as_u16() == 403 => {
+                        detail.push_str("白名单拒绝校验：✅ 403（未触达上游）\n");
+                    }
+                    Ok(r) => {
+                        level = TestLevel::Warning;
+                        message = format!("Key 可用，但白名单校验返回 HTTP {}", r.status());
+                        detail.push_str(&format!(
+                            "白名单拒绝校验：⚠️ 期望 403，实际 {}\n",
+                            r.status()
+                        ));
+                    }
+                    Err(err) => {
+                        level = TestLevel::Warning;
+                        message = format!("Key 可用，但白名单校验请求失败：{err}");
+                        detail.push_str(&format!("白名单拒绝校验：⚠️ {err}\n"));
+                    }
+                }
+            }
+        }
+        detail.push_str(&format!(
+            "额度：{} tokens / {} 请求\n",
+            key.max_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "不限".into()),
+            key.max_requests
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "不限".into())
+        ));
+    } else {
+        level = TestLevel::Warning;
+        message = "代理未启用鉴权，Key 与白名单未参与校验".into();
+        detail.push_str("代理鉴权开关：关闭\n");
+    }
+    result.level = level;
+    result.message = message;
+    result.detail = detail;
+    result.models = models;
+    result
+}
+
+/// Minimal side-effect-free probe used by the half-open recovery task.
+pub async fn half_open_probe(
+    gw: &Gateway,
+    account: &Account,
+    provider: &Provider,
+    model_hint: Option<String>,
+) -> bool {
+    let key = match gw.master.decrypt(&account.api_key) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let data = probe_credentials(gw, provider, &key, model_hint.as_deref(), true).await;
+    matches!(data.level, TestLevel::Success)
+}

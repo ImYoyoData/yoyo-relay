@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    # Bootstrap commits can opt out with [skip release]. Release merges must not use it.
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message || '', '[skip release]') }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      skip: ${{ steps.meta.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version and check tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python3 .github/scripts/version.py)"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} already exists — skipping this release."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release notes from CHANGELOG
+        if: steps.meta.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/release_notes.py "${{ steps.meta.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.meta.outputs.skip != 'true'
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x64
+            upx: true
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            name: linux-x64
+            upx: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+            name: macos-arm64
+            upx: false
+          - os: macos-14
+            target: x86_64-apple-darwin
+            name: macos-x64
+            upx: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-xcb-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev upx-ucl
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ needs.prepare.outputs.version }}"
+          $target = "${{ matrix.target }}"
+          $base = "yoyo-relay-v$version-windows-x64"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/$target/release/yoyo-relay.exe" "dist/yoyo-relay.exe"
+          Copy-Item README.md dist/
+          Copy-Item LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath "$base.zip"
+          Write-Output "packaged $base.zip"
+
+      - name: Package Windows (UPX)
+        if: runner.os == 'Windows' && matrix.upx
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $version = "${{ needs.prepare.outputs.version }}"
+          $target = "${{ matrix.target }}"
+          $base = "yoyo-relay-v$version-windows-x64"
+          choco install upx -y --no-progress
+          $env:Path += ";C:\ProgramData\chocolatey\bin"
+          New-Item -ItemType Directory -Force dist-upx | Out-Null
+          Copy-Item "target/$target/release/yoyo-relay.exe" "dist-upx/yoyo-relay.exe"
+          upx --best --lzma --force "dist-upx/yoyo-relay.exe"
+          if ($LASTEXITCODE -ne 0) { throw "UPX failed with exit code $LASTEXITCODE" }
+          Compress-Archive -Path dist-upx/* -DestinationPath "$base-upx.zip"
+          Write-Output "packaged $base-upx.zip"
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          target="${{ matrix.target }}"
+          base="yoyo-relay-v${version}-linux-x64"
+          mkdir -p dist
+          cp "target/${target}/release/yoyo-relay" dist/yoyo-relay
+          cp README.md LICENSE dist/
+          tar -czf "${base}.tar.gz" -C dist .
+          echo "packaged ${base}.tar.gz"
+
+      - name: Package Linux (UPX)
+        if: runner.os == 'Linux' && matrix.upx
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          target="${{ matrix.target }}"
+          base="yoyo-relay-v${version}-linux-x64"
+          mkdir -p dist-upx
+          cp "target/${target}/release/yoyo-relay" dist-upx/yoyo-relay
+          upx --best --lzma dist-upx/yoyo-relay
+          tar -czf "${base}-upx.tar.gz" -C dist-upx .
+          echo "packaged ${base}-upx.tar.gz"
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          target="${{ matrix.target }}"
+          arch="${{ matrix.name }}"
+          base="yoyo-relay-v${version}-${arch}"
+          mkdir -p dist
+          cp "target/${target}/release/yoyo-relay" dist/yoyo-relay
+          cp README.md LICENSE dist/
+          tar -czf "${base}.tar.gz" -C dist .
+          echo "packaged ${base}.tar.gz (unsigned)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yoyo-relay-${{ matrix.name }}
+          path: |
+            yoyo-relay-v*.zip
+            yoyo-relay-v*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: yoyo-relay-*
+          merge-multiple: true
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: .
+
+      - name: List release files
+        run: ls -lh dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+         
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: YoyoRelay ${{ needs.prepare.outputs.tag }}
+          body_path: release-notes.md
+          files: dist/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+          make_latest: true

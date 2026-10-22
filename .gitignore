@@ -1,0 +1,7 @@
+/target
+/.tmp-test
+/dist
+/dist-upx
+*.log
+config.corrupt-*.json
+.render-logo.html
