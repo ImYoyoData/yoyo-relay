@@ -1585,119 +1585,25 @@ impl App {
                 }
                 ui.add_space(6.0);
                 let (color, label) = self.proxy_status();
+                let mut urls: Vec<String> = self
+                    .snapshot
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.url.clone())
+                    .filter(|url| !url.is_empty())
+                    .collect();
+                if urls.is_empty() && !self.snapshot.endpoint.is_empty() {
+                    urls.push(self.snapshot.endpoint.clone());
+                }
+                urls.dedup();
+                let active = self.snapshot.active_requests;
+                let tokens = widgets::format_count(self.snapshot.today.totals.total_tokens);
                 egui::Frame::new()
                     .fill(t.card)
                     .stroke(Stroke::new(1.0_f32, t.card_border))
                     .corner_radius(12)
                     .inner_margin(egui::Margin::symmetric(11, 9))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("{} 活跃", self.snapshot.active_requests))
-                                    .size(9.5)
-                                    .color(t.muted),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} tokens",
-                                        widgets::format_count(
-                                            self.snapshot.today.totals.total_tokens
-                                        )
-                                    ))
-                                    .size(9.5)
-                                    .color(t.muted),
-                                );
-                            });
-                        });
-                        ui.add_space(3.0);
-                        let endpoint = self
-                            .snapshot
-                            .endpoint
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://")
-                            .to_string();
-                        ui.horizontal(|ui| {
-                            let width = (ui.available_width() - 20.0).max(60.0);
-                            ui.add_sized(
-                                [width, 14.0],
-                                egui::Label::new(
-                                    RichText::new(if endpoint.is_empty() {
-                                        "—".to_string()
-                                    } else {
-                                        endpoint.clone()
-                                    })
-                                    .monospace()
-                                    .size(9.0)
-                                    .color(t.muted),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(endpoint.clone());
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(icons::COPY).size(10.5).color(t.muted),
-                                    )
-                                    .frame(false)
-                                    .min_size(Vec2::splat(16.0)),
-                                )
-                                .on_hover_text("复制端点")
-                                .clicked()
-                            {
-                                ui.ctx().copy_text(self.snapshot.endpoint.clone());
-                                self.toast(NoticeLevel::Success, "端点已复制");
-                            }
-                        });
-                        let lan_endpoints: Vec<_> = self
-                            .snapshot
-                            .endpoints
-                            .iter()
-                            .filter(|endpoint| endpoint.lan)
-                            .cloned()
-                            .collect();
-                        if !lan_endpoints.is_empty() {
-                            let hover = lan_endpoints
-                                .iter()
-                                .map(|view| view.url.as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let label = if lan_endpoints.len() == 1 {
-                                lan_endpoints[0]
-                                    .url
-                                    .trim_start_matches("http://")
-                                    .trim_start_matches("https://")
-                                    .to_string()
-                            } else {
-                                format!("局域网 {} 个地址", lan_endpoints.len())
-                            };
-                            ui.horizontal(|ui| {
-                                let width = (ui.available_width() - 20.0).max(60.0);
-                                ui.add_sized(
-                                    [width, 14.0],
-                                    egui::Label::new(
-                                        RichText::new(label).monospace().size(8.5).color(t.muted),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(hover.clone());
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(icons::COPY).size(9.5).color(t.muted),
-                                        )
-                                        .frame(false)
-                                        .min_size(Vec2::splat(14.0)),
-                                    )
-                                    .on_hover_text("复制全部局域网端点")
-                                    .clicked()
-                                {
-                                    ui.ctx().copy_text(hover.clone());
-                                    self.toast(NoticeLevel::Success, "局域网端点已复制");
-                                }
-                            });
-                        }
-                        ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             kit::status_pill(ui, &format!("代理{label}"), color);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1719,6 +1625,61 @@ impl App {
                                         UiCommand::StartProxy
                                     });
                                 }
+                            });
+                        });
+                        ui.add_space(5.0);
+                        // Show every endpoint (loopback + each LAN address) in
+                        // full. The font is compact and wraps; each row has its
+                        // own copy button.
+                        for url in &urls {
+                            ui.horizontal_top(|ui| {
+                                let text_width = (ui.available_width() - 18.0).max(60.0);
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(text_width, 0.0),
+                                    Layout::top_down(Align::Min),
+                                    |ui| {
+                                        ui.set_width(text_width);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(url)
+                                                    .monospace()
+                                                    .size(8.0)
+                                                    .color(t.muted),
+                                            )
+                                            .wrap(),
+                                        );
+                                    },
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(icons::COPY).size(9.0).color(t.muted),
+                                        )
+                                        .frame(false)
+                                        .min_size(Vec2::splat(14.0)),
+                                    )
+                                    .on_hover_text("复制该端点")
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(url.clone());
+                                    self.toast(NoticeLevel::Success, "端点已复制");
+                                }
+                            });
+                            ui.add_space(1.0);
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{active} 活跃"))
+                                    .size(9.5)
+                                    .color(t.muted),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!("{tokens} tokens"))
+                                        .size(9.5)
+                                        .color(t.muted),
+                                );
                             });
                         });
                     });

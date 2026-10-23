@@ -538,12 +538,11 @@ impl App {
                     });
                 if !lan_endpoints.is_empty() {
                     ui.add_space(5.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("局域网").size(9.5).color(t.muted));
-                        for view in &lan_endpoints {
-                            if super::kit::path_pill(ui, &view.url)
-                                .on_hover_text("点击复制局域网端点")
-                                .clicked()
+                    for view in &lan_endpoints {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("局域网").size(9.5).color(t.muted));
+                            ui.label(RichText::new(&view.url).monospace().size(9.5).color(t.text));
+                            if super::kit::icon_button(ui, icons::COPY, "复制局域网端点").clicked()
                             {
                                 ui.ctx().copy_text(view.url.clone());
                                 self.toast(
@@ -551,8 +550,8 @@ impl App {
                                     "局域网端点已复制",
                                 );
                             }
-                        }
-                    });
+                        });
+                    }
                 }
 
                 ui.add_space(9.0);
