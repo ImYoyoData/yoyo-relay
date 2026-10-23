@@ -176,7 +176,7 @@ pub struct BalanceView {
     pub quota_windows: Vec<QuotaWindowView>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct QuotaWindowView {
     pub label: String,
     pub used: f64,

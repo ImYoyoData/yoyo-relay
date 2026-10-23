@@ -39,22 +39,22 @@ fn quota_bar(
     let ratio = quota_ratio(used, limit);
     let color = quota_color(ratio);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(10.5).strong().color(t.text));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                RichText::new(format!("剩余 {:.0}%", (1.0 - ratio) * 100.0))
-                    .size(9.5)
-                    .color(color),
-            );
-        });
+        ui.label(RichText::new(label).size(9.5).strong().color(t.text));
+        let remaining_width = ui.available_width();
+        let bar_width = (remaining_width - 58.0).max(50.0);
+        ui.add_sized(
+            [bar_width, 7.0],
+            egui::ProgressBar::new(ratio)
+                .desired_height(7.0)
+                .fill(color)
+                .corner_radius(4),
+        );
+        ui.label(
+            RichText::new(format!("余 {:.0}%", (1.0 - ratio) * 100.0))
+                .size(9.0)
+                .color(color),
+        );
     });
-    ui.add(
-        egui::ProgressBar::new(ratio)
-            .desired_height(9.0)
-            .fill(color)
-            .corner_radius(5)
-            .text(format!("{:.0}%", ratio * 100.0)),
-    );
     ui.horizontal(|ui| {
         let value = if unit == "percent" {
             format!("{used:.0}% / {limit:.0}%")
@@ -65,17 +65,17 @@ fn quota_bar(
                 widgets::format_money(limit, currency)
             )
         };
-        ui.label(RichText::new(value).monospace().size(9.0).color(t.muted));
+        ui.label(RichText::new(value).monospace().size(8.0).color(t.muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let reset = if reset_at > 0 {
                 format!("重置 {}", widgets::format_time(reset_at))
             } else {
                 "不重置".to_string()
             };
-            ui.label(RichText::new(reset).size(8.5).color(t.muted));
+            ui.label(RichText::new(reset).size(8.0).color(t.muted));
         });
     });
-    ui.add_space(5.0);
+    ui.add_space(3.0);
 }
 
 fn quota_aggregate(ui: &mut egui::Ui, windows: &[&QuotaWindowView]) {

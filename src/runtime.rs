@@ -1619,6 +1619,10 @@ impl Runtime {
                             .entry(crate::config::normalize_currency(&view.balance_currency))
                             .or_insert(0.0) += amount;
                     }
+                    let api_windows: Vec<QuotaWindowView> = balance_rows
+                        .get(&account.id)
+                        .and_then(|row| serde_json::from_str(&row.quota_json).ok())
+                        .unwrap_or_default();
                     balances.push(BalanceView {
                         account_id: account.id.clone(),
                         provider_id: provider.id.clone(),
@@ -1632,8 +1636,17 @@ impl Runtime {
                         note: view.balance_source.clone(),
                         status_text: view.balance_source.clone(),
                         quota_preset: account.balance.quota_preset.clone(),
-                        quota_note: quota_note_for(&account),
-                        quota_windows: quota_windows_for(self.db.as_ref(), &cfg, &account),
+                        quota_note: if api_windows.is_empty() {
+                            quota_note_for(&account)
+                        } else {
+                            "上游额度接口返回".into()
+                        },
+                        quota_windows: quota_windows_for(
+                            self.db.as_ref(),
+                            &cfg,
+                            &account,
+                            &api_windows,
+                        ),
                     });
                 }
             }
@@ -2219,7 +2232,11 @@ fn quota_windows_for(
     db: &Db,
     cfg: &AppConfig,
     account: &crate::config::Account,
+    api_windows: &[QuotaWindowView],
 ) -> Vec<QuotaWindowView> {
+    if !api_windows.is_empty() {
+        return api_windows.to_vec();
+    }
     let now = chrono::Local::now();
     let currency = crate::config::normalize_currency(&account.balance.currency);
     let windows: Vec<crate::config::QuotaWindowConfig> =

@@ -34,12 +34,14 @@ pub async fn refresh_balances(gw: &Gateway, only: Option<&str>) -> Vec<(String, 
                 continue;
             }
         }
-        if account.balance.mode != BalanceMode::Auto {
+        let quota_preset = !account.balance.quota_preset.trim().is_empty();
+        if account.balance.mode != BalanceMode::Auto && !quota_preset {
             continue;
         }
-        let Some(url) = account.balance.url.clone().filter(|u| !u.trim().is_empty()) else {
+        let url = account.balance.url.clone().filter(|u| !u.trim().is_empty());
+        if url.is_none() && !quota_preset {
             continue;
-        };
+        }
         let Some(provider) = cfg.provider(&account.provider_id) else {
             results.push((account.id.clone(), Err(anyhow!("供应商不存在"))));
             continue;
@@ -51,30 +53,218 @@ pub async fn refresh_balances(gw: &Gateway, only: Option<&str>) -> Vec<(String, 
                 continue;
             }
         };
-        match fetch_balance(gw, account, &url, &provider.auth, &key).await {
-            Ok(amount) => {
-                let row = BalanceRow {
-                    account_id: account.id.clone(),
-                    amount,
-                    currency: if account.balance.currency.is_empty() {
-                        "USD".to_string()
-                    } else {
-                        account.balance.currency.clone()
-                    },
-                    source: "auto".to_string(),
-                    updated_at: now_ts(),
-                    note: String::new(),
-                };
-                if let Err(err) = gw.db.balance_upsert(&row) {
-                    results.push((account.id.clone(), Err(anyhow!("写入余额失败：{err}"))));
-                } else {
-                    results.push((account.id.clone(), Ok(())));
+        let amount = if let Some(url) = &url {
+            match fetch_balance(gw, account, url, &provider.auth, &key).await {
+                Ok(amount) => amount,
+                Err(err) => {
+                    if !quota_preset {
+                        results.push((account.id.clone(), Err(err)));
+                        continue;
+                    }
+                    0.0
                 }
             }
-            Err(err) => results.push((account.id.clone(), Err(err))),
+        } else {
+            0.0
+        };
+        let quota_windows = if quota_preset {
+            fetch_quota_windows(gw, account, &provider, &key).await
+        } else {
+            Vec::new()
+        };
+        let quota_json = serde_json::to_string(&quota_windows).unwrap_or_default();
+        let row = BalanceRow {
+            account_id: account.id.clone(),
+            amount,
+            currency: if account.balance.currency.is_empty() {
+                "USD".to_string()
+            } else {
+                account.balance.currency.clone()
+            },
+            source: if quota_windows.is_empty() {
+                "auto".to_string()
+            } else {
+                "quota-api".to_string()
+            },
+            updated_at: now_ts(),
+            note: String::new(),
+            quota_json,
+        };
+        if let Err(err) = gw.db.balance_upsert(&row) {
+            results.push((account.id.clone(), Err(anyhow!("写入余额失败：{err}"))));
+        } else {
+            results.push((account.id.clone(), Ok(())));
         }
     }
     results
+}
+
+/// Try the built-in usage endpoints for subscription providers, then fall back
+/// to the provider's own base URL. The response shape is parsed heuristically
+/// because these endpoints are not publicly documented.
+async fn fetch_quota_windows(
+    gw: &Gateway,
+    account: &Account,
+    provider: &crate::config::Provider,
+    key: &str,
+) -> Vec<crate::snapshot::QuotaWindowView> {
+    let mut candidates = Vec::new();
+    if let Some(url) = account
+        .balance
+        .url
+        .clone()
+        .filter(|url| !url.trim().is_empty())
+    {
+        candidates.push(url);
+    }
+    match account.balance.quota_preset.as_str() {
+        "opencode_go" => {
+            candidates.push("https://opencode.ai/inference/go/v1/usage".into());
+            candidates.push("https://opencode.ai/inference/go/v1/me".into());
+            candidates.push("https://opencode.ai/inference/v1/usage".into());
+        }
+        "command_code_go" => {
+            candidates.push("https://api.commandcode.ai/provider/v1/usage".into());
+            candidates.push("https://api.commandcode.ai/provider/v1/me".into());
+            candidates.push("https://api.commandcode.ai/v1/usage".into());
+        }
+        _ => {}
+    }
+    let base = provider.base_url.trim_end_matches('/');
+    if let Some(root) = base.strip_suffix("/openai/v1") {
+        candidates.push(format!("{root}/usage"));
+    }
+    candidates.push(format!("{base}/usage"));
+    candidates.sort();
+    candidates.dedup();
+    for url in candidates {
+        let mut req = gw
+            .client_for(&url)
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/json");
+        let Ok(auth_req) = apply_auth(req, &provider.auth, key) else {
+            continue;
+        };
+        req = auth_req;
+        let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(8), req.send()).await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(text) = resp.text().await else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let windows = parse_quota_windows(&value);
+        if !windows.is_empty() {
+            return windows;
+        }
+    }
+    Vec::new()
+}
+
+fn parse_quota_windows(value: &Value) -> Vec<crate::snapshot::QuotaWindowView> {
+    let mut out = Vec::new();
+    collect_quota_windows(value, "", &mut out, 0);
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    out.dedup_by(|a, b| a.label == b.label);
+    out
+}
+
+fn collect_quota_windows(
+    value: &Value,
+    label: &str,
+    out: &mut Vec<crate::snapshot::QuotaWindowView>,
+    depth: usize,
+) {
+    if depth > 5 || out.len() >= 12 {
+        return;
+    }
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+    let label = obj
+        .get("label")
+        .or_else(|| obj.get("name"))
+        .or_else(|| obj.get("period"))
+        .and_then(Value::as_str)
+        .unwrap_or(label);
+    let percent = obj
+        .get("used_percent")
+        .or_else(|| obj.get("utilization"))
+        .or_else(|| obj.get("percent"))
+        .or_else(|| obj.get("usage_percent"))
+        .and_then(Value::as_f64);
+    let limit = obj
+        .get("limit")
+        .or_else(|| obj.get("total"))
+        .or_else(|| obj.get("max"))
+        .or_else(|| obj.get("quota"))
+        .and_then(Value::as_f64);
+    let used = obj
+        .get("used")
+        .or_else(|| obj.get("usage"))
+        .and_then(Value::as_f64);
+    let remaining = obj
+        .get("remaining")
+        .or_else(|| obj.get("left"))
+        .and_then(Value::as_f64);
+    let reset_at = obj
+        .get("reset_at")
+        .or_else(|| obj.get("resets_at"))
+        .or_else(|| obj.get("reset"))
+        .and_then(value_to_timestamp)
+        .unwrap_or(0);
+    let currency = obj
+        .get("currency")
+        .and_then(Value::as_str)
+        .unwrap_or("USD")
+        .to_string();
+    let (used_value, limit_value, unit) = if let Some(percent) = percent {
+        (percent, 100.0, "percent")
+    } else if let Some(limit) = limit {
+        let used = used.or_else(|| remaining.map(|r| (limit - r).max(0.0)));
+        if let Some(used) = used {
+            (used, limit, "money")
+        } else {
+            (0.0, 0.0, "")
+        }
+    } else {
+        (0.0, 0.0, "")
+    };
+    if !unit.is_empty() && !label.is_empty() {
+        out.push(crate::snapshot::QuotaWindowView {
+            label: label.to_string(),
+            used: used_value,
+            limit: limit_value,
+            unit: unit.to_string(),
+            currency,
+            reset_at,
+        });
+    }
+    for (key, child) in obj {
+        if child.is_object() || child.is_array() {
+            collect_quota_windows(child, key, out, depth + 1);
+        }
+    }
+}
+
+fn value_to_timestamp(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_f64() {
+        let number = number as i64;
+        return Some(if number > 10_000_000_000 {
+            number / 1000
+        } else {
+            number
+        });
+    }
+    let text = value.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|dt| dt.timestamp())
 }
 
 async fn fetch_balance(
@@ -524,5 +714,22 @@ mod tests {
         assert!(validate_formula("(data.balance + 1").is_err());
         assert!(validate_formula("data.balance /").is_err());
         assert!(validate_formula("").is_err());
+    }
+
+    #[test]
+    fn parses_common_quota_window_shapes() {
+        let value = json!({
+            "five_hour": {"used_percent": 25, "resets_at": "2026-10-23T18:00:00Z"},
+            "weekly": {"used": 30, "limit": 100},
+            "monthly": {"used": 60, "limit": 100}
+        });
+        let windows = parse_quota_windows(&value);
+        assert_eq!(windows.len(), 3);
+        assert!(windows
+            .iter()
+            .any(|w| w.label == "five_hour" && w.used == 25.0));
+        assert!(windows
+            .iter()
+            .any(|w| w.label == "monthly" && w.limit == 100.0));
     }
 }

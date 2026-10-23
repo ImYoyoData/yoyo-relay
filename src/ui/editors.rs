@@ -603,10 +603,18 @@ impl App {
             balance.scale
         };
         balance.quota_total = balance.quota_total.max(0.0);
+        let refresh_quota = !balance.quota_preset.is_empty();
         account.balance = balance;
         if !self.persist() {
             self.config = backup;
             return false;
+        }
+        if refresh_quota {
+            let _ = self
+                .cmd_tx
+                .send(crate::runtime::UiCommand::RefreshBalance(Some(
+                    draft.account_id.clone(),
+                )));
         }
         self.toast(NoticeLevel::Success, "余额设置已保存");
         true
@@ -4646,6 +4654,9 @@ fn balance_setup_form(app: &App, ui: &mut egui::Ui, draft: &mut BalanceSetupDraf
             {
                 balance.quota_preset = preset.to_string();
                 balance.quota_windows = crate::config::quota_preset_windows(preset);
+                if !preset.is_empty() {
+                    balance.mode = BalanceMode::Auto;
+                }
                 if preset == "command_code_go" {
                     balance.currency = "USD".into();
                 }

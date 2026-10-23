@@ -178,6 +178,8 @@ pub struct BalanceRow {
     pub source: String,
     pub updated_at: i64,
     pub note: String,
+    /// Serialized quota windows returned by the upstream usage endpoint.
+    pub quota_json: String,
 }
 
 pub struct Db {
@@ -229,7 +231,8 @@ impl Db {
                 currency TEXT NOT NULL,
                 source TEXT NOT NULL,
                 updated_at INTEGER NOT NULL,
-                note TEXT NOT NULL DEFAULT ''
+                note TEXT NOT NULL DEFAULT '',
+                quota_json TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -257,6 +260,16 @@ impl Db {
         if !has_first_token {
             conn.execute_batch(
                 "ALTER TABLE usage_requests ADD COLUMN first_token_ms INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        let has_quota_json: bool = conn
+            .prepare("PRAGMA table_info(balances)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "quota_json");
+        if !has_quota_json {
+            conn.execute_batch(
+                "ALTER TABLE balances ADD COLUMN quota_json TEXT NOT NULL DEFAULT ''",
             )?;
         }
         Ok(Self {
@@ -664,18 +677,20 @@ impl Db {
     pub fn balance_upsert(&self, row: &BalanceRow) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO balances(account_id, amount, currency, source, updated_at, note)
-             VALUES (?1,?2,?3,?4,?5,?6)
+            "INSERT INTO balances(account_id, amount, currency, source, updated_at, note, quota_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(account_id) DO UPDATE SET
                amount=excluded.amount, currency=excluded.currency,
-               source=excluded.source, updated_at=excluded.updated_at, note=excluded.note",
+               source=excluded.source, updated_at=excluded.updated_at, note=excluded.note,
+               quota_json=excluded.quota_json",
             params![
                 row.account_id,
                 row.amount,
                 row.currency,
                 row.source,
                 row.updated_at,
-                row.note
+                row.note,
+                row.quota_json
             ],
         )?;
         Ok(())
@@ -684,7 +699,7 @@ impl Db {
     pub fn balances(&self) -> Result<Vec<BalanceRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT account_id, amount, currency, source, updated_at, note FROM balances",
+            "SELECT account_id, amount, currency, source, updated_at, note, quota_json FROM balances",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(BalanceRow {
@@ -694,6 +709,7 @@ impl Db {
                 source: r.get(3)?,
                 updated_at: r.get(4)?,
                 note: r.get(5)?,
+                quota_json: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -943,6 +959,7 @@ mod tests {
             source: "auto".into(),
             updated_at: 1,
             note: "x".into(),
+            quota_json: String::new(),
         })
         .unwrap();
         let rows = db.balances().unwrap();
