@@ -201,14 +201,46 @@ pub fn format_count(value: u64) -> String {
     }
 }
 
-pub fn format_cost(cost_micros: u64) -> String {
-    let usd = cost_micros as f64 / 1_000_000.0;
-    if usd >= 100.0 {
-        format!("${usd:.1}")
-    } else if usd >= 1.0 {
-        format!("${usd:.2}")
+/// Cost stored in micro-USD, converted into the display currency.
+pub fn format_cost_in(cost_micros: u64, currency: &str, units_per_usd: f64) -> String {
+    let amount = cost_micros as f64 / 1_000_000.0 * units_per_usd.max(0.0);
+    format_money_precise(amount, currency)
+}
+
+pub fn format_cost_with(cost_micros: u64, ui: &crate::config::UiConfig) -> String {
+    format_cost_in(cost_micros, &ui.active_currency(), ui.active_fx_rate())
+}
+
+fn format_money_precise(amount: f64, currency: &str) -> String {
+    let currency = crate::config::normalize_currency(currency);
+    let symbol = match currency.as_str() {
+        "CNY" => "¥",
+        "USD" => "$",
+        "EUR" => "€",
+        "GBP" => "£",
+        "JPY" => "JP¥",
+        "KRW" => "₩",
+        "HKD" => "HK$",
+        "TWD" => "NT$",
+        "SGD" => "S$",
+        "AUD" => "A$",
+        "CAD" => "C$",
+        "INR" => "₹",
+        "RUB" => "₽",
+        "BRL" => "R$",
+        _ => "",
+    };
+    let value = if amount.abs() >= 100.0 {
+        format!("{amount:.1}")
+    } else if amount.abs() >= 1.0 {
+        format!("{amount:.2}")
     } else {
-        format!("${usd:.4}")
+        format!("{amount:.4}")
+    };
+    if symbol.is_empty() {
+        format!("{value} {currency}")
+    } else {
+        format!("{symbol}{value}")
     }
 }
 

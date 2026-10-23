@@ -16,9 +16,9 @@ pub fn surface(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
     egui::Frame::new()
         .fill(t.card)
         .stroke(Stroke::new(1.0_f32, t.card_border))
-        .corner_radius(14)
+        .corner_radius(16)
         .shadow(t.card_shadow)
-        .inner_margin(egui::Margin::symmetric(18, 16))
+        .inner_margin(egui::Margin::symmetric(20, 18))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             body(ui);
@@ -82,9 +82,12 @@ pub fn soft_panel(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
             Color32::from_rgb(248, 250, 253)
         })
         .stroke(Stroke::new(1.0_f32, t.card_border))
-        .corner_radius(10)
-        .inner_margin(egui::Margin::symmetric(12, 9))
-        .show(ui, body);
+        .corner_radius(12)
+        .inner_margin(egui::Margin::symmetric(14, 11))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            body(ui);
+        });
 }
 
 pub fn divider(ui: &mut Ui) {
@@ -106,13 +109,25 @@ pub fn divider(ui: &mut Ui) {
 
 const RAIL_WIDTH: f32 = 11.0;
 
+/// Fade a colour to transparent without passing through black. Interpolating
+/// RGB toward transparent black makes hover states look like a dirty shadow.
+fn fade(color: Color32, alpha: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+}
+
 fn lerp_color(from: Color32, to: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    Color32::from_rgb(
+    Color32::from_rgba_unmultiplied(
         mix(from.r(), to.r()),
         mix(from.g(), to.g()),
         mix(from.b(), to.b()),
+        mix(from.a(), to.a()),
     )
 }
 
@@ -284,10 +299,20 @@ pub fn scroll_fill<R>(
             bottom: 0,
         })
         .show(ui, |ui| {
+            // Capture the viewport width *before* the scroll area lays out its
+            // content. Reading it inside the closure creates a feedback loop:
+            // wide content grows the scroll area, which grows the content,
+            // until the page is wider than the window and header actions are
+            // pushed off-screen.
             let width = ui.available_width();
             ui.set_width(width);
             ui.set_min_width(width);
+            ui.set_max_width(width);
             ui.set_height(height.max(32.0));
+            // We draw our own rail and hide the native bar; without this egui
+            // still reserves `bar_width` points and clips the rightmost 10 px
+            // of the page (header actions sit exactly there).
+            ui.spacing_mut().scroll.bar_width = 0.0;
             egui::ScrollArea::vertical()
                 .id_salt(id_salt)
                 .max_height(height.max(32.0))
@@ -295,10 +320,9 @@ pub fn scroll_fill<R>(
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .stick_to_bottom(stick_to_bottom)
                 .show(ui, |ui| {
-                    // Fill the viewport so cards and separators use the full
-                    // width instead of shrink-wrapping and leaving a gap.
-                    let width = ui.available_width();
                     ui.set_width(width);
+                    ui.set_min_width(width);
+                    ui.set_max_width(width);
                     body(ui)
                 })
         })
@@ -327,6 +351,8 @@ pub fn scroll_capped<R>(
             let width = ui.available_width();
             ui.set_width(width);
             ui.set_min_width(width);
+            ui.set_max_width(width);
+            ui.spacing_mut().scroll.bar_width = 0.0;
             egui::ScrollArea::vertical()
                 .id_salt(id_salt)
                 .max_height(max_height)
@@ -334,10 +360,9 @@ pub fn scroll_capped<R>(
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .stick_to_bottom(stick_to_bottom)
                 .show(ui, |ui| {
-                    // Fill the viewport so cards and separators use the full
-                    // width instead of shrink-wrapping and leaving a gap.
-                    let width = ui.available_width();
                     ui.set_width(width);
+                    ui.set_min_width(width);
+                    ui.set_max_width(width);
                     body(ui)
                 })
         })
@@ -367,6 +392,8 @@ pub fn scroll_rows(
             let width = ui.available_width();
             ui.set_width(width);
             ui.set_min_width(width);
+            ui.set_max_width(width);
+            ui.spacing_mut().scroll.bar_width = 0.0;
             egui::ScrollArea::vertical()
                 .id_salt(id_salt)
                 .max_height(max_height)
@@ -391,30 +418,16 @@ pub fn page_header(
     actions: impl FnOnce(&mut Ui),
 ) {
     let t = theme::tokens(ui);
-    let narrow = ui.available_width() < 760.0;
-    if narrow {
-        eyebrow_line(ui, eyebrow, t.primary, t.muted);
-        ui.add_space(4.0);
-        ui.label(RichText::new(title).size(24.0).strong().color(t.text));
-        ui.add_space(2.0);
-        ui.label(RichText::new(subtitle).size(11.5).color(t.muted));
-        ui.add_space(10.0);
-        ui.horizontal_wrapped(actions);
-    } else {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                eyebrow_line(ui, eyebrow, t.primary, t.muted);
-                ui.add_space(4.0);
-                ui.label(RichText::new(title).size(24.0).strong().color(t.text));
-                ui.add_space(2.0);
-                ui.label(RichText::new(subtitle).size(11.5).color(t.muted));
-            });
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.set_height(34.0);
-                actions(ui);
-            });
-        });
-    }
+    eyebrow_line(ui, eyebrow, t.primary, t.muted);
+    ui.add_space(4.0);
+    ui.label(RichText::new(title).size(24.0).strong().color(t.text));
+    ui.add_space(2.0);
+    ui.add(egui::Label::new(RichText::new(subtitle).size(11.5).color(t.muted)).wrap());
+    ui.add_space(10.0);
+    // Always place actions in their own row. A right-aligned action column was
+    // fragile inside the scroll viewport (long subtitles pushed the buttons
+    // past the right edge), and a full-width row is easier to scan.
+    ui.horizontal_wrapped(actions);
     ui.add_space(16.0);
 }
 
@@ -668,6 +681,24 @@ pub fn window_button(ui: &mut Ui, icon: &str, tooltip: &str, danger: bool) -> Re
 // ---------------------------------------------------------------------------
 
 pub fn kpi_grid(ui: &mut Ui, cards: &[(&str, &str, String, String, Color32)]) {
+    kpi_grid_impl(ui, cards, None);
+}
+
+/// KPI grid whose cost card carries a clickable currency chip. Returns true
+/// when the display currency changed and the caller should persist.
+pub fn kpi_grid_with_toggle(
+    ui: &mut Ui,
+    cards: &[(&str, &str, String, String, Color32)],
+    cfg: &mut crate::config::UiConfig,
+) -> bool {
+    kpi_grid_impl(ui, cards, Some(cfg))
+}
+
+fn kpi_grid_impl(
+    ui: &mut Ui,
+    cards: &[(&str, &str, String, String, Color32)],
+    mut cfg: Option<&mut crate::config::UiConfig>,
+) -> bool {
     let avail = ui.available_width();
     let min_card = 168.0;
     let gap = 12.0;
@@ -680,39 +711,63 @@ pub fn kpi_grid(ui: &mut Ui, cards: &[(&str, &str, String, String, Color32)]) {
     };
     let width = ((avail - gap * (per_row.saturating_sub(1)) as f32) / per_row as f32).max(120.0);
     let total_rows = cards.len().div_ceil(per_row);
+    let mut changed = false;
     for (row_index, chunk) in cards.chunks(per_row).enumerate() {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for (icon, label, value, sub, color) in chunk {
+                let is_cost = label.contains("花费");
+                let mut card_toggle = false;
                 ui.allocate_ui_with_layout(
-                    Vec2::new(width, 106.0),
+                    Vec2::new(width, 116.0),
                     Layout::top_down(Align::Min),
                     |ui| {
                         ui.set_width(width);
-                        kpi_card(ui, icon, label, value, sub, *color);
+                        card_toggle = kpi_card_impl(
+                            ui,
+                            icon,
+                            label,
+                            value,
+                            sub,
+                            *color,
+                            if is_cost { cfg.as_deref_mut() } else { None },
+                        );
                     },
                 );
+                changed |= card_toggle;
             }
         });
         if row_index + 1 < total_rows {
             ui.add_space(10.0);
         }
     }
+    changed
 }
 
-pub fn kpi_card(ui: &mut Ui, icon: &str, label: &str, value: &str, sub: &str, color: Color32) {
+fn kpi_card_impl(
+    ui: &mut Ui,
+    icon: &str,
+    label: &str,
+    value: &str,
+    sub: &str,
+    color: Color32,
+    cfg: Option<&mut crate::config::UiConfig>,
+) -> bool {
     let t = theme::tokens(ui);
+    let mut toggled = false;
     egui::Frame::new()
         .fill(t.card)
         .stroke(Stroke::new(1.0_f32, t.card_border))
-        .corner_radius(14)
+        .corner_radius(16)
         .shadow(t.card_shadow)
-        .inner_margin(egui::Margin::symmetric(16, 13))
+        .inner_margin(egui::Margin::symmetric(16, 14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let icon_size = 33.0;
             let gap = 8.0;
-            let text_width = (ui.available_width() - icon_size - gap).max(54.0);
+            let text_width =
+                (ui.available_width() - icon_size - gap - if cfg.is_some() { 46.0 } else { 0.0 })
+                    .max(54.0);
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
                     Vec2::new(text_width, 0.0),
@@ -726,11 +781,44 @@ pub fn kpi_card(ui: &mut Ui, icon: &str, label: &str, value: &str, sub: &str, co
                 );
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                     icon_chip(ui, icon, color, icon_size);
+                    if let Some(cfg) = cfg {
+                        let home = cfg.home_currency();
+                        let active = cfg.active_currency();
+                        let next = if active == "USD" {
+                            if home == "USD" {
+                                "CNY".to_string()
+                            } else {
+                                home.clone()
+                            }
+                        } else {
+                            "USD".to_string()
+                        };
+                        if currency_chip(ui, &active)
+                            .on_hover_text("切换花费显示币种")
+                            .clicked()
+                        {
+                            cfg.display_currency = if next == home { String::new() } else { next };
+                            toggled = true;
+                            ui.ctx().request_repaint();
+                        }
+                    }
                 });
             });
             ui.add_space(2.0);
             ui.add(egui::Label::new(RichText::new(sub).size(9.5).color(t.muted)).truncate());
         });
+    toggled
+}
+
+fn currency_chip(ui: &mut Ui, currency: &str) -> Response {
+    let t = theme::tokens(ui);
+    ui.add(
+        egui::Button::new(RichText::new(currency).size(8.5).strong().color(t.primary))
+            .fill(t.primary_soft)
+            .stroke(Stroke::NONE)
+            .corner_radius(6)
+            .min_size(Vec2::new(0.0, 18.0)),
+    )
 }
 
 /// Draw a KPI value that shrinks until it fits the reserved text column. This
@@ -754,12 +842,21 @@ fn fitted_value_label(ui: &mut Ui, text: &str, base: f32, min: f32, color: Color
     ui.add(egui::Label::new(RichText::new(text).size(size).strong().color(color)).truncate());
 }
 
-pub fn kpi_cards_from_snapshot(ui: &mut Ui, snapshot: &crate::snapshot::UiSnapshot) {
+pub fn kpi_cards_from_snapshot(
+    ui: &mut Ui,
+    snapshot: &crate::snapshot::UiSnapshot,
+    cfg: &mut crate::config::UiConfig,
+) -> bool {
     let today = &snapshot.today.totals;
     let success = if today.requests == 0 {
         "—".to_string()
     } else {
         format!("{:.1}%", today.success_rate() * 100.0)
+    };
+    let ttft = if today.avg_first_token_ms > 0 {
+        widgets::format_duration_ms(today.avg_first_token_ms)
+    } else {
+        "—".to_string()
     };
     let t = theme::tokens(ui);
     let cards: Vec<(&str, &str, String, String, Color32)> = vec![
@@ -786,7 +883,7 @@ pub fn kpi_cards_from_snapshot(ui: &mut Ui, snapshot: &crate::snapshot::UiSnapsh
             "成功率",
             success,
             format!(
-                "平均耗时 {}",
+                "首字 {ttft} · 总耗时 {}",
                 widgets::format_duration_ms(today.avg_latency_ms)
             ),
             if today.requests > 0 && today.success_rate() >= 0.95 {
@@ -798,12 +895,12 @@ pub fn kpi_cards_from_snapshot(ui: &mut Ui, snapshot: &crate::snapshot::UiSnapsh
         (
             icons::CURRENCY_DOLLAR,
             "今日预估花费",
-            widgets::format_cost(today.cost_micros),
+            widgets::format_cost_with(today.cost_micros, cfg),
             "按路由价格估算".to_string(),
             t.amber,
         ),
     ];
-    kpi_grid(ui, &cards);
+    kpi_grid_with_toggle(ui, &cards, cfg)
 }
 
 pub fn empty_state(
@@ -843,15 +940,19 @@ pub fn nav_item(
 ) -> Response {
     let t = theme::tokens(ui);
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
-    let bg = if active {
-        t.primary_soft
-    } else if response.hovered() {
-        t.hover
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
+    let active_t = ui
+        .ctx()
+        .animate_bool_with_time(response.id.with("active"), active, 0.16);
+    let hover_t =
+        ui.ctx()
+            .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);
+    let bg = if active_t > 0.0 {
+        fade(t.primary_soft, active_t)
     } else {
-        Color32::TRANSPARENT
+        fade(t.hover, hover_t)
     };
-    ui.painter().rect_filled(rect, 8.0, bg);
+    ui.painter().rect_filled(rect, 10.0, bg);
     if active {
         ui.painter().rect_filled(
             Rect::from_min_size(
@@ -892,15 +993,19 @@ pub fn nav_item(
 pub fn nav_rail_item(ui: &mut Ui, icon: &str, tooltip: &str, active: bool) -> Response {
     let t = theme::tokens(ui);
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
-    let bg = if active {
-        t.primary_soft
-    } else if response.hovered() {
-        t.hover
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+    let active_t = ui
+        .ctx()
+        .animate_bool_with_time(response.id.with("active"), active, 0.16);
+    let hover_t =
+        ui.ctx()
+            .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);
+    let bg = if active_t > 0.0 {
+        fade(t.primary_soft, active_t)
     } else {
-        Color32::TRANSPARENT
+        fade(t.hover, hover_t)
     };
-    ui.painter().rect_filled(rect, 8.0, bg);
+    ui.painter().rect_filled(rect, 10.0, bg);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -946,7 +1051,7 @@ pub fn modal_shell(
             egui::Frame::new()
                 .fill(t.card)
                 .stroke(Stroke::new(1.0_f32, t.card_border))
-                .corner_radius(16)
+                .corner_radius(18)
                 .shadow(egui::epaint::Shadow {
                     offset: [0, 18],
                     blur: 44,
@@ -1076,22 +1181,23 @@ fn metric_value(point: &ChartPoint, metric: ChartMetric) -> f64 {
     }
 }
 
-fn metric_short(value: f64, metric: ChartMetric) -> String {
+fn metric_short(value: f64, metric: ChartMetric, currency: &str, units_per_usd: f64) -> String {
     match metric {
         ChartMetric::Tokens => widgets::format_count(value as u64),
         ChartMetric::Requests => format!("{}", value as u64),
-        ChartMetric::Cost => widgets::format_cost(value as u64),
+        ChartMetric::Cost => widgets::format_cost_in(value as u64, currency, units_per_usd),
     }
 }
 
-fn metric_text(value: f64, metric: ChartMetric) -> String {
+fn metric_text(value: f64, metric: ChartMetric, currency: &str, units_per_usd: f64) -> String {
     match metric {
         ChartMetric::Tokens => format!("{} tokens", widgets::format_count(value as u64)),
         ChartMetric::Requests => format!("{} 次请求", value as u64),
-        ChartMetric::Cost => widgets::format_cost(value as u64),
+        ChartMetric::Cost => widgets::format_cost_in(value as u64, currency, units_per_usd),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn interactive_chart(
     ui: &mut Ui,
     source: &[ChartPoint],
@@ -1099,6 +1205,8 @@ pub fn interactive_chart(
     height: f32,
     metric: ChartMetric,
     bucket_secs: i64,
+    currency: &str,
+    units_per_usd: f64,
 ) -> Option<usize> {
     let points: Vec<(i64, f64)> = source
         .iter()
@@ -1135,7 +1243,7 @@ pub fn interactive_chart(
         painter.text(
             Pos2::new(plot.left() - 10.0, y),
             Align2::RIGHT_CENTER,
-            metric_short(value, metric),
+            metric_short(value, metric, currency, units_per_usd),
             FontId::proportional(9.0),
             t.muted,
         );
@@ -1275,7 +1383,7 @@ pub fn interactive_chart(
         let text = format!(
             "{}   {}",
             fmt_time(points[index].0),
-            metric_text(points[index].1, metric)
+            metric_text(points[index].1, metric, currency, units_per_usd)
         );
         let galley = painter.layout_no_wrap(
             text,
@@ -1489,22 +1597,32 @@ pub fn toggle_switch(ui: &mut Ui, value: &mut bool) -> Response {
         ui.ctx().request_repaint();
     }
     let on = *value;
-    let bg = if on {
-        t.primary
-    } else if t.dark_mode {
+    let off_bg = if t.dark_mode {
         Color32::from_rgb(55, 62, 76)
     } else {
         Color32::from_rgb(203, 210, 222)
     };
+    let progress = ui
+        .ctx()
+        .animate_bool_with_time(response.id.with("knob"), on, 0.16);
+    let bg = lerp_color(off_bg, t.primary, progress);
     ui.painter().rect_filled(rect, 11.0, bg);
-    let cx = if on {
-        rect.right() - 11.0
-    } else {
-        rect.left() + 11.0
-    };
+    let left = rect.left() + 11.0;
+    let travel = (rect.width() - 22.0).max(0.0);
+    let cx = left + travel * progress;
     ui.painter()
         .circle_filled(Pos2::new(cx, rect.center().y), 8.0, Color32::WHITE);
     response
+}
+
+/// Text input with comfortable inner padding. The egui default (4×2) makes
+/// fields look cramped next to the app's 12–18 px card padding.
+pub fn text_input(text: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).margin(egui::Margin::symmetric(10, 7))
+}
+
+pub fn text_area(text: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::multiline(text).margin(egui::Margin::symmetric(10, 8))
 }
 
 #[cfg(test)]

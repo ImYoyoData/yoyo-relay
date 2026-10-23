@@ -1,4 +1,3 @@
-use armas::components::{Alert, AlertVariant};
 use armas::ext::ArmasContextExt;
 use egui::{RichText, Vec2};
 use egui_phosphor::regular as icons;
@@ -22,7 +21,10 @@ impl App {
             },
         );
 
-        super::kit::kpi_cards_from_snapshot(ui, &self.snapshot);
+        let snapshot = self.snapshot.clone();
+        if super::kit::kpi_cards_from_snapshot(ui, &snapshot, &mut self.config.ui) {
+            self.persist();
+        }
         ui.add_space(4.0);
 
         if ui.available_width() < 900.0 {
@@ -52,6 +54,7 @@ impl App {
                 super::kit::badge(ui, "今日", theme::ACCENT);
             },
             |ui| {
+                let currency = self.config.ui.active_currency();
                 super::kit::interactive_chart(
                     ui,
                     &points,
@@ -59,6 +62,8 @@ impl App {
                     170.0,
                     super::kit::ChartMetric::Tokens,
                     3600,
+                    &currency,
+                    self.config.ui.active_fx_rate(),
                 );
             },
         );
@@ -182,14 +187,23 @@ impl App {
                                             let curl = self.curl_for(request);
                                             self.copy(ui.ctx(), &curl, "curl 命令");
                                         }
+                                        let duration = if request.first_token_ms > 0 {
+                                            format!(
+                                                "首字 {} · 总 {}",
+                                                widgets::format_duration_ms(request.first_token_ms),
+                                                widgets::format_duration_ms(request.latency_ms)
+                                            )
+                                        } else {
+                                            format!(
+                                                "总 {}",
+                                                widgets::format_duration_ms(request.latency_ms)
+                                            )
+                                        };
                                         ui.label(
-                                            RichText::new(format!(
-                                                "{:.2} s",
-                                                request.latency_ms as f64 / 1000.0
-                                            ))
-                                            .monospace()
-                                            .size(9.5)
-                                            .color(theme::muted(ui)),
+                                            RichText::new(duration)
+                                                .monospace()
+                                                .size(9.5)
+                                                .color(theme::muted(ui)),
                                         );
                                         ui.label(
                                             RichText::new(widgets::format_count(
@@ -199,8 +213,9 @@ impl App {
                                             .size(10.0),
                                         );
                                         ui.label(
-                                            RichText::new(widgets::format_cost(
+                                            RichText::new(widgets::format_cost_with(
                                                 request.cost_micros,
+                                                &self.config.ui,
                                             ))
                                             .size(9.5)
                                             .color(theme::ORANGE),
@@ -350,7 +365,26 @@ impl App {
             },
             |ui| {
                 if let ProxyStatus::Error(err) = &self.snapshot.proxy {
-                    Alert::new(err).variant(AlertVariant::Destructive).show(ui);
+                    let t = theme::tokens(ui);
+                    egui::Frame::new()
+                        .fill(theme::soft_for(ui, theme::RED))
+                        .stroke(egui::Stroke::new(1.0_f32, theme::RED.gamma_multiply(0.28)))
+                        .corner_radius(10)
+                        .inner_margin(egui::Margin::symmetric(11, 9))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal_top(|ui| {
+                                ui.label(
+                                    RichText::new(icons::WARNING_OCTAGON)
+                                        .size(14.0)
+                                        .color(theme::RED),
+                                );
+                                ui.add(
+                                    egui::Label::new(RichText::new(err).size(10.8).color(t.text))
+                                        .wrap(),
+                                );
+                            });
+                        });
                     ui.add_space(8.0);
                 }
                 let endpoint = self.snapshot.endpoint.clone();
@@ -504,20 +538,32 @@ impl App {
                     });
                 } else {
                     for alert in &rows {
-                        let color = match alert.level {
-                            AlertLevel::Info => theme::BLUE_INFO,
-                            AlertLevel::Warning => theme::ORANGE,
-                            AlertLevel::Critical => theme::RED,
+                        let (color, icon) = match alert.level {
+                            AlertLevel::Info => (theme::BLUE_INFO, icons::INFO),
+                            AlertLevel::Warning => (theme::ORANGE, icons::WARNING),
+                            AlertLevel::Critical => (theme::RED, icons::WARNING_OCTAGON),
                         };
-                        let variant = if alert.level == AlertLevel::Critical {
-                            AlertVariant::Destructive
-                        } else {
-                            AlertVariant::Info
-                        };
-                        Alert::new(&alert.text)
-                            .variant(variant)
-                            .color(color)
-                            .show(ui);
+                        let t = theme::tokens(ui);
+                        egui::Frame::new()
+                            .fill(theme::soft_for(ui, color))
+                            .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.28)))
+                            .corner_radius(10)
+                            .inner_margin(egui::Margin::symmetric(11, 9))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.set_min_height(36.0);
+                                ui.horizontal_top(|ui| {
+                                    ui.label(RichText::new(icon).size(14.0).color(color));
+                                    ui.add_space(2.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&alert.text).size(10.8).color(t.text),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                            });
+                        ui.add_space(5.0);
                     }
                     if alert_count > rows.len() {
                         ui.label(

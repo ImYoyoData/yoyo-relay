@@ -181,6 +181,43 @@ pub fn for_name(provider_name: &str) -> Brand {
     for_preset(Some(key))
 }
 
+/// Bundled vendor artwork. These are the official favicons/app icons of each
+/// provider, embedded so the UI never needs the network to draw a brand mark.
+fn logo_bytes(key: &str) -> Option<&'static [u8]> {
+    Some(match key {
+        "openai" => include_bytes!("../../assets/providers/openai.png"),
+        "anthropic" => include_bytes!("../../assets/providers/anthropic.png"),
+        "zhipu" => include_bytes!("../../assets/providers/zhipu.png"),
+        "xiaomi" => include_bytes!("../../assets/providers/xiaomi.png"),
+        "minimax" => include_bytes!("../../assets/providers/minimax.png"),
+        "doubao" => include_bytes!("../../assets/providers/doubao.png"),
+        "qwen" => include_bytes!("../../assets/providers/qwen.png"),
+        "hunyuan" => include_bytes!("../../assets/providers/hunyuan.png"),
+        "stepfun" => include_bytes!("../../assets/providers/stepfun.png"),
+        "command_code" => include_bytes!("../../assets/providers/command_code.png"),
+        "opencode_zen" | "opencode_go" => include_bytes!("../../assets/providers/opencode.png"),
+        _ => return None,
+    })
+}
+
+fn logo_texture(ctx: &egui::Context, key: &str) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("provider_logo_texture", key));
+    if let Some(handle) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(id)) {
+        return Some(handle);
+    }
+    let bytes = logo_bytes(key)?;
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    let handle = ctx.load_texture(
+        format!("provider-logo-{key}"),
+        color,
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|data| data.insert_temp(id, handle.clone()));
+    Some(handle)
+}
+
 /// A provider logo tile. Allocates `size` and returns the response.
 pub fn tile(ui: &mut Ui, brand: &Brand, size: f32) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
@@ -191,33 +228,57 @@ pub fn tile(ui: &mut Ui, brand: &Brand, size: f32) -> Response {
 pub fn paint_tile(ui: &Ui, rect: Rect, brand: &Brand) {
     let painter = ui.painter();
     let corner = (rect.width() * 0.28).clamp(4.0, 14.0);
-    painter.rect_filled(rect, corner, brand.bg);
-    // Soft depth: a clipped highlight in the upper-left corner.
-    let clip = painter.with_clip_rect(rect);
-    let glow = Rect::from_center_size(
-        Pos2::new(
-            rect.left() + rect.width() * 0.24,
-            rect.top() + rect.height() * 0.18,
-        ),
-        Vec2::splat(rect.width() * 0.95),
-    );
-    clip.circle_filled(
-        glow.center(),
-        glow.width() * 0.5,
-        Color32::from_rgba_unmultiplied(255, 255, 255, 26),
-    );
-    let glyph_size = (rect.width() * brand.glyph_scale).max(9.0);
-    painter.text(
-        rect.center() + Vec2::new(0.0, -0.5),
-        Align2::CENTER_CENTER,
-        brand.glyph,
-        FontId::proportional(glyph_size),
-        brand.fg,
-    );
+    let texture = logo_texture(ui.ctx(), brand.key);
+    let has_logo = texture.is_some();
+    let bg = if has_logo {
+        if theme::tokens(ui).dark_mode {
+            Color32::from_rgb(243, 246, 251)
+        } else {
+            Color32::WHITE
+        }
+    } else {
+        brand.bg
+    };
+    painter.rect_filled(rect, corner, bg);
+    if let Some(texture) = texture {
+        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        let inset = rect.shrink(rect.width() * 0.14);
+        painter.image(texture.id(), inset, uv, Color32::WHITE);
+    } else {
+        // Soft depth: a clipped highlight in the upper-left corner.
+        let clip = painter.with_clip_rect(rect);
+        let glow = Rect::from_center_size(
+            Pos2::new(
+                rect.left() + rect.width() * 0.24,
+                rect.top() + rect.height() * 0.18,
+            ),
+            Vec2::splat(rect.width() * 0.95),
+        );
+        clip.circle_filled(
+            glow.center(),
+            glow.width() * 0.5,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+        );
+        let glyph_size = (rect.width() * brand.glyph_scale).max(9.0);
+        painter.text(
+            rect.center() + Vec2::new(0.0, -0.5),
+            Align2::CENTER_CENTER,
+            brand.glyph,
+            FontId::proportional(glyph_size),
+            brand.fg,
+        );
+    }
     painter.rect_stroke(
         rect.shrink(0.5),
         corner,
-        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 46)),
+        Stroke::new(
+            1.0_f32,
+            if has_logo {
+                Color32::from_rgba_unmultiplied(15, 23, 42, 26)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 46)
+            },
+        ),
         egui::StrokeKind::Inside,
     );
 }

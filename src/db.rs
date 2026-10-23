@@ -23,6 +23,9 @@ pub struct UsageRecord {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cost_micros: u64,
+    /// Wall-clock time from request start to the first generated token. For
+    /// non-streaming requests this equals the full response time.
+    pub first_token_ms: u64,
     pub latency_ms: u64,
     pub kind: String,
 }
@@ -36,7 +39,10 @@ pub struct Totals {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cost_micros: u64,
+    /// Average total request duration (queue + prefill + thinking + decode).
     pub avg_latency_ms: u64,
+    /// Average time to first generated token.
+    pub avg_first_token_ms: u64,
 }
 
 impl Totals {
@@ -89,6 +95,7 @@ pub struct RecentRequest {
     pub total_tokens: u64,
     pub cost_micros: u64,
     pub latency_ms: u64,
+    pub first_token_ms: u64,
     pub local_key_id: Option<String>,
 }
 
@@ -115,6 +122,7 @@ pub struct UsageDetail {
     pub total_tokens: u64,
     pub cost_micros: u64,
     pub latency_ms: u64,
+    pub first_token_ms: u64,
     pub kind: String,
 }
 
@@ -207,6 +215,7 @@ impl Db {
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_micros INTEGER NOT NULL DEFAULT 0,
                 latency_ms INTEGER NOT NULL DEFAULT 0,
+                first_token_ms INTEGER NOT NULL DEFAULT 0,
                 kind TEXT NOT NULL DEFAULT 'chat'
             );
             CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_requests(ts);
@@ -240,6 +249,16 @@ impl Db {
                 "ALTER TABLE usage_requests ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0",
             )?;
         }
+        let has_first_token: bool = conn
+            .prepare("PRAGMA table_info(usage_requests)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "first_token_ms");
+        if !has_first_token {
+            conn.execute_batch(
+                "ALTER TABLE usage_requests ADD COLUMN first_token_ms INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -258,8 +277,8 @@ impl Db {
             "INSERT INTO usage_requests
              (ts, request_id, account_id, provider_id, local_key_id, client_model, upstream_model,
               protocol, status, ok, stream, cancelled, prompt_tokens, cached_tokens,
-              completion_tokens, total_tokens, cost_micros, latency_ms, kind)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+              completion_tokens, total_tokens, cost_micros, latency_ms, first_token_ms, kind)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 rec.ts,
                 rec.request_id,
@@ -279,6 +298,7 @@ impl Db {
                 rec.total_tokens as i64,
                 rec.cost_micros as i64,
                 rec.latency_ms as i64,
+                rec.first_token_ms as i64,
                 rec.kind,
             ],
         )?;
@@ -331,7 +351,7 @@ impl Db {
             "SELECT id, ts, request_id, account_id, provider_id, local_key_id,
                     client_model, upstream_model, protocol, status, ok, stream, cancelled,
                     prompt_tokens, cached_tokens, completion_tokens, total_tokens,
-                    cost_micros, latency_ms, kind
+                    cost_micros, latency_ms, first_token_ms, kind
              FROM usage_requests WHERE {sql}{}
              ORDER BY id DESC LIMIT ? OFFSET ?",
             if ok.is_some() { " AND ok = ?" } else { "" }
@@ -371,7 +391,8 @@ impl Db {
                 total_tokens: r.get::<_, i64>(16)? as u64,
                 cost_micros: r.get::<_, i64>(17)? as u64,
                 latency_ms: r.get::<_, i64>(18)? as u64,
-                kind: r.get(19)?,
+                first_token_ms: r.get::<_, i64>(19)? as u64,
+                kind: r.get(20)?,
             });
         }
         Ok(out)
@@ -435,7 +456,8 @@ impl Db {
                     COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cached_tokens),0),
                     COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0),
-                    COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0)
+                    COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0),
+                    COALESCE(CAST(AVG(CASE WHEN ok=1 THEN first_token_ms END) AS INTEGER),0)
              FROM usage_requests WHERE ts >= ?1 AND (?2 IS NULL OR local_key_id = ?2)",
             params![since, key],
             |r| {
@@ -448,6 +470,7 @@ impl Db {
                     total_tokens: r.get::<_, i64>(5)? as u64,
                     cost_micros: r.get::<_, i64>(6)? as u64,
                     avg_latency_ms: r.get::<_, i64>(7)? as u64,
+                    avg_first_token_ms: r.get::<_, i64>(8)? as u64,
                 })
             },
         )?;
@@ -461,7 +484,8 @@ impl Db {
                     COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cached_tokens),0),
                     COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0),
-                    COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0)
+                    COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0),
+                    COALESCE(CAST(AVG(CASE WHEN ok=1 THEN first_token_ms END) AS INTEGER),0)
              FROM usage_requests WHERE ts >= ?1 AND client_model = ?2",
             params![since, client_model],
             |r| {
@@ -474,6 +498,7 @@ impl Db {
                     total_tokens: r.get::<_, i64>(5)? as u64,
                     cost_micros: r.get::<_, i64>(6)? as u64,
                     avg_latency_ms: r.get::<_, i64>(7)? as u64,
+                    avg_first_token_ms: r.get::<_, i64>(8)? as u64,
                 })
             },
         )?;
@@ -501,7 +526,8 @@ impl Db {
                     COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cached_tokens),0),
                     COALESCE(SUM(completion_tokens),0),
                     COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_micros),0),
-                    COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0)
+                    COALESCE(CAST(AVG(CASE WHEN ok=1 THEN latency_ms END) AS INTEGER),0),
+                    COALESCE(CAST(AVG(CASE WHEN ok=1 THEN first_token_ms END) AS INTEGER),0)
              FROM usage_requests WHERE ts >= ?1 AND (?2 IS NULL OR local_key_id = ?2)
              GROUP BY {column} ORDER BY SUM(total_tokens) DESC"
         );
@@ -519,6 +545,7 @@ impl Db {
                     total_tokens: r.get::<_, i64>(6)? as u64,
                     cost_micros: r.get::<_, i64>(7)? as u64,
                     avg_latency_ms: r.get::<_, i64>(8)? as u64,
+                    avg_first_token_ms: r.get::<_, i64>(9)? as u64,
                 },
             })
         })?;
@@ -557,6 +584,7 @@ impl Db {
                     total_tokens: r.get::<_, i64>(7)? as u64,
                     cost_micros: r.get::<_, i64>(8)? as u64,
                     avg_latency_ms: 0,
+                    avg_first_token_ms: 0,
                 },
             })
         })?;
@@ -602,7 +630,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, ts, request_id, account_id, provider_id, client_model, upstream_model,
                     protocol, status, ok, stream, cancelled, prompt_tokens, cached_tokens,
-                    completion_tokens, total_tokens, cost_micros, latency_ms, local_key_id
+                    completion_tokens, total_tokens, cost_micros, latency_ms, first_token_ms,
+                    local_key_id
              FROM usage_requests ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
@@ -625,7 +654,8 @@ impl Db {
                 total_tokens: r.get::<_, i64>(15)? as u64,
                 cost_micros: r.get::<_, i64>(16)? as u64,
                 latency_ms: r.get::<_, i64>(17)? as u64,
-                local_key_id: r.get(18)?,
+                first_token_ms: r.get::<_, i64>(18)? as u64,
+                local_key_id: r.get(19)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -746,6 +776,7 @@ mod tests {
             total_tokens: tokens,
             cost_micros: 100,
             latency_ms: 42,
+            first_token_ms: 12,
             kind: "chat".into(),
         }
     }
@@ -761,6 +792,7 @@ mod tests {
         assert_eq!(totals.requests, 3);
         assert_eq!(totals.ok, 2);
         assert_eq!(totals.total_tokens, 35);
+        assert_eq!(totals.avg_first_token_ms, 12);
         let (tokens, reqs) = db.sum_account_since("a1", 0).unwrap();
         assert_eq!((tokens, reqs), (15, 2));
         let groups = db.group_since("account", 0).unwrap();
@@ -852,6 +884,7 @@ mod tests {
         let totals = db.totals_since(0).unwrap();
         assert_eq!(totals.total_tokens, 15);
         assert_eq!(totals.cached_tokens, 0);
+        assert_eq!(totals.avg_first_token_ms, 0);
         // New writes work after the in-place migration.
         db.record_usage(&sample("a1", 5, true)).unwrap();
         assert_eq!(db.totals_since(0).unwrap().requests, 2);

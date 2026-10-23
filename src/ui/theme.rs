@@ -232,7 +232,8 @@ pub fn apply(ctx: &Context, dark: bool) {
     visuals.extreme_bg_color = tokens.input;
     visuals.code_bg_color = tokens.hover;
     visuals.window_stroke = Stroke::new(1.0_f32, tokens.card_border);
-    visuals.window_corner_radius = 14.into();
+    visuals.window_corner_radius = 18.into();
+    visuals.menu_corner_radius = 12.into();
     visuals.menu_corner_radius = 10.into();
     visuals.hyperlink_color = tokens.primary;
     visuals.warn_fg_color = tokens.amber;
@@ -282,8 +283,11 @@ pub fn apply(ctx: &Context, dark: bool) {
 
     ctx.style_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(11.0, 6.0);
-        style.spacing.interact_size.y = 30.0;
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.spacing.interact_size.y = 32.0;
+        // Smooth hover/expand animations. egui's default is ~0.1 s; a slightly
+        // longer curve makes cards and toggles feel less abrupt.
+        style.animation_time = 0.18;
         style.spacing.scroll.bar_width = 10.0;
         // Native scrollbars are reserved for the few places that opt out of
         // `kit::scroll_*` (horizontal tables). They must read as a white
@@ -292,10 +296,10 @@ pub fn apply(ctx: &Context, dark: bool) {
         style.spacing.scroll.foreground_color = false;
         style.spacing.scroll.handle_min_length = 28.0;
         style.spacing.scroll.bar_inner_margin = 4.0;
-        style.visuals.widgets.inactive.corner_radius = 8.into();
-        style.visuals.widgets.hovered.corner_radius = 8.into();
-        style.visuals.widgets.active.corner_radius = 8.into();
-        style.visuals.widgets.noninteractive.corner_radius = 10.into();
+        style.visuals.widgets.inactive.corner_radius = 10.into();
+        style.visuals.widgets.hovered.corner_radius = 10.into();
+        style.visuals.widgets.active.corner_radius = 10.into();
+        style.visuals.widgets.noninteractive.corner_radius = 12.into();
         style.text_styles.insert(
             TextStyle::Heading,
             FontId::new(24.0, FontFamily::Proportional),
