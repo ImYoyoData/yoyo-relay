@@ -879,9 +879,11 @@ impl App {
             self.update_modal = false;
             return;
         }
+        let note_blocks = markdown::parse(update.notes.trim());
         let mut close = false;
         let mut dismiss = false;
         let mut update_now = false;
+        let mut cancel_update = false;
         let mut open_page = false;
         let closed = kit::modal_shell(
             ctx,
@@ -915,24 +917,24 @@ impl App {
                     .corner_radius(10)
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
-                        if update.notes.trim().is_empty() {
+                        if note_blocks.is_empty() {
                             ui.label(
                                 RichText::new("该版本没有提供发布说明。")
                                     .size(11.0)
                                     .color(theme::muted(ui)),
                             );
                         } else {
-                            ui.add(
-                                egui::Label::new(RichText::new(update.notes.trim()).size(11.0))
-                                    .wrap(),
-                            );
+                            markdown::render(ui, &note_blocks);
                         }
                     });
                 if update.installing {
                     ui.add_space(10.0);
                     ui.add(
                         egui::ProgressBar::new(update.progress)
-                            .show_percentage()
+                            .desired_height(14.0)
+                            .fill(theme::ACCENT)
+                            .corner_radius(7)
+                            .text(format!("{:.0}%", update.progress * 100.0))
                             .animate(true),
                     );
                     if !update.install_message.trim().is_empty() {
@@ -974,6 +976,11 @@ impl App {
             },
             |ui| {
                 if update.installing {
+                    if update.cancelling {
+                        ui.add_enabled(false, egui::Button::new("正在取消…"));
+                    } else if kit::danger_button(ui, icons::X, "取消下载").clicked() {
+                        cancel_update = true;
+                    }
                     if kit::secondary_button(ui, "", "隐藏").clicked() {
                         close = true;
                     }
@@ -1000,6 +1007,10 @@ impl App {
                 }
             },
         );
+        if cancel_update {
+            let _ = self.cmd_tx.send(UiCommand::CancelUpdate);
+            return;
+        }
         if update_now {
             let _ = self.cmd_tx.send(UiCommand::InstallUpdate);
             self.toast(NoticeLevel::Info, "开始下载更新，完成后会自动重启…");

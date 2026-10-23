@@ -11,6 +11,95 @@ use serde_json::Value;
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/ImYoyoData/yoyo-relay/releases/latest";
 
+/// Client for GitHub release checks/downloads. It explicitly honours the
+/// system HTTP/SOCKS proxy (Windows registry, or HTTPS_PROXY/ALL_PROXY) so a
+/// VPN/proxy is used when one is configured.
+pub fn build_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .pool_max_idle_per_host(16)
+        .tcp_nodelay(true)
+        .user_agent(concat!("YoyoRelay/", env!("CARGO_PKG_VERSION")));
+    if let Some(proxy) = system_proxy_url() {
+        if let Ok(proxy) = reqwest::Proxy::all(&proxy) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn system_proxy_url() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        if let Ok(value) = std::env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        return windows_proxy_url();
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_proxy_url() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let query = |name: &str| -> Option<String> {
+        let output = Command::new("reg")
+            .args(["query", KEY, "/v", name])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        let value = text
+            .split("REG_SZ")
+            .nth(1)
+            .or_else(|| text.split("REG_DWORD").nth(1))?;
+        Some(value.trim().to_string())
+    };
+
+    let enabled = query("ProxyEnable")?;
+    if !enabled.contains("0x1") && enabled.trim() != "1" {
+        return None;
+    }
+    let server = query("ProxyServer")?;
+    if server.is_empty() {
+        return None;
+    }
+    let proxy = server
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("https="))
+        .or_else(|| {
+            server
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix("http="))
+        })
+        .unwrap_or(server.as_str())
+        .trim();
+    if proxy.is_empty() {
+        return None;
+    }
+    if proxy.contains("://") {
+        Some(proxy.to_string())
+    } else {
+        Some(format!("http://{proxy}"))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ReleaseInfo {
     pub version: String,

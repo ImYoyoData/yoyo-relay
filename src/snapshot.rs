@@ -111,6 +111,7 @@ pub struct UpdateView {
     pub error: Option<String>,
     /// Self-update download/install progress.
     pub installing: bool,
+    pub cancelling: bool,
     pub progress: f32,
     pub install_message: String,
     pub install_error: Option<String>,

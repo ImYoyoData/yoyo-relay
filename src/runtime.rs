@@ -71,6 +71,8 @@ pub enum UiCommand {
     },
     /// Download the latest release, replace this executable and restart.
     InstallUpdate,
+    /// Abort an in-progress update download.
+    CancelUpdate,
     ReloadPlugins,
     SetPluginEnabled {
         id: String,
@@ -178,6 +180,7 @@ struct Shared {
     update_checking: AtomicBool,
     update_error: Mutex<Option<String>>,
     update_installing: AtomicBool,
+    update_cancelled: AtomicBool,
     update_progress: Mutex<f32>,
     update_message: Mutex<String>,
     update_install_error: Mutex<Option<String>>,
@@ -208,6 +211,7 @@ impl Shared {
             update_checking: AtomicBool::new(false),
             update_error: Mutex::new(None),
             update_installing: AtomicBool::new(false),
+            update_cancelled: AtomicBool::new(false),
             update_progress: Mutex::new(0.0),
             update_message: Mutex::new(String::new()),
             update_install_error: Mutex::new(None),
@@ -606,6 +610,14 @@ impl Runtime {
             UiCommand::RefreshBalance(only) => self.spawn_balance_refresh(only, true),
             UiCommand::CheckUpdate { manual } => self.spawn_update_check(manual),
             UiCommand::InstallUpdate => self.spawn_update_install(),
+            UiCommand::CancelUpdate => {
+                if self.shared.update_installing.load(Ordering::SeqCst) {
+                    self.shared.update_cancelled.store(true, Ordering::SeqCst);
+                    if let Ok(mut message) = self.shared.update_message.lock() {
+                        *message = "正在取消下载…".into();
+                    }
+                }
+            }
             UiCommand::ReloadPlugins => {
                 self.plugins.scan();
                 let host = self.plugins.clone();
@@ -1317,7 +1329,7 @@ impl Runtime {
         let shared = self.shared.clone();
         let store = self.store.clone();
         tokio::spawn(async move {
-            let client = gateway.client_for("https://api.github.com").clone();
+            let client = crate::update::build_client();
             let result = crate::update::fetch_latest_release(&client).await;
             match result {
                 Ok(release) => {
@@ -1385,12 +1397,19 @@ impl Runtime {
         self.shared
             .update_restart_pending
             .store(false, Ordering::SeqCst);
+        self.shared.update_cancelled.store(false, Ordering::SeqCst);
         set_update_progress(&self.shared, 0.0, "正在获取最新版本…");
         let gateway = self.gateway.clone();
         let shared = self.shared.clone();
         tokio::spawn(async move {
             if let Err(err) = install_update(&gateway, &shared).await {
+                let cancelled = shared.update_cancelled.swap(false, Ordering::SeqCst);
                 shared.update_installing.store(false, Ordering::SeqCst);
+                if cancelled {
+                    set_update_progress(&shared, 0.0, "更新已取消");
+                    shared.push_notice(NoticeLevel::Info, "更新已取消，原程序保持不变。");
+                    return;
+                }
                 if let Ok(mut slot) = shared.update_install_error.lock() {
                     *slot = Some(err.clone());
                 }
@@ -1894,6 +1913,7 @@ impl Runtime {
                     .map(|slot| slot.clone())
                     .unwrap_or(None),
                 installing: self.shared.update_installing.load(Ordering::SeqCst),
+                cancelling: self.shared.update_cancelled.load(Ordering::SeqCst),
                 progress: self
                     .shared
                     .update_progress
@@ -2202,7 +2222,8 @@ fn set_update_progress(shared: &Shared, progress: f32, message: impl Into<String
 }
 
 async fn install_update(gateway: &Gateway, shared: &Shared) -> Result<(), String> {
-    let client = gateway.client_for("https://api.github.com").clone();
+    let _ = gateway;
+    let client = crate::update::build_client();
     let release = crate::update::fetch_latest_release(&client)
         .await
         .map_err(|err| format!("{err:#}"))?;
@@ -2239,33 +2260,55 @@ async fn install_update(gateway: &Gateway, shared: &Shared) -> Result<(), String
     } else {
         response.content_length().unwrap_or(0)
     };
-    let mut file = tokio::fs::File::create(&archive)
-        .await
-        .map_err(|err| format!("创建更新包失败：{err}"))?;
+    let mut file = tokio::io::BufWriter::with_capacity(
+        256 * 1024,
+        tokio::fs::File::create(&archive)
+            .await
+            .map_err(|err| format!("创建更新包失败：{err}"))?,
+    );
     let mut hasher = Sha256::new();
     let mut downloaded = 0u64;
+    let mut last_report_at = Instant::now();
+    let mut last_report_bytes = 0u64;
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|err| format!("读取更新包失败：{err}"))?
     {
+        if shared.update_cancelled.load(Ordering::SeqCst) {
+            let _ = file.flush().await;
+            drop(file);
+            let _ = std::fs::remove_dir_all(&work);
+            return Err("已取消".into());
+        }
         file.write_all(&chunk)
             .await
             .map_err(|err| format!("写入更新包失败：{err}"))?;
         hasher.update(&chunk);
         downloaded += chunk.len() as u64;
+        // Update the UI at most five times per second. Reporting every network
+        // chunk contended on the shared mutex and made the download slow.
         if total > 0 {
-            let ratio = (downloaded as f32 / total as f32).clamp(0.0, 0.99);
-            set_update_progress(
-                shared,
-                ratio,
-                format!(
-                    "正在下载 v{} · {:.1} / {:.1} MB",
-                    release.version,
-                    downloaded as f64 / 1_048_576.0,
-                    total as f64 / 1_048_576.0
-                ),
-            );
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_report_at).as_secs_f64();
+            if elapsed >= 0.2 || downloaded >= total {
+                let speed =
+                    downloaded.saturating_sub(last_report_bytes) as f64 / elapsed.max(0.001);
+                let ratio = (downloaded as f32 / total as f32).clamp(0.0, 0.99);
+                set_update_progress(
+                    shared,
+                    ratio,
+                    format!(
+                        "正在下载 v{} · {:.1} / {:.1} MB · {:.1} MB/s",
+                        release.version,
+                        downloaded as f64 / 1_048_576.0,
+                        total as f64 / 1_048_576.0,
+                        speed / 1_048_576.0
+                    ),
+                );
+                last_report_at = now;
+                last_report_bytes = downloaded;
+            }
         }
     }
     file.flush()
@@ -2293,6 +2336,10 @@ async fn install_update(gateway: &Gateway, shared: &Shared) -> Result<(), String
         }
     }
 
+    if shared.update_cancelled.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err("已取消".into());
+    }
     set_update_progress(shared, 0.99, "正在解压更新包…");
     let extract = work.join("extract");
     std::fs::create_dir_all(&extract).map_err(|err| format!("创建解压目录失败：{err}"))?;
@@ -2359,6 +2406,10 @@ async fn install_update(gateway: &Gateway, shared: &Shared) -> Result<(), String
         return Err("更新包中的文件不是可执行程序。".into());
     }
 
+    if shared.update_cancelled.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err("已取消".into());
+    }
     set_update_progress(shared, 0.995, "正在准备替换程序…");
     let current = std::env::current_exe().map_err(|err| format!("无法定位当前程序：{err}"))?;
     let file_name = current
