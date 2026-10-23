@@ -2,7 +2,7 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。发布标签格式为 `vX.Y.Z`，发布说明由本文件对应版本的小节自动提取。
 
-## [Unreleased]
+## [0.6.0] - 2026-10-23
 
 ### 新增
 
