@@ -640,7 +640,7 @@ impl App {
         let Some(mut editor) = self.editor.take() else {
             return;
         };
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, PartialEq, Eq)]
         enum EditorKind {
             Provider,
             Account,
@@ -708,6 +708,7 @@ impl App {
                 balance_setup_subtitle.as_str(),
             ),
         };
+        let is_new_provider = matches!(&editor, Editor::Provider(draft) if draft.is_new);
         let mut action = None;
         let width = match kind {
             EditorKind::Provider => 920.0,
@@ -733,6 +734,14 @@ impl App {
             |ui| {
                 match kind {
                     EditorKind::Provider | EditorKind::Account | EditorKind::Route => {
+                        if kind == EditorKind::Provider && is_new_provider {
+                            if super::kit::secondary_button(ui, icons::SPARKLE, "AI 帮我创建")
+                                .on_hover_text("用已配置的供应商和账号调用 AI，自动填写供应商信息")
+                                .clicked()
+                            {
+                                action = Some(EditorAction::AiProvider);
+                            }
+                        }
                         if super::kit::primary_button(ui, icons::FLASK, "保存并测试").clicked()
                         {
                             action = Some(EditorAction::SaveTest);
@@ -773,6 +782,17 @@ impl App {
         match action {
             None => self.editor = Some(editor),
             Some(EditorAction::Cancel) => self.editor = None,
+            Some(EditorAction::AiProvider) => {
+                self.editor = None;
+                self.ai_provider_open = true;
+                self.ai_provider_prompt.clear();
+                self.ai_provider_account_key.clear();
+                self.ai_provider_error = None;
+                self.ai_provider_generating = false;
+                self.ai_provider_token = 0;
+                self.ensure_ai_caller_selection();
+                let _ = self.cmd_tx.send(crate::runtime::UiCommand::ClearAiProvider);
+            }
             Some(kind) => {
                 let test = kind == EditorAction::SaveTest;
                 let saved = match &editor {
@@ -905,6 +925,269 @@ impl App {
         );
         if closed || close {
             self.currency_error = None;
+        }
+    }
+
+    pub(crate) fn show_close_confirm(&mut self, ctx: &egui::Context) {
+        if !self.close_confirm_open {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        let hide_choice = std::cell::Cell::new(self.close_hide_to_tray);
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_close_confirm"),
+            &format!("关闭 {}", crate::identity::APP_NAME),
+            "请选择关闭主窗口后的行为",
+            520.0,
+            |ui| {
+                ui.label(
+                    RichText::new("关闭主窗口后，代理可以继续在后台运行，也可以直接退出。")
+                        .size(12.0),
+                );
+                ui.add_space(10.0);
+                let mut checked = hide_choice.get();
+                if ui
+                    .checkbox(&mut checked, "隐藏到系统托盘（代理继续运行）")
+                    .changed()
+                {
+                    hide_choice.set(checked);
+                }
+                ui.add_space(6.0);
+                if hide_choice.get() {
+                    super::kit::info_row(
+                        ui,
+                        icons::INFO,
+                        "窗口与任务栏图标会隐藏，代理继续处理请求；可从托盘菜单重新打开或退出。",
+                    );
+                } else {
+                    super::kit::info_row(
+                        ui,
+                        icons::WARNING,
+                        "程序将退出，代理停止，正在处理的请求会被中断。",
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "此提示只显示一次；之后可在「设置 → 启动与托盘」中随时修改关闭行为。",
+                    )
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+                );
+            },
+            |ui| {
+                if super::kit::primary_button(
+                    ui,
+                    icons::CHECK,
+                    if hide_choice.get() {
+                        "隐藏到托盘"
+                    } else {
+                        "退出程序"
+                    },
+                )
+                .clicked()
+                {
+                    confirm = true;
+                }
+                if super::kit::secondary_button(ui, "", "取消").clicked() {
+                    cancel = true;
+                }
+            },
+        );
+        if closed || cancel {
+            self.close_confirm_open = false;
+            return;
+        }
+        if confirm {
+            let hide_to_tray = hide_choice.get();
+            self.close_hide_to_tray = hide_to_tray;
+            self.config.ui.close_to_tray = hide_to_tray;
+            self.config.ui.close_confirm_done = true;
+            self.persist();
+            self.close_confirm_open = false;
+            if hide_to_tray {
+                self.hide_to_tray(ctx);
+            } else {
+                self.quit(ctx);
+            }
+        }
+    }
+
+    pub(crate) fn show_proxy_status_modal(&mut self, ctx: &egui::Context) {
+        if !self.proxy_status_open {
+            return;
+        }
+        let (color, label) = self.proxy_status();
+        let running = self.snapshot.proxy.is_running();
+        let port = self.config.server.port;
+        let active = self.snapshot.active_requests.to_string();
+        let queued = self.snapshot.queued_requests.to_string();
+        let uptime = crate::config::fmt_duration_secs(self.snapshot.uptime_secs);
+        let max_concurrency = self.config.server.max_global_concurrency.to_string();
+        let queue_capacity = self.config.server.queue_capacity.to_string();
+        let tokens = widgets::format_count(self.snapshot.today.totals.total_tokens);
+        let mut urls: Vec<String> = self
+            .snapshot
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.url.clone())
+            .filter(|url| !url.is_empty())
+            .collect();
+        if urls.is_empty() && !self.snapshot.endpoint.is_empty() {
+            urls.push(self.snapshot.endpoint.clone());
+        }
+        urls.dedup();
+        let mut close = false;
+        let mut toggle = false;
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_proxy_status"),
+            "代理运行状态",
+            "端点、运行指标与代理控制",
+            620.0,
+            |ui| {
+                ui.horizontal(|ui| {
+                    super::kit::status_pill(ui, &label, color);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("Port: {port}"))
+                                .monospace()
+                                .size(10.0)
+                                .color(theme::muted(ui)),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+                super::kit::section_label(ui, "端点");
+                for url in &urls {
+                    ui.horizontal_top(|ui| {
+                        let text_width = (ui.available_width() - 24.0).max(120.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(text_width, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(text_width);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(url)
+                                            .monospace()
+                                            .size(10.5)
+                                            .color(theme::text(ui)),
+                                    )
+                                    .wrap(),
+                                );
+                            },
+                        );
+                        if super::kit::icon_button(ui, icons::COPY, "复制该端点").clicked() {
+                            ui.ctx().copy_text(url.clone());
+                            self.toast(NoticeLevel::Success, "端点已复制");
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+                ui.add_space(8.0);
+                ui.columns(3, |cols| {
+                    super::kit::mini_stat(&mut cols[0], "持续时长", &uptime);
+                    super::kit::mini_stat(&mut cols[1], "活跃请求", &active);
+                    super::kit::mini_stat(&mut cols[2], "排队中", &queued);
+                });
+                ui.add_space(6.0);
+                ui.columns(2, |cols| {
+                    super::kit::mini_stat(&mut cols[0], "并发上限", &max_concurrency);
+                    super::kit::mini_stat(&mut cols[1], "队列容量", &queue_capacity);
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("今日 {tokens} tokens"))
+                        .size(9.5)
+                        .color(theme::muted(ui)),
+                );
+            },
+            |ui| {
+                if running {
+                    if super::kit::danger_button(ui, icons::STOP, "停止代理").clicked() {
+                        toggle = true;
+                    }
+                } else if super::kit::primary_button(ui, icons::PLAY, "启动代理").clicked() {
+                    toggle = true;
+                }
+                if super::kit::secondary_button(ui, "", "关闭").clicked() {
+                    close = true;
+                }
+            },
+        );
+        if toggle {
+            let _ = self.cmd_tx.send(if running {
+                crate::runtime::UiCommand::StopProxy
+            } else {
+                crate::runtime::UiCommand::StartProxy
+            });
+        }
+        if closed || close {
+            self.proxy_status_open = false;
+        }
+    }
+
+    pub(crate) fn show_alerts_modal(&mut self, ctx: &egui::Context) {
+        if !self.alerts_open {
+            return;
+        }
+        let alerts = self.snapshot.alerts.clone();
+        let mut close = false;
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_alerts"),
+            "系统告警",
+            &format!("共 {} 项 · 按严重程度汇总", alerts.len()),
+            680.0,
+            |ui| {
+                if alerts.is_empty() {
+                    super::kit::info_row(ui, icons::CHECK_CIRCLE, "当前没有需要处理的告警。");
+                    return;
+                }
+                super::kit::scroll_capped(ui, "alerts_modal_scroll", 420.0, false, |ui| {
+                    for alert in &alerts {
+                        let (color, icon) = match alert.level {
+                            crate::snapshot::AlertLevel::Info => (theme::BLUE_INFO, icons::INFO),
+                            crate::snapshot::AlertLevel::Warning => (theme::ORANGE, icons::WARNING),
+                            crate::snapshot::AlertLevel::Critical => {
+                                (theme::RED, icons::WARNING_OCTAGON)
+                            }
+                        };
+                        egui::Frame::new()
+                            .fill(theme::soft_for(ui, color))
+                            .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.28)))
+                            .corner_radius(10)
+                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal_top(|ui| {
+                                    ui.label(RichText::new(icon).size(15.0).color(color));
+                                    ui.add_space(3.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&alert.text)
+                                                .size(11.0)
+                                                .color(theme::text(ui)),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                            });
+                        ui.add_space(6.0);
+                    }
+                });
+            },
+            |ui| {
+                if super::kit::secondary_button(ui, "", "关闭").clicked() {
+                    close = true;
+                }
+            },
+        );
+        if closed || close {
+            self.alerts_open = false;
         }
     }
 
@@ -1667,6 +1950,406 @@ impl App {
         }
     }
 
+    fn ai_caller_providers(&self) -> Vec<crate::config::Provider> {
+        self.config
+            .providers
+            .iter()
+            .filter(|provider| {
+                !provider.base_url.starts_with("plugin://")
+                    && self
+                        .config
+                        .accounts
+                        .iter()
+                        .any(|account| account.provider_id == provider.id && account.enabled)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn ai_caller_models(&self, provider_id: &str) -> Vec<String> {
+        let mut models = Vec::new();
+        if let Some(view) = self.snapshot.provider_models.get(provider_id) {
+            models.extend(view.models.iter().cloned());
+        }
+        for route in &self.config.routes {
+            if route.provider_id == provider_id {
+                models.push(route.upstream_model.clone());
+            }
+        }
+        if let Some(provider) = self.config.provider(provider_id) {
+            if let Some(model) = &provider.test_model {
+                models.push(model.clone());
+            }
+        }
+        models.sort();
+        models.dedup();
+        models
+    }
+
+    fn ensure_ai_caller_selection(&mut self) {
+        let providers = self.ai_caller_providers();
+        if providers.is_empty() {
+            self.config.ui.ai_provider_id.clear();
+            self.config.ui.ai_account_id.clear();
+            return;
+        }
+        if !providers
+            .iter()
+            .any(|provider| provider.id == self.config.ui.ai_provider_id)
+        {
+            self.config.ui.ai_provider_id = providers[0].id.clone();
+        }
+        let provider_id = self.config.ui.ai_provider_id.clone();
+        let account_ids: Vec<String> = self
+            .config
+            .accounts
+            .iter()
+            .filter(|account| account.provider_id == provider_id && account.enabled)
+            .map(|account| account.id.clone())
+            .collect();
+        if !account_ids.contains(&self.config.ui.ai_account_id) {
+            self.config.ui.ai_account_id = account_ids.first().cloned().unwrap_or_default();
+        }
+        let models = self.ai_caller_models(&provider_id);
+        if self.config.ui.ai_model.is_empty() || !models.contains(&self.config.ui.ai_model) {
+            self.config.ui.ai_model = models.first().cloned().unwrap_or_default();
+        }
+    }
+
+    pub(crate) fn show_ai_provider_modal(&mut self, ctx: &egui::Context) {
+        if !self.ai_provider_open {
+            return;
+        }
+        self.ensure_ai_caller_selection();
+        let view = self
+            .snapshot
+            .ai_provider
+            .clone()
+            .filter(|view| view.token == self.ai_provider_token);
+        let running =
+            self.ai_provider_generating || view.as_ref().map(|view| view.running).unwrap_or(false);
+        if !running && self.ai_provider_generating {
+            self.ai_provider_generating = false;
+        }
+        let providers = self.ai_caller_providers();
+        let provider_id = self.config.ui.ai_provider_id.clone();
+        let accounts: Vec<(String, String)> = self
+            .config
+            .accounts
+            .iter()
+            .filter(|account| account.provider_id == provider_id && account.enabled)
+            .map(|account| (account.id.clone(), account.name.clone()))
+            .collect();
+        let models = self.ai_caller_models(&provider_id);
+        let has_caller = !providers.is_empty() && !accounts.is_empty();
+        let generated = view.as_ref().and_then(|view| view.provider.clone());
+        let error = view
+            .as_ref()
+            .and_then(|view| view.error.clone())
+            .or_else(|| self.ai_provider_error.clone());
+        let prompt_ready = !self.ai_provider_prompt.trim().is_empty();
+        let mut generate = false;
+        let mut apply = false;
+        let mut cancel = false;
+        let mut selection_changed = false;
+
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_ai_provider"),
+            "AI 创建供应商",
+            "选择一个可用的供应商/账号调用 AI，描述你想要的供应商，检查后一键创建",
+            780.0,
+            |ui| {
+                if providers.is_empty() {
+                    super::kit::info_row(
+                        ui,
+                        icons::INFO,
+                        "需要至少一个可用的供应商和启用账号作为 AI 调用来源。请先添加供应商与账号。",
+                    );
+                    return;
+                }
+                super::kit::section_label(ui, "AI 调用来源");
+                ui.add_space(4.0);
+                egui::Grid::new("ai_provider_caller")
+                    .num_columns(2)
+                    .spacing([14.0, 9.0])
+                    .show(ui, |ui| {
+                        ui.label("供应商");
+                        let provider_name = providers
+                            .iter()
+                            .find(|provider| provider.id == self.config.ui.ai_provider_id)
+                            .map(|provider| provider.name.clone())
+                            .unwrap_or_else(|| "请选择".into());
+                        let mut selected = self.config.ui.ai_provider_id.clone();
+                        ComboBox::from_id_salt("ai_caller_provider")
+                            .selected_text(provider_name)
+                            .show_ui(ui, |ui| {
+                                for provider in &providers {
+                                    ui.selectable_value(
+                                        &mut selected,
+                                        provider.id.clone(),
+                                        &provider.name,
+                                    );
+                                }
+                            });
+                        if selected != self.config.ui.ai_provider_id {
+                            self.config.ui.ai_provider_id = selected;
+                            self.config.ui.ai_account_id.clear();
+                            self.config.ui.ai_model.clear();
+                            self.ensure_ai_caller_selection();
+                            selection_changed = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("账号");
+                        let account_name = accounts
+                            .iter()
+                            .find(|(id, _)| id == &self.config.ui.ai_account_id)
+                            .map(|(_, name)| name.clone())
+                            .unwrap_or_else(|| "请选择".into());
+                        let mut selected = self.config.ui.ai_account_id.clone();
+                        ComboBox::from_id_salt("ai_caller_account")
+                            .selected_text(account_name)
+                            .show_ui(ui, |ui| {
+                                for (id, name) in &accounts {
+                                    ui.selectable_value(&mut selected, id.clone(), name);
+                                }
+                            });
+                        if selected != self.config.ui.ai_account_id {
+                            self.config.ui.ai_account_id = selected;
+                            selection_changed = true;
+                        }
+                        ui.end_row();
+
+                        ui.label("模型");
+                        if models.is_empty() {
+                            ui.add(
+                                kit::text_input(&mut self.config.ui.ai_model)
+                                    .desired_width(360.0)
+                                    .hint_text("输入用于调用 AI 的上游模型名"),
+                            );
+                        } else {
+                            let mut selected = self.config.ui.ai_model.clone();
+                            ComboBox::from_id_salt("ai_caller_model")
+                                .selected_text(if selected.is_empty() {
+                                    "请选择".to_string()
+                                } else {
+                                    selected.clone()
+                                })
+                                .show_ui(ui, |ui| {
+                                    for model in &models {
+                                        ui.selectable_value(&mut selected, model.clone(), model);
+                                    }
+                                });
+                            if selected != self.config.ui.ai_model {
+                                self.config.ui.ai_model = selected;
+                                selection_changed = true;
+                            }
+                        }
+                        ui.end_row();
+                    });
+                ui.label(
+                    RichText::new(
+                        "选择会缓存到配置；如果供应商或账号被删除，生成时会提示重新选择。",
+                    )
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+                );
+
+                ui.add_space(10.0);
+                super::kit::section_label(ui, "需求描述");
+                ui.add(
+                    kit::text_area(&mut self.ai_provider_prompt)
+                        .id(Id::new("ai_provider_prompt"))
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(4)
+                        .hint_text("例如：添加 OpenRouter，OpenAI 兼容，Base URL https://openrouter.ai/api/v1，测试模型 openai/gpt-4o-mini；Claude 模型走 Anthropic 端点。"),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("新供应商默认账号 Key（可选，仅本地加密保存，不会发送给 AI）")
+                        .size(10.0)
+                        .color(theme::muted(ui)),
+                );
+                ui.add(
+                    kit::text_input(&mut self.ai_provider_account_key)
+                        .password(true)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("留空则创建供应商后手动添加账号"),
+                );
+
+                if running {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("AI 正在生成供应商配置…");
+                    });
+                }
+                if let Some(err) = &error {
+                    ui.add_space(8.0);
+                    super::kit::info_row(ui, icons::WARNING_CIRCLE, err);
+                }
+                if let Some(provider) = &generated {
+                    ui.add_space(10.0);
+                    super::kit::soft_panel(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            brands::tile(ui, &brands::for_name(&provider.name), 40.0);
+                            ui.add_space(3.0);
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&provider.name).size(14.0).strong());
+                                    kit::badge(ui, provider.kind.label(), theme::BLUE_INFO);
+                                });
+                                ui.label(
+                                    RichText::new(&provider.base_url)
+                                        .monospace()
+                                        .size(9.5)
+                                        .color(theme::muted(ui)),
+                                );
+                            });
+                        });
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "协议 {} · 认证 {} · 测试模型 {}",
+                                provider.static_protocol.label(),
+                                provider.auth.mode.label(),
+                                provider.test_model.as_deref().unwrap_or("—")
+                            ))
+                            .size(10.0)
+                            .color(theme::muted(ui)),
+                        );
+                        if !provider.protocol_base_urls.is_empty() {
+                            for (protocol, url) in &provider.protocol_base_urls {
+                                ui.label(
+                                    RichText::new(format!("{protocol} → {url}"))
+                                        .monospace()
+                                        .size(9.0)
+                                        .color(theme::muted(ui)),
+                                );
+                            }
+                        }
+                    });
+                }
+            },
+            |ui| {
+                if generated.is_some() {
+                    if kit::primary_button(ui, icons::CHECK, "应用并创建").clicked() {
+                        apply = true;
+                    }
+                    if kit::secondary_button(ui, icons::SPARKLE, "重新生成").clicked() {
+                        generate = true;
+                    }
+                } else if kit::primary_button(ui, icons::SPARKLE, "生成").clicked()
+                    && !running
+                    && prompt_ready
+                    && has_caller
+                {
+                    generate = true;
+                }
+                if kit::secondary_button(ui, "", "取消").clicked() {
+                    cancel = true;
+                }
+            },
+        );
+
+        if selection_changed {
+            self.persist();
+        }
+        if generate && !running && has_caller && prompt_ready {
+            let provider_id = self.config.ui.ai_provider_id.clone();
+            let account_id = self.config.ui.ai_account_id.clone();
+            let provider_ok = self.config.provider(&provider_id).is_some();
+            let account_ok = self
+                .config
+                .account(&account_id)
+                .is_some_and(|account| account.provider_id == provider_id && account.enabled);
+            if !provider_ok {
+                self.ai_provider_error = Some("缓存的供应商已被移除，请重新选择。".into());
+            } else if !account_ok {
+                self.ai_provider_error = Some("缓存的账号已被移除或停用，请重新选择。".into());
+            } else if self.config.ui.ai_model.trim().is_empty() {
+                self.ai_provider_error = Some("请选择或填写用于调用 AI 的模型。".into());
+            } else {
+                self.ai_provider_seq = self.ai_provider_seq.wrapping_add(1).max(1);
+                self.ai_provider_token = self.ai_provider_seq;
+                self.ai_provider_generating = true;
+                self.ai_provider_error = None;
+                let _ = self
+                    .cmd_tx
+                    .send(crate::runtime::UiCommand::GenerateAiProvider {
+                        provider_id,
+                        account_id,
+                        model: self.config.ui.ai_model.clone(),
+                        prompt: self.ai_provider_prompt.clone(),
+                        token: self.ai_provider_token,
+                    });
+                self.toast(NoticeLevel::Info, "正在让 AI 生成供应商配置…");
+            }
+        }
+        if apply {
+            if let Some(mut provider) = generated {
+                provider.id = new_id();
+                provider.created_at = now_ts();
+                let backup = self.config.clone();
+                self.config.providers.push(provider.clone());
+                let key = self.ai_provider_account_key.trim().to_string();
+                let mut account_created = false;
+                if !key.is_empty() {
+                    match self.store.encrypt(&key) {
+                        Ok(encrypted) => {
+                            self.config.accounts.push(Account {
+                                id: new_id(),
+                                provider_id: provider.id.clone(),
+                                name: "默认账号".into(),
+                                api_key: encrypted,
+                                created_at: now_ts(),
+                                ..Account::default()
+                            });
+                            account_created = true;
+                        }
+                        Err(err) => {
+                            self.config = backup;
+                            self.ai_provider_error = Some(format!("保存默认账号 Key 失败：{err}"));
+                            return;
+                        }
+                    }
+                }
+                if !self.persist() {
+                    self.config = backup;
+                    return;
+                }
+                self.ai_provider_open = false;
+                self.ai_provider_generating = false;
+                self.ai_provider_token = 0;
+                self.ai_provider_account_key.clear();
+                let _ = self.cmd_tx.send(crate::runtime::UiCommand::ClearAiProvider);
+                self.page = Page::Providers;
+                if account_created {
+                    self.toast(
+                        NoticeLevel::Success,
+                        format!("AI 已创建供应商「{}」和默认账号", provider.name),
+                    );
+                } else {
+                    self.toast(
+                        NoticeLevel::Success,
+                        format!("AI 已创建供应商「{}」，请添加账号", provider.name),
+                    );
+                    self.open_new_account_for(&provider.id);
+                }
+            }
+            return;
+        }
+        if closed || cancel {
+            self.ai_provider_open = false;
+            self.ai_provider_generating = false;
+            self.ai_provider_token = 0;
+            self.ai_provider_account_key.clear();
+            let _ = self.cmd_tx.send(crate::runtime::UiCommand::ClearAiProvider);
+        }
+    }
+
     // -- onboarding ---------------------------------------------------------
     // -- onboarding ---------------------------------------------------------
 
@@ -1822,6 +2505,7 @@ enum EditorAction {
     Cancel,
     Save,
     SaveTest,
+    AiProvider,
 }
 
 // ---------------------------------------------------------------------------

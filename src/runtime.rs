@@ -108,6 +108,14 @@ pub enum UiCommand {
         token: u64,
     },
     ClearAiPricing,
+    GenerateAiProvider {
+        provider_id: String,
+        account_id: String,
+        model: String,
+        prompt: String,
+        token: u64,
+    },
+    ClearAiProvider,
     CleanupNow,
     Shutdown,
 }
@@ -163,6 +171,7 @@ struct Shared {
     fetched_model: Mutex<Option<FetchedModelView>>,
     model_fetch_running: AtomicBool,
     ai_pricing: Mutex<Option<AiPricingView>>,
+    ai_provider: Mutex<Option<crate::snapshot::AiProviderView>>,
     provider_models: Mutex<HashMap<String, ProviderModelsView>>,
     models_fetching: Mutex<HashSet<String>>,
     fx_refreshing: AtomicBool,
@@ -192,6 +201,7 @@ impl Shared {
             fetched_model: Mutex::new(None),
             model_fetch_running: AtomicBool::new(false),
             ai_pricing: Mutex::new(None),
+            ai_provider: Mutex::new(None),
             provider_models: Mutex::new(HashMap::new()),
             models_fetching: Mutex::new(HashSet::new()),
             fx_refreshing: AtomicBool::new(false),
@@ -765,6 +775,11 @@ impl Runtime {
                     *slot = None;
                 }
             }
+            UiCommand::ClearAiProvider => {
+                if let Ok(mut slot) = self.shared.ai_provider.lock() {
+                    *slot = None;
+                }
+            }
             UiCommand::GenerateAiPricing {
                 route_id,
                 provider_id,
@@ -814,6 +829,60 @@ impl Runtime {
                         token,
                         running: false,
                         plan,
+                        error,
+                    });
+                });
+            }
+            UiCommand::GenerateAiProvider {
+                provider_id,
+                account_id,
+                model,
+                prompt,
+                token,
+            } => {
+                if let Ok(mut slot) = self.shared.ai_provider.lock() {
+                    *slot = Some(crate::snapshot::AiProviderView {
+                        token,
+                        running: true,
+                        provider: None,
+                        error: None,
+                    });
+                }
+                let gateway = self.gateway.clone();
+                let shared = self.shared.clone();
+                tokio::spawn(async move {
+                    let result = probe::generate_provider_plan(
+                        &gateway,
+                        &provider_id,
+                        &account_id,
+                        &model,
+                        &prompt,
+                    )
+                    .await;
+                    let (provider, error) = match result {
+                        Ok(provider) => (Some(provider), None),
+                        Err(err) => (None, Some(err)),
+                    };
+                    let Ok(mut slot) = shared.ai_provider.lock() else {
+                        return;
+                    };
+                    if slot.as_ref().map(|view| view.token) != Some(token) {
+                        return;
+                    }
+                    match (&provider, &error) {
+                        (Some(provider), _) => shared.push_notice(
+                            NoticeLevel::Success,
+                            format!("AI 已生成供应商「{}」，请检查后应用。", provider.name),
+                        ),
+                        (_, Some(err)) => {
+                            shared.push_notice(NoticeLevel::Error, format!("AI 生成失败：{err}"))
+                        }
+                        _ => {}
+                    }
+                    *slot = Some(crate::snapshot::AiProviderView {
+                        token,
+                        running: false,
+                        provider,
                         error,
                     });
                 });
@@ -1585,7 +1654,7 @@ impl Runtime {
         }
 
         let usage = self.build_usage(&cfg);
-        const CALLS_PAGE_SIZE: usize = 20;
+        const CALLS_PAGE_SIZE: usize = 10;
         let calls_total = self.db.usage_count(&self.calls_filter).unwrap_or(0);
         let max_page = ((calls_total as usize).saturating_sub(1)) / CALLS_PAGE_SIZE;
         if self.calls_page > max_page {
@@ -1766,6 +1835,12 @@ impl Runtime {
             ai_pricing: self
                 .shared
                 .ai_pricing
+                .lock()
+                .map(|slot| slot.clone())
+                .unwrap_or(None),
+            ai_provider: self
+                .shared
+                .ai_provider
                 .lock()
                 .map(|slot| slot.clone())
                 .unwrap_or(None),

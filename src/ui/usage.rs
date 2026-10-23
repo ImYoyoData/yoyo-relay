@@ -1,4 +1,5 @@
 use egui::RichText;
+use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icons;
 
 use crate::runtime::UiCommand;
@@ -309,139 +310,206 @@ impl App {
                 return;
             }
             let mut toggled: Option<String> = None;
-            for group in &usage.groups {
-                let expanded = self.usage_expanded.contains(&group.key);
-                let pairs: Vec<_> = usage
-                    .model_pairs
-                    .iter()
-                    .filter(|(client, _, _)| client == &group.key)
-                    .cloned()
-                    .collect();
-                egui::Frame::new()
-                    .fill(theme::subtle_fill(ui))
-                    .corner_radius(10)
-                    .inner_margin(egui::Margin::symmetric(12, 9))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if usage.dimension == UsageDimension::Model {
-                                if super::kit::icon_button(
-                                    ui,
-                                    if expanded {
-                                        icons::CARET_DOWN
-                                    } else {
-                                        icons::CARET_RIGHT
-                                    },
-                                    if expanded {
-                                        "收起上游拆分"
-                                    } else {
-                                        "展开上游拆分"
-                                    },
-                                )
-                                .clicked()
-                                {
-                                    toggled = Some(group.key.clone());
-                                }
-                            }
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new(&group.label)
-                                        .size(12.5)
-                                        .strong()
-                                        .color(theme::text(ui)),
-                                );
+            let t = theme::tokens(ui);
+            let avail = ui.available_width();
+            let base = [280.0, 110.0, 110.0, 110.0, 160.0];
+            let total: f32 = base.iter().sum();
+            let scale = (avail / total).clamp(0.7, 1.5);
+            let mut builder = TableBuilder::new(ui)
+                .striped(true)
+                .resizable(false)
+                .vscroll(false)
+                .auto_shrink([false, true])
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+            for width in base {
+                builder = builder.column(Column::initial(width * scale).at_least(60.0));
+            }
+            builder
+                .header(26.0, |mut header| {
+                    for label in ["分组", "请求 / 成功", "Tokens", "花费", "首字 / 总耗时"]
+                    {
+                        header.col(|ui| {
+                            ui.label(RichText::new(label).size(9.0).strong().color(t.muted));
+                        });
+                    }
+                })
+                .body(|mut body| {
+                    for group in &usage.groups {
+                        let expanded = self.usage_expanded.contains(&group.key);
+                        let pairs: Vec<_> = usage
+                            .model_pairs
+                            .iter()
+                            .filter(|(client, _, _)| client == &group.key)
+                            .cloned()
+                            .collect();
+                        body.row(34.0, |mut table_row| {
+                            table_row.col(|ui| {
+                                ui.horizontal(|ui| {
+                                    if usage.dimension == UsageDimension::Model {
+                                        if super::kit::icon_button(
+                                            ui,
+                                            if expanded {
+                                                icons::CARET_DOWN
+                                            } else {
+                                                icons::CARET_RIGHT
+                                            },
+                                            if expanded {
+                                                "收起上游拆分"
+                                            } else {
+                                                "展开上游拆分"
+                                            },
+                                        )
+                                        .clicked()
+                                        {
+                                            toggled = Some(group.key.clone());
+                                        }
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&group.label)
+                                                .size(11.5)
+                                                .strong()
+                                                .color(t.text),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                            });
+                            table_row.col(|ui| {
                                 ui.label(
                                     RichText::new(format!(
-                                        "{} 请求 · {} 成功 · 平均耗时 {}",
-                                        group.totals.requests,
-                                        group.totals.ok,
-                                        widgets::format_duration_ms(group.totals.avg_latency_ms)
+                                        "{} / {}",
+                                        group.totals.requests, group.totals.ok
                                     ))
+                                    .monospace()
                                     .size(9.5)
-                                    .color(theme::muted(ui)),
+                                    .color(t.text),
                                 );
                             });
-                            let metrics_width = 4.0 * 82.0 + 3.0 * 10.0;
-                            let remaining = ui.available_width();
-                            if remaining > metrics_width + 16.0 {
-                                ui.add_space(remaining - metrics_width);
-                            }
-                            metric_column(
-                                ui,
-                                "请求 / 成功",
-                                &format!("{} / {}", group.totals.requests, group.totals.ok),
-                                false,
-                            );
-                            metric_column(
-                                ui,
-                                "Tokens",
-                                &widgets::format_count(group.totals.total_tokens),
-                                true,
-                            );
-                            metric_column(
-                                ui,
-                                "花费",
-                                &widgets::format_cost_with(
-                                    group.totals.cost_micros,
-                                    &self.config.ui,
-                                ),
-                                false,
-                            );
-                            metric_column(
-                                ui,
-                                "平均耗时",
-                                &widgets::format_duration_ms(group.totals.avg_latency_ms),
-                                false,
-                            );
+                            table_row.col(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(widgets::format_count(
+                                                group.totals.total_tokens,
+                                            ))
+                                            .monospace()
+                                            .size(9.5)
+                                            .color(t.text),
+                                        );
+                                    },
+                                );
+                            });
+                            table_row.col(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(widgets::format_cost_with(
+                                                group.totals.cost_micros,
+                                                &self.config.ui,
+                                            ))
+                                            .size(9.5)
+                                            .color(theme::ORANGE),
+                                        );
+                                    },
+                                );
+                            });
+                            table_row.col(|ui| {
+                                let text = if group.totals.avg_first_token_ms > 0 {
+                                    format!(
+                                        "总 {} (首字 {})",
+                                        widgets::format_duration_ms(group.totals.avg_latency_ms),
+                                        widgets::format_duration_ms(
+                                            group.totals.avg_first_token_ms
+                                        )
+                                    )
+                                } else {
+                                    format!(
+                                        "总 {}",
+                                        widgets::format_duration_ms(group.totals.avg_latency_ms)
+                                    )
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text).monospace().size(8.5).color(t.muted),
+                                    )
+                                    .truncate(),
+                                );
+                            });
                         });
                         if expanded {
-                            ui.add_space(6.0);
                             for (_, upstream, totals) in pairs {
-                                egui::Frame::new()
-                                    .fill(theme::tokens(ui).card)
-                                    .corner_radius(8)
-                                    .inner_margin(egui::Margin::symmetric(10, 7))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
+                                body.row(30.0, |mut table_row| {
+                                    table_row.col(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
                                                 RichText::new(format!("↳ {upstream}"))
                                                     .monospace()
-                                                    .size(10.0)
-                                                    .color(theme::muted(ui)),
-                                            );
-                                            let metrics_width = 3.0 * 82.0 + 2.0 * 10.0;
-                                            let remaining = ui.available_width();
-                                            if remaining > metrics_width + 16.0 {
-                                                ui.add_space(remaining - metrics_width);
-                                            }
-                                            metric_column(
-                                                ui,
-                                                "请求 / 成功",
-                                                &format!("{} / {}", totals.requests, totals.ok),
-                                                false,
-                                            );
-                                            metric_column(
-                                                ui,
-                                                "Tokens",
-                                                &widgets::format_count(totals.total_tokens),
-                                                true,
-                                            );
-                                            metric_column(
-                                                ui,
-                                                "花费",
-                                                &widgets::format_cost_with(
-                                                    totals.cost_micros,
-                                                    &self.config.ui,
-                                                ),
-                                                false,
-                                            );
-                                        });
+                                                    .size(9.5)
+                                                    .color(t.muted),
+                                            )
+                                            .truncate(),
+                                        );
                                     });
-                                ui.add_space(4.0);
+                                    table_row.col(|ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} / {}",
+                                                totals.requests, totals.ok
+                                            ))
+                                            .monospace()
+                                            .size(9.0)
+                                            .color(t.muted),
+                                        );
+                                    });
+                                    table_row.col(|ui| {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(widgets::format_count(
+                                                        totals.total_tokens,
+                                                    ))
+                                                    .monospace()
+                                                    .size(9.0)
+                                                    .color(t.muted),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    table_row.col(|ui| {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(widgets::format_cost_with(
+                                                        totals.cost_micros,
+                                                        &self.config.ui,
+                                                    ))
+                                                    .size(9.0)
+                                                    .color(theme::ORANGE),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    table_row.col(|ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "总 {}",
+                                                widgets::format_duration_ms(totals.avg_latency_ms)
+                                            ))
+                                            .monospace()
+                                            .size(8.5)
+                                            .color(t.muted),
+                                        );
+                                    });
+                                });
                             }
                         }
-                    });
-                ui.add_space(6.0);
-            }
+                    }
+                });
             if let Some(key) = toggled {
                 if !self.usage_expanded.remove(&key) {
                     self.usage_expanded.insert(key);
@@ -525,22 +593,4 @@ impl App {
             );
         }
     }
-}
-
-fn metric_column(ui: &mut egui::Ui, label: &str, value: &str, emphasize: bool) {
-    ui.allocate_ui_with_layout(
-        egui::Vec2::new(82.0, 34.0),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            ui.set_width(82.0);
-            ui.label(RichText::new(label).size(8.5).color(theme::muted(ui)));
-            let text = RichText::new(value).size(11.0).monospace();
-            ui.label(if emphasize {
-                text.strong().color(theme::text(ui))
-            } else {
-                text.color(theme::text(ui))
-            });
-        },
-    );
-    ui.add_space(10.0);
 }

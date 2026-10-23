@@ -2,11 +2,16 @@
 //!
 //! These are diagnostics only: they never write to the usage database.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::config::{now_ts, Account, Protocol, Provider};
+use crate::config::{
+    now_ts, Account, AuthConfig, AuthMode, PrefixRule, Protocol, ProtocolStrategy,
+    ProtocolStrategyMode, Provider, ProviderKind,
+};
 use crate::gateway::{apply_auth, readable_reqwest_error, upstream_error_message, Gateway};
 use futures_util::StreamExt;
 
@@ -263,6 +268,32 @@ JSON 结构：
 7. 用户使用“元、¥、人民币”时 currency=CNY，否则 currency=USD。
 8. 方案名称要简短，例如“工作日峰谷价”。"#;
 
+const AI_PROVIDER_SYSTEM_PROMPT: &str = r#"你是 YoyoRelay 的上游供应商配置助手。根据用户描述生成一个可直接保存的供应商 JSON。
+只返回一个 JSON 对象，不要 Markdown、不要解释、不要代码围栏，不要返回任何 API Key。
+
+JSON 结构：
+{
+  "name": "供应商名称",
+  "kind": "official" 或 "aggregator" 或 "custom",
+  "base_url": "https://api.example.com/v1",
+  "static_protocol": "openai-chat" 或 "anthropic-messages" 或 "openai-responses",
+  "auth_mode": "bearer" 或 "x-api-key" 或 "custom" 或 "none",
+  "auth_header": "自定义 Header 名称，仅 auth_mode=custom 时填写",
+  "auth_scheme": "自定义前缀，例如 Bearer，可留空",
+  "test_model": "用于测试的最小模型名",
+  "protocol_strategy": "static" 或 "model_prefix" 或 "explicit" 或 "ingress",
+  "prefix_rules": [{"prefix": "claude", "protocol": "anthropic-messages"}],
+  "protocol_base_urls": {"anthropic-messages": "https://api.example.com/anthropic/v1"},
+  "models_base_url": "https://api.example.com/v1"
+}
+
+规则：
+1. base_url 必须是真实可用的 OpenAI / Anthropic 兼容端点，包含版本路径（如 /v1）；不要编造域名。
+2. 只有同一网关为不同协议提供不同路径时才填写 protocol_base_urls 和 models_base_url，否则留空对象/空字符串。
+3. 用户说“Claude 模型走 Anthropic”时，使用 model_prefix 策略并给出 claude -> anthropic-messages 规则。
+4. 不确定的字段留空或使用默认值；不要返回账号、密钥、价格或路由。
+5. 名称使用用户给出的品牌名；没有品牌名时用简短的自定义名称。"#;
+
 /// Ask the route's upstream model to turn a natural-language pricing request
 /// into the JSON shape consumed by `PricePlan`.
 pub async fn generate_price_plan(
@@ -270,6 +301,195 @@ pub async fn generate_price_plan(
     provider_id: &str,
     model: &str,
     prompt: &str,
+) -> Result<Value, String> {
+    generate_ai_json(
+        gw,
+        provider_id,
+        None,
+        model,
+        AI_PRICING_SYSTEM_PROMPT,
+        prompt,
+        1600,
+    )
+    .await
+}
+
+/// Create a provider configuration from a natural-language description. The
+/// caller's API key is only used as the HTTP credential and never appears in
+/// the prompt or the returned configuration.
+pub async fn generate_provider_plan(
+    gw: &Gateway,
+    provider_id: &str,
+    account_id: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<Provider, String> {
+    let value = generate_ai_json(
+        gw,
+        provider_id,
+        Some(account_id),
+        model,
+        AI_PROVIDER_SYSTEM_PROMPT,
+        prompt,
+        1800,
+    )
+    .await?;
+    parse_ai_provider(value)
+}
+
+#[derive(Debug, Deserialize)]
+struct AiProviderPlan {
+    name: String,
+    #[serde(default)]
+    kind: String,
+    base_url: String,
+    #[serde(default)]
+    static_protocol: String,
+    #[serde(default)]
+    auth_mode: String,
+    #[serde(default)]
+    auth_header: String,
+    #[serde(default)]
+    auth_scheme: String,
+    #[serde(default)]
+    test_model: String,
+    #[serde(default)]
+    protocol_strategy: String,
+    #[serde(default)]
+    prefix_rules: Vec<AiPrefixRule>,
+    #[serde(default)]
+    protocol_base_urls: BTreeMap<String, String>,
+    #[serde(default)]
+    models_base_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiPrefixRule {
+    prefix: String,
+    protocol: String,
+}
+
+fn parse_ai_protocol(value: &str) -> Option<Protocol> {
+    let value = value.trim().to_ascii_lowercase().replace('_', "-");
+    match value.as_str() {
+        "openai-chat" | "openai" | "chat" | "chat-completions" => Some(Protocol::OpenAiChat),
+        "anthropic-messages" | "anthropic" | "messages" | "claude" => {
+            Some(Protocol::AnthropicMessages)
+        }
+        "openai-responses" | "responses" => Some(Protocol::OpenAiResponses),
+        _ => None,
+    }
+}
+
+fn parse_ai_provider(value: Value) -> Result<Provider, String> {
+    let plan: AiProviderPlan =
+        serde_json::from_value(value).map_err(|err| format!("AI 返回的供应商配置不完整：{err}"))?;
+    let name = plan.name.trim();
+    let base_url = plan.base_url.trim().trim_end_matches('/');
+    if name.is_empty() {
+        return Err("AI 没有返回供应商名称。".into());
+    }
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err("AI 返回的 Base URL 不是 http(s) 地址。".into());
+    }
+    let static_protocol = parse_ai_protocol(&plan.static_protocol)
+        .ok_or_else(|| "AI 返回了未知的上游协议。".to_string())?;
+    let kind = match plan.kind.trim().to_ascii_lowercase().as_str() {
+        "official" | "官方" => ProviderKind::Official,
+        "aggregator" | "聚合" => ProviderKind::Aggregator,
+        _ => ProviderKind::Custom,
+    };
+    let auth = match plan.auth_mode.trim().to_ascii_lowercase().as_str() {
+        "x-api-key" | "x_api_key" | "xapikey" => AuthConfig {
+            mode: AuthMode::XApiKey,
+            header_name: String::new(),
+            scheme: String::new(),
+        },
+        "custom" => AuthConfig {
+            mode: AuthMode::Custom,
+            header_name: plan.auth_header.trim().to_string(),
+            scheme: plan.auth_scheme.trim().to_string(),
+        },
+        "none" => AuthConfig {
+            mode: AuthMode::None,
+            header_name: String::new(),
+            scheme: String::new(),
+        },
+        _ => AuthConfig::default(),
+    };
+    let mode = match plan
+        .protocol_strategy
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .as_str()
+    {
+        "model-prefix" | "modelprefix" | "prefix" => ProtocolStrategyMode::ModelPrefix,
+        "explicit" => ProtocolStrategyMode::Explicit,
+        "ingress" => ProtocolStrategyMode::Ingress,
+        _ => ProtocolStrategyMode::Static,
+    };
+    let prefix_rules: Vec<PrefixRule> = plan
+        .prefix_rules
+        .iter()
+        .filter_map(|rule| {
+            let prefix = rule.prefix.trim();
+            let protocol = parse_ai_protocol(&rule.protocol)?;
+            (!prefix.is_empty()).then(|| PrefixRule {
+                prefix: prefix.to_string(),
+                protocol,
+            })
+        })
+        .collect();
+    let protocol_base_urls: BTreeMap<String, String> = plan
+        .protocol_base_urls
+        .into_iter()
+        .filter_map(|(protocol, url)| {
+            let protocol = parse_ai_protocol(&protocol)?;
+            let url = url.trim().trim_end_matches('/').to_string();
+            (url.starts_with("http://") || url.starts_with("https://"))
+                .then(|| (protocol.label().to_string(), url))
+        })
+        .collect();
+    let models_base_url = {
+        let url = plan.models_base_url.trim().trim_end_matches('/');
+        (url.starts_with("http://") || url.starts_with("https://")).then(|| url.to_string())
+    };
+    let test_model = if plan.test_model.trim().is_empty() {
+        match static_protocol {
+            Protocol::AnthropicMessages => "claude-3-5-haiku-20241022",
+            Protocol::OpenAiChat | Protocol::OpenAiResponses => "gpt-4o-mini",
+        }
+        .to_string()
+    } else {
+        plan.test_model.trim().to_string()
+    };
+    Ok(Provider {
+        id: String::new(),
+        name: name.to_string(),
+        kind,
+        base_url: base_url.to_string(),
+        protocol_base_urls,
+        models_base_url,
+        auth,
+        static_protocol,
+        protocol_strategy: ProtocolStrategy { mode, prefix_rules },
+        extra_headers: Vec::new(),
+        timeout_secs: None,
+        test_model: Some(test_model),
+        preset: None,
+        created_at: 0,
+    })
+}
+
+async fn generate_ai_json(
+    gw: &Gateway,
+    provider_id: &str,
+    account_id: Option<&str>,
+    model: &str,
+    system_prompt: &str,
+    prompt: &str,
+    max_tokens: u32,
 ) -> Result<Value, String> {
     let config = gw.config();
     let provider = config
@@ -279,12 +499,27 @@ pub async fn generate_price_plan(
     if provider.base_url.starts_with("plugin://") {
         return Err("临时供应商没有可直接调用的账号，请选择真实上游再生成。".into());
     }
-    let account = config
-        .accounts
-        .iter()
-        .find(|account| account.provider_id == provider_id && account.enabled)
-        .cloned()
-        .ok_or_else(|| "该供应商没有启用的账号，无法调用 AI。".to_string())?;
+    let account = if let Some(id) = account_id {
+        let account = config
+            .accounts
+            .iter()
+            .find(|account| account.id == id && account.provider_id == provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                "指定的 AI 调用账号已被移除或不属于该供应商，请重新选择。".to_string()
+            })?;
+        if !account.enabled {
+            return Err("指定的 AI 调用账号已停用，请重新选择。".into());
+        }
+        account
+    } else {
+        config
+            .accounts
+            .iter()
+            .find(|account| account.provider_id == provider_id && account.enabled)
+            .cloned()
+            .ok_or_else(|| "该供应商没有启用的账号，无法调用 AI。".to_string())?
+    };
     let key = if account.api_key.trim().is_empty() {
         String::new()
     } else {
@@ -293,7 +528,7 @@ pub async fn generate_price_plan(
             .map_err(|err| format!("读取账号 Key 失败：{err}"))?
     };
     let protocol = provider.protocol_for(model, None);
-    let body = ai_pricing_body(protocol, model, prompt);
+    let body = ai_json_body(protocol, model, system_prompt, prompt, max_tokens);
     let url = minimal_url(&provider, protocol);
     let timeout = provider.timeout_secs.unwrap_or(120).clamp(30, 300);
     let response = send_probe(gw, &provider, &key, "POST", &url, Some(&body), timeout).await;
@@ -314,29 +549,35 @@ pub async fn generate_price_plan(
     })
 }
 
-fn ai_pricing_body(protocol: Protocol, model: &str, prompt: &str) -> Value {
+fn ai_json_body(
+    protocol: Protocol,
+    model: &str,
+    system_prompt: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> Value {
     match protocol {
         Protocol::OpenAiChat => json!({
             "model": model,
             "messages": [
-                {"role": "system", "content": AI_PRICING_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.2,
-            "max_tokens": 1600,
+            "max_tokens": max_tokens,
             "stream": false
         }),
         Protocol::AnthropicMessages => json!({
             "model": model,
-            "max_tokens": 1600,
-            "system": AI_PRICING_SYSTEM_PROMPT,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
             "messages": [{"role": "user", "content": prompt}]
         }),
         Protocol::OpenAiResponses => json!({
             "model": model,
-            "instructions": AI_PRICING_SYSTEM_PROMPT,
+            "instructions": system_prompt,
             "input": prompt,
-            "max_output_tokens": 1600,
+            "max_output_tokens": max_tokens,
             "stream": false
         }),
     }
@@ -2213,7 +2454,7 @@ mod ai_pricing_tests {
             Protocol::AnthropicMessages,
             Protocol::OpenAiResponses,
         ] {
-            let body = ai_pricing_body(protocol, "model-x", prompt);
+            let body = ai_json_body(protocol, "model-x", AI_PRICING_SYSTEM_PROMPT, prompt, 1600);
             assert_eq!(body.get("model").and_then(Value::as_str), Some("model-x"));
             match protocol {
                 Protocol::OpenAiChat => assert!(body.get("messages").is_some()),
@@ -2221,5 +2462,52 @@ mod ai_pricing_tests {
                 Protocol::OpenAiResponses => assert!(body.get("instructions").is_some()),
             }
         }
+    }
+
+    #[test]
+    fn parses_ai_provider_configs() {
+        let value = json!({
+            "name": "OpenCode Go",
+            "kind": "aggregator",
+            "base_url": "https://opencode.ai/inference/go/openai/v1/",
+            "static_protocol": "openai-chat",
+            "auth_mode": "bearer",
+            "test_model": "glm-5.3-flash",
+            "protocol_strategy": "model_prefix",
+            "prefix_rules": [
+                {"prefix": "claude", "protocol": "anthropic-messages"},
+                {"prefix": "", "protocol": "openai-chat"}
+            ],
+            "protocol_base_urls": {
+                "anthropic-messages": "https://opencode.ai/inference/go/anthropic/v1"
+            },
+            "models_base_url": "https://opencode.ai/inference/go/v1"
+        });
+        let provider = parse_ai_provider(value).expect("provider");
+        assert_eq!(provider.name, "OpenCode Go");
+        assert_eq!(provider.kind, ProviderKind::Aggregator);
+        assert_eq!(
+            provider.base_url_for(Protocol::OpenAiChat),
+            "https://opencode.ai/inference/go/openai/v1"
+        );
+        assert_eq!(
+            provider.base_url_for(Protocol::AnthropicMessages),
+            "https://opencode.ai/inference/go/anthropic/v1"
+        );
+        assert_eq!(
+            provider.models_url(),
+            "https://opencode.ai/inference/go/v1/models"
+        );
+        assert_eq!(provider.protocol_strategy.prefix_rules.len(), 1);
+        assert_eq!(
+            provider.protocol_strategy.prefix_rules[0].protocol,
+            Protocol::AnthropicMessages
+        );
+    }
+
+    #[test]
+    fn rejects_ai_provider_without_http_base_url() {
+        let value = json!({"name": "Bad", "base_url": "plugin://x"});
+        assert!(parse_ai_provider(value).is_err());
     }
 }

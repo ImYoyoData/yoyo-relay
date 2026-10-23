@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.33"
+egui_extras = { version = "0.33", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "fs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 axum = { version = "0.8", features = ["macros", "json"] }
@@ -63,10 +64,16 @@ eframe = { version = "0.33", default-features = false, features = ["x11", "wayla
 tempfile = "3"
 
 [profile.release]
-opt-level = "s"
-lto = "thin"
+# Size-first release profile. Fat LTO removes cross-crate dead code, `z`
+# prefers size over the small speed edge of `s`, and stripping drops symbols.
+# `panic = "abort"` is intentionally not used: the runtime catches panics from
+# the gateway task with `catch_unwind` to keep the UI alive.
+opt-level = "z"
+lto = true
 codegen-units = 1
 strip = true
+debug = false
+incremental = false
 
 [profile.dev]
 opt-level = 1

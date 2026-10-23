@@ -127,8 +127,8 @@ fn run() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 660.0])
-            .with_min_inner_size([820.0, 560.0])
+            .with_inner_size([1280.0, 700.0])
+            .with_min_inner_size([1000.0, 600.0])
             .with_decorations(false)
             .with_transparent(false)
             .with_resizable(true)
