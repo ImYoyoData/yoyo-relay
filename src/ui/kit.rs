@@ -513,12 +513,12 @@ pub fn icon_chip(ui: &mut Ui, icon: &str, color: Color32, size: f32) {
     );
 }
 
-pub fn status_pill(ui: &mut Ui, text: &str, color: Color32) {
+pub fn status_pill(ui: &mut Ui, text: &str, color: Color32) -> Response {
     let bg = theme::soft_for(ui, color);
     let font = FontId::proportional(10.0);
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
     let size = Vec2::new(galley.size().x + 24.0, 19.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     ui.painter().rect_filled(rect, 999.0, bg);
     ui.painter()
         .circle_filled(Pos2::new(rect.left() + 8.0, rect.center().y), 3.0, color);
@@ -527,10 +527,11 @@ pub fn status_pill(ui: &mut Ui, text: &str, color: Color32) {
         galley,
         color,
     );
+    response
 }
 
 pub fn status_badge(ui: &mut Ui, text: &str, color: Color32) {
-    status_pill(ui, text, color);
+    let _ = status_pill(ui, text, color);
 }
 
 pub fn badge(ui: &mut Ui, text: &str, color: Color32) {

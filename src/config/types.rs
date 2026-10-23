@@ -354,6 +354,9 @@ pub struct UiConfig {
     pub start_minimized: bool,
     /// Hide the window instead of quitting when the close button is pressed.
     pub close_to_tray: bool,
+    /// The one-time close confirmation has been completed. After this the app
+    /// follows `close_to_tray` directly.
+    pub close_confirm_done: bool,
     /// Show live request/token information in the window title (taskbar tooltip).
     pub show_taskbar_stats: bool,
     pub notifications: bool,
@@ -487,6 +490,7 @@ impl Default for UiConfig {
             autostart: false,
             start_minimized: false,
             close_to_tray: false,
+            close_confirm_done: false,
             show_taskbar_stats: true,
             notifications: true,
             retention_days: 90,

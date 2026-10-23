@@ -928,6 +928,208 @@ impl App {
         }
     }
 
+    pub(crate) fn show_close_confirm(&mut self, ctx: &egui::Context) {
+        if !self.close_confirm_open {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        let hide_choice = std::cell::Cell::new(self.close_hide_to_tray);
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_close_confirm"),
+            &format!("关闭 {}", crate::identity::APP_NAME),
+            "请选择关闭主窗口后的行为",
+            520.0,
+            |ui| {
+                ui.label(
+                    RichText::new("关闭主窗口后，代理可以继续在后台运行，也可以直接退出。")
+                        .size(12.0),
+                );
+                ui.add_space(10.0);
+                let mut checked = hide_choice.get();
+                if ui
+                    .checkbox(&mut checked, "隐藏到系统托盘（代理继续运行）")
+                    .changed()
+                {
+                    hide_choice.set(checked);
+                }
+                ui.add_space(6.0);
+                if hide_choice.get() {
+                    super::kit::info_row(
+                        ui,
+                        icons::INFO,
+                        "窗口与任务栏图标会隐藏，代理继续处理请求；可从托盘菜单重新打开或退出。",
+                    );
+                } else {
+                    super::kit::info_row(
+                        ui,
+                        icons::WARNING,
+                        "程序将退出，代理停止，正在处理的请求会被中断。",
+                    );
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "此提示只显示一次；之后可在「设置 → 启动与托盘」中随时修改关闭行为。",
+                    )
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+                );
+            },
+            |ui| {
+                if super::kit::primary_button(
+                    ui,
+                    icons::CHECK,
+                    if hide_choice.get() {
+                        "隐藏到托盘"
+                    } else {
+                        "退出程序"
+                    },
+                )
+                .clicked()
+                {
+                    confirm = true;
+                }
+                if super::kit::secondary_button(ui, "", "取消").clicked() {
+                    cancel = true;
+                }
+            },
+        );
+        if closed || cancel {
+            self.close_confirm_open = false;
+            return;
+        }
+        if confirm {
+            let hide_to_tray = hide_choice.get();
+            self.close_hide_to_tray = hide_to_tray;
+            self.config.ui.close_to_tray = hide_to_tray;
+            self.config.ui.close_confirm_done = true;
+            self.persist();
+            self.close_confirm_open = false;
+            if hide_to_tray {
+                self.hide_to_tray(ctx);
+            } else {
+                self.quit(ctx);
+            }
+        }
+    }
+
+    pub(crate) fn show_proxy_status_modal(&mut self, ctx: &egui::Context) {
+        if !self.proxy_status_open {
+            return;
+        }
+        let (color, label) = self.proxy_status();
+        let running = self.snapshot.proxy.is_running();
+        let port = self.config.server.port;
+        let active = self.snapshot.active_requests.to_string();
+        let queued = self.snapshot.queued_requests.to_string();
+        let uptime = crate::config::fmt_duration_secs(self.snapshot.uptime_secs);
+        let max_concurrency = self.config.server.max_global_concurrency.to_string();
+        let queue_capacity = self.config.server.queue_capacity.to_string();
+        let tokens = widgets::format_count(self.snapshot.today.totals.total_tokens);
+        let mut urls: Vec<String> = self
+            .snapshot
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.url.clone())
+            .filter(|url| !url.is_empty())
+            .collect();
+        if urls.is_empty() && !self.snapshot.endpoint.is_empty() {
+            urls.push(self.snapshot.endpoint.clone());
+        }
+        urls.dedup();
+        let mut close = false;
+        let mut toggle = false;
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_proxy_status"),
+            "代理运行状态",
+            "端点、运行指标与代理控制",
+            620.0,
+            |ui| {
+                ui.horizontal(|ui| {
+                    super::kit::status_pill(ui, &label, color);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("Port: {port}"))
+                                .monospace()
+                                .size(10.0)
+                                .color(theme::muted(ui)),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
+                super::kit::section_label(ui, "端点");
+                for url in &urls {
+                    ui.horizontal_top(|ui| {
+                        let text_width = (ui.available_width() - 24.0).max(120.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(text_width, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(text_width);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(url)
+                                            .monospace()
+                                            .size(10.5)
+                                            .color(theme::text(ui)),
+                                    )
+                                    .wrap(),
+                                );
+                            },
+                        );
+                        if super::kit::icon_button(ui, icons::COPY, "复制该端点").clicked() {
+                            ui.ctx().copy_text(url.clone());
+                            self.toast(NoticeLevel::Success, "端点已复制");
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+                ui.add_space(8.0);
+                ui.columns(3, |cols| {
+                    super::kit::mini_stat(&mut cols[0], "持续时长", &uptime);
+                    super::kit::mini_stat(&mut cols[1], "活跃请求", &active);
+                    super::kit::mini_stat(&mut cols[2], "排队中", &queued);
+                });
+                ui.add_space(6.0);
+                ui.columns(2, |cols| {
+                    super::kit::mini_stat(&mut cols[0], "并发上限", &max_concurrency);
+                    super::kit::mini_stat(&mut cols[1], "队列容量", &queue_capacity);
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("今日 {tokens} tokens"))
+                        .size(9.5)
+                        .color(theme::muted(ui)),
+                );
+            },
+            |ui| {
+                if running {
+                    if super::kit::danger_button(ui, icons::STOP, "停止代理").clicked() {
+                        toggle = true;
+                    }
+                } else if super::kit::primary_button(ui, icons::PLAY, "启动代理").clicked() {
+                    toggle = true;
+                }
+                if super::kit::secondary_button(ui, "", "关闭").clicked() {
+                    close = true;
+                }
+            },
+        );
+        if toggle {
+            let _ = self.cmd_tx.send(if running {
+                crate::runtime::UiCommand::StopProxy
+            } else {
+                crate::runtime::UiCommand::StartProxy
+            });
+        }
+        if closed || close {
+            self.proxy_status_open = false;
+        }
+    }
+
     fn confirm_text(&self, action: &ConfirmAction) -> (&'static str, String, bool, &'static str) {
         match action {
             ConfirmAction::DeleteProvider(id) => {

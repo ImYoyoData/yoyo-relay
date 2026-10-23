@@ -344,6 +344,11 @@ pub struct App {
     pub(crate) plugin_console: Option<String>,
     pub(crate) plugin_console_level: u8,
     pub(crate) plugin_console_auto_scroll: bool,
+    /// One-time close confirmation state.
+    pub(crate) close_confirm_open: bool,
+    pub(crate) close_hide_to_tray: bool,
+    /// Runtime status modal opened from the title-bar status pill.
+    pub(crate) proxy_status_open: bool,
     pub(crate) closing: bool,
     pub(crate) last_zoom: f32,
     pub(crate) signals: Arc<crate::instance::Signals>,
@@ -444,6 +449,9 @@ impl App {
             plugin_console: None,
             plugin_console_level: 0,
             plugin_console_auto_scroll: true,
+            close_confirm_open: false,
+            close_hide_to_tray: true,
+            proxy_status_open: false,
             closing: false,
             last_zoom: 1.0,
             signals,
@@ -733,20 +741,35 @@ impl App {
 
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
-            if self.config.ui.close_to_tray {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.hide_to_tray(ctx);
-            } else {
-                self.closing = true;
-                let _ = self.cmd_tx.send(UiCommand::Shutdown);
-            }
+            // Always cancel the native close first so the one-time confirmation
+            // can be shown. `request_close` performs the actual hide/quit.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_close(ctx);
+        }
+    }
+
+    fn request_close(&mut self, ctx: &egui::Context) {
+        if self.close_confirm_open {
+            return;
+        }
+        if !self.config.ui.close_confirm_done {
+            self.close_confirm_open = true;
+            self.close_hide_to_tray = true;
+        } else if self.config.ui.close_to_tray {
+            self.hide_to_tray(ctx);
+        } else {
+            self.quit(ctx);
         }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if escape {
-            if self.editor.is_some() {
+            if self.close_confirm_open {
+                self.close_confirm_open = false;
+            } else if self.proxy_status_open {
+                self.proxy_status_open = false;
+            } else if self.editor.is_some() {
                 self.editor = None;
             } else if self.confirm.is_some() {
                 self.confirm = None;
@@ -1227,7 +1250,9 @@ impl App {
                                     .color(t.text),
                             );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let close_hint = if self.config.ui.close_to_tray {
+                                let close_hint = if !self.config.ui.close_confirm_done {
+                                    format!("关闭 {}", crate::identity::APP_NAME)
+                                } else if self.config.ui.close_to_tray {
                                     if cfg!(windows) {
                                         "隐藏到系统托盘".to_string()
                                     } else {
@@ -1237,11 +1262,7 @@ impl App {
                                     format!("退出 {}", crate::identity::APP_NAME)
                                 };
                                 if kit::window_button(ui, icons::X, &close_hint, true).clicked() {
-                                    if self.config.ui.close_to_tray {
-                                        self.hide_to_tray(ctx);
-                                    } else {
-                                        self.quit(ctx);
-                                    }
+                                    self.request_close(ctx);
                                 }
                                 let maximized =
                                     ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -1268,7 +1289,12 @@ impl App {
                                 }
                                 ui.add_space(4.0);
                                 let (color, label) = self.proxy_status();
-                                kit::status_pill(ui, label, color);
+                                if kit::status_pill(ui, label, color)
+                                    .on_hover_text("查看运行状态与端点")
+                                    .clicked()
+                                {
+                                    self.proxy_status_open = true;
+                                }
                                 let update = self.snapshot.update.clone();
                                 let update_icon = if update.checking {
                                     icons::SPINNER
@@ -1442,251 +1468,150 @@ impl App {
     // -- sidebar ------------------------------------------------------------
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let t = theme::tokens_ctx(ui.ctx());
         let compact = self.sidebar_width(ui.ctx()) < 100.0;
-        ui.add_space(8.0);
-        if compact {
-            for page in Page::all() {
-                if kit::nav_rail_item(ui, page.icon(), page.label(), self.page == page).clicked() {
-                    self.page = page;
-                    self.search.clear();
-                }
-                ui.add_space(2.0);
-            }
-        } else {
-            kit::nav_label(ui, "工作台");
-            if kit::nav_item(ui, icons::HOUSE, "概览", self.page == Page::Overview, None).clicked()
-            {
-                self.page = Page::Overview;
-                self.search.clear();
-            }
-            kit::nav_label(ui, "配置");
-            if kit::nav_item(
-                ui,
-                icons::HARD_DRIVES,
-                "供应商",
-                self.page == Page::Providers,
-                Some(self.config.providers.len().to_string()),
-            )
-            .clicked()
-            {
-                self.page = Page::Providers;
-                self.search.clear();
-            }
-            if kit::nav_item(
-                ui,
-                icons::USERS,
-                "账号",
-                self.page == Page::Accounts,
-                Some(self.config.accounts.len().to_string()),
-            )
-            .clicked()
-            {
-                self.page = Page::Accounts;
-                self.search.clear();
-            }
-            if kit::nav_item(
-                ui,
-                icons::GIT_BRANCH,
-                "路由",
-                self.page == Page::Routes,
-                Some(self.config.routes.len().to_string()),
-            )
-            .clicked()
-            {
-                self.page = Page::Routes;
-                self.search.clear();
-            }
-            if kit::nav_item(
-                ui,
-                icons::PUZZLE_PIECE,
-                "插件",
-                self.page == Page::Plugins,
-                Some(self.snapshot.plugins.len().to_string()),
-            )
-            .clicked()
-            {
-                self.page = Page::Plugins;
-                self.search.clear();
-            }
-            if kit::nav_item(
-                ui,
-                icons::KEY,
-                "本地 Key",
-                self.page == Page::LocalKeys,
-                Some(self.config.local_keys.len().to_string()),
-            )
-            .clicked()
-            {
-                self.page = Page::LocalKeys;
-                self.search.clear();
-            }
-            kit::nav_label(ui, "观测");
-            if kit::nav_item(ui, icons::CHART_BAR, "用量", self.page == Page::Usage, None).clicked()
-            {
-                self.page = Page::Usage;
-                self.search.clear();
-            }
-            if kit::nav_item(
-                ui,
-                icons::LIST_BULLETS,
-                "调用明细",
-                self.page == Page::Calls,
-                Some(self.snapshot.calls.total.to_string()),
-            )
-            .clicked()
-            {
-                self.page = Page::Calls;
-                self.search.clear();
-            }
-            if kit::nav_item(ui, icons::WALLET, "余额", self.page == Page::Balances, None).clicked()
-            {
-                self.page = Page::Balances;
-                self.search.clear();
-            }
-        }
-
-        ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-            ui.add_space(8.0);
-            if compact {
-                if kit::nav_rail_item(ui, icons::GEAR_SIX, "设置", self.page == Page::Settings)
-                    .clicked()
-                {
-                    self.page = Page::Settings;
-                    self.search.clear();
-                }
-                ui.add_space(4.0);
-                let (color, label) = self.proxy_status();
-                let (rect, response) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
-                ui.painter().rect_filled(rect, 8.0, t.hover);
-                ui.painter()
-                    .circle_filled(Pos2::new(rect.center().x, rect.center().y), 4.0, color);
-                if response.on_hover_text(format!("代理{label}")).clicked() {
-                    let running = self.snapshot.proxy.is_running();
-                    let _ = self.cmd_tx.send(if running {
-                        UiCommand::StopProxy
-                    } else {
-                        UiCommand::StartProxy
-                    });
-                }
-            } else {
-                if kit::nav_item(
-                    ui,
-                    icons::GEAR_SIX,
-                    "设置",
-                    self.page == Page::Settings,
-                    None,
-                )
-                .clicked()
-                {
-                    self.page = Page::Settings;
-                    self.search.clear();
-                }
-                ui.add_space(6.0);
-                let (color, label) = self.proxy_status();
-                let mut urls: Vec<String> = self
-                    .snapshot
-                    .endpoints
-                    .iter()
-                    .map(|endpoint| endpoint.url.clone())
-                    .filter(|url| !url.is_empty())
-                    .collect();
-                if urls.is_empty() && !self.snapshot.endpoint.is_empty() {
-                    urls.push(self.snapshot.endpoint.clone());
-                }
-                urls.dedup();
-                let active = self.snapshot.active_requests;
-                let tokens = widgets::format_count(self.snapshot.today.totals.total_tokens);
-                egui::Frame::new()
-                    .fill(t.card)
-                    .stroke(Stroke::new(1.0_f32, t.card_border))
-                    .corner_radius(12)
-                    .inner_margin(egui::Margin::symmetric(11, 9))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            kit::status_pill(ui, &format!("代理{label}"), color);
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let running = self.snapshot.proxy.is_running();
-                                if kit::icon_button(
-                                    ui,
-                                    if running { icons::STOP } else { icons::PLAY },
-                                    if running {
-                                        "停止代理"
-                                    } else {
-                                        "启动代理"
-                                    },
-                                )
-                                .clicked()
-                                {
-                                    let _ = self.cmd_tx.send(if running {
-                                        UiCommand::StopProxy
-                                    } else {
-                                        UiCommand::StartProxy
-                                    });
-                                }
-                            });
-                        });
-                        ui.add_space(5.0);
-                        // Show every endpoint (loopback + each LAN address) in
-                        // full. The font is compact and wraps; each row has its
-                        // own copy button.
-                        for url in &urls {
-                            ui.horizontal_top(|ui| {
-                                let text_width = (ui.available_width() - 18.0).max(60.0);
-                                ui.allocate_ui_with_layout(
-                                    Vec2::new(text_width, 0.0),
-                                    Layout::top_down(Align::Min),
-                                    |ui| {
-                                        ui.set_width(text_width);
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(url)
-                                                    .monospace()
-                                                    .size(8.0)
-                                                    .color(t.muted),
-                                            )
-                                            .wrap(),
-                                        );
-                                    },
-                                );
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(icons::COPY).size(9.0).color(t.muted),
-                                        )
-                                        .frame(false)
-                                        .min_size(Vec2::splat(14.0)),
-                                    )
-                                    .on_hover_text("复制该端点")
-                                    .clicked()
-                                {
-                                    ui.ctx().copy_text(url.clone());
-                                    self.toast(NoticeLevel::Success, "端点已复制");
-                                }
-                            });
-                            ui.add_space(1.0);
+        // Reserve the bottom area for the status card and Settings before the
+        // nav list. The nav list then scrolls in the remaining space instead of
+        // letting the card float over the last menu items.
+        egui::TopBottomPanel::bottom("sidebar_bottom")
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 6)))
+            .show_inside(ui, |ui| self.sidebar_bottom(ui));
+        egui::ScrollArea::vertical()
+            .id_salt("sidebar_nav")
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                if compact {
+                    for page in Page::all() {
+                        if kit::nav_rail_item(ui, page.icon(), page.label(), self.page == page)
+                            .clicked()
+                        {
+                            self.page = page;
+                            self.search.clear();
                         }
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("{active} 活跃"))
-                                    .size(9.5)
-                                    .color(t.muted),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(format!("{tokens} tokens"))
-                                        .size(9.5)
-                                        .color(t.muted),
-                                );
-                            });
-                        });
-                    });
+                        ui.add_space(2.0);
+                    }
+                } else {
+                    kit::nav_label(ui, "工作台");
+                    if kit::nav_item(ui, icons::HOUSE, "概览", self.page == Page::Overview, None)
+                        .clicked()
+                    {
+                        self.page = Page::Overview;
+                        self.search.clear();
+                    }
+                    kit::nav_label(ui, "配置");
+                    if kit::nav_item(
+                        ui,
+                        icons::HARD_DRIVES,
+                        "供应商",
+                        self.page == Page::Providers,
+                        Some(self.config.providers.len().to_string()),
+                    )
+                    .clicked()
+                    {
+                        self.page = Page::Providers;
+                        self.search.clear();
+                    }
+                    if kit::nav_item(
+                        ui,
+                        icons::USERS,
+                        "账号",
+                        self.page == Page::Accounts,
+                        Some(self.config.accounts.len().to_string()),
+                    )
+                    .clicked()
+                    {
+                        self.page = Page::Accounts;
+                        self.search.clear();
+                    }
+                    if kit::nav_item(
+                        ui,
+                        icons::GIT_BRANCH,
+                        "路由",
+                        self.page == Page::Routes,
+                        Some(self.config.routes.len().to_string()),
+                    )
+                    .clicked()
+                    {
+                        self.page = Page::Routes;
+                        self.search.clear();
+                    }
+                    if kit::nav_item(
+                        ui,
+                        icons::PUZZLE_PIECE,
+                        "插件",
+                        self.page == Page::Plugins,
+                        Some(self.snapshot.plugins.len().to_string()),
+                    )
+                    .clicked()
+                    {
+                        self.page = Page::Plugins;
+                        self.search.clear();
+                    }
+                    if kit::nav_item(
+                        ui,
+                        icons::KEY,
+                        "本地 Key",
+                        self.page == Page::LocalKeys,
+                        Some(self.config.local_keys.len().to_string()),
+                    )
+                    .clicked()
+                    {
+                        self.page = Page::LocalKeys;
+                        self.search.clear();
+                    }
+                    kit::nav_label(ui, "观测");
+                    if kit::nav_item(ui, icons::CHART_BAR, "用量", self.page == Page::Usage, None)
+                        .clicked()
+                    {
+                        self.page = Page::Usage;
+                        self.search.clear();
+                    }
+                    if kit::nav_item(
+                        ui,
+                        icons::LIST_BULLETS,
+                        "调用明细",
+                        self.page == Page::Calls,
+                        Some(self.snapshot.calls.total.to_string()),
+                    )
+                    .clicked()
+                    {
+                        self.page = Page::Calls;
+                        self.search.clear();
+                    }
+                    if kit::nav_item(ui, icons::WALLET, "余额", self.page == Page::Balances, None)
+                        .clicked()
+                    {
+                        self.page = Page::Balances;
+                        self.search.clear();
+                    }
+                }
+            });
+    }
+
+    fn sidebar_bottom(&mut self, ui: &mut egui::Ui) {
+        let compact = self.sidebar_width(ui.ctx()) < 100.0;
+        if compact {
+            if kit::nav_rail_item(ui, icons::GEAR_SIX, "设置", self.page == Page::Settings)
+                .clicked()
+            {
+                self.page = Page::Settings;
+                self.search.clear();
             }
-            ui.separator();
-            ui.add_space(2.0);
-        });
+        } else if kit::nav_item(
+            ui,
+            icons::GEAR_SIX,
+            "设置",
+            self.page == Page::Settings,
+            None,
+        )
+        .clicked()
+        {
+            self.page = Page::Settings;
+            self.search.clear();
+        }
     }
 
     fn proxy_status(&self) -> (Color32, &'static str) {
@@ -1927,6 +1852,17 @@ impl eframe::App for App {
         self.sync_plugin_settings();
         self.sync_live_fx();
         self.apply_theme(ctx);
+        // Enforce a usable minimum size even when the window is resized through
+        // the custom borderless handles (which bypass the native minimum on
+        // some Windows versions).
+        let min_size = egui::vec2(900.0, 620.0);
+        let current_size = ctx.content_rect().size();
+        if current_size.x + 0.5 < min_size.x || current_size.y + 0.5 < min_size.y {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                current_size.x.max(min_size.x),
+                current_size.y.max(min_size.y),
+            )));
+        }
         self.sync_autostart();
         self.update_window_title(ctx);
         self.update_tray_stats();
@@ -1977,15 +1913,7 @@ impl eframe::App for App {
                     // read as a heavy black divider between menu and content.
                     .stroke(Stroke::NONE),
             )
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_scroll")
-                    .auto_shrink([false, false])
-                    // A visible track next to the content divider reads as a
-                    // thick black line; keep wheel scrolling, hide the rail.
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .show(ui, |ui| self.sidebar(ui));
-            });
+            .show(ctx, |ui| self.sidebar(ui));
 
         self.status_bar(ctx);
         self.central(ctx);
@@ -1999,6 +1927,8 @@ impl eframe::App for App {
         self.show_plugin_console(ctx);
         self.show_plugin_docs(ctx);
         self.show_currency_error(ctx);
+        self.show_close_confirm(ctx);
+        self.show_proxy_status_modal(ctx);
         self.show_confirm(ctx);
         self.show_test_modal(ctx);
         self.show_onboarding(ctx);
