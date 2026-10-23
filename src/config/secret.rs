@@ -143,7 +143,7 @@ impl Paths {
             dirs::config_dir()
                 .or_else(dirs::data_local_dir)
                 .ok_or_else(|| anyhow!("无法定位用户配置目录"))?
-                .join("YoyoRelay")
+                .join(crate::identity::CONFIG_DIR_NAME)
         };
         fs::create_dir_all(&root)?;
         let exports_dir = root.join("exports");

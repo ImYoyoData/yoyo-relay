@@ -162,6 +162,33 @@ pub fn quota_bar(
     }
 }
 
+/// Live token rate with enough precision to show sub-1 tok/s values instead
+/// of rounding every small burst down to "0".
+pub fn format_tps(tps: f64) -> String {
+    if !tps.is_finite() || tps <= 0.0 {
+        "0".to_string()
+    } else if tps >= 100.0 {
+        format!("{tps:.0}")
+    } else if tps >= 10.0 {
+        format!("{tps:.1}")
+    } else {
+        format!("{tps:.2}")
+    }
+}
+
+/// Request wall-clock duration. The stored field is named `latency_ms` for
+/// historical reasons, but it measures the whole request (queue, prefill,
+/// thinking and decode), so the UI labels it 耗时 rather than 延迟.
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{:.1} min", ms as f64 / 60_000.0)
+    } else if ms >= 1000 {
+        format!("{:.2} s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms} ms")
+    }
+}
+
 pub fn format_count(value: u64) -> String {
     if value >= 1_000_000_000 {
         format!("{:.2}B", value as f64 / 1_000_000_000.0)

@@ -52,6 +52,8 @@ cargo run --release
 - macOS：`~/Library/Application Support/YoyoRelay`
 - Linux：`~/.config/YoyoRelay`
 
+调试构建（`cargo run` / `cargo build`）与安装版完全隔离：使用 `YoyoRelay-dev` 配置目录、默认端口 `17789`、独立的自启项与单实例锁，窗口标题为「YoyoRelay Dev」。因此可以同时运行开发版和正式版，开发版不会关闭或劫持正式版的窗口。
+
 也可以设置 `YOYO_RELAY_HOME` 指定独立目录（便于测试/多实例）：
 
 ```bash

@@ -248,11 +248,24 @@ pub fn apply(ctx: &Context, dark: bool) {
     visuals.widgets.noninteractive.weak_bg_fill = tokens.card;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, tokens.card_border);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, tokens.text);
-    visuals.widgets.inactive.bg_fill = tokens.card;
+    // `bg_fill` is what egui uses for scroll handles, slider rails and
+    // checkbox/radio fills. A card-white handle vanished on white cards, so
+    // use a soft raised tone instead. Buttons use `weak_bg_fill`.
+    visuals.widgets.inactive.bg_fill = if dark {
+        Color32::from_rgb(71, 80, 96)
+    } else {
+        Color32::from_rgb(225, 231, 241)
+    };
     visuals.widgets.inactive.weak_bg_fill = tokens.card;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, tokens.card_border);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, tokens.text);
-    visuals.widgets.hovered.bg_fill = tokens.hover;
+    // Hovered scroll handles also read `bg_fill`; keep the rail's hover state
+    // a bit stronger than the resting handle.
+    visuals.widgets.hovered.bg_fill = if dark {
+        Color32::from_rgb(104, 117, 137)
+    } else {
+        Color32::from_rgb(203, 212, 225)
+    };
     visuals.widgets.hovered.weak_bg_fill = tokens.hover;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, tokens.card_border);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, tokens.text);
@@ -271,13 +284,14 @@ pub fn apply(ctx: &Context, dark: bool) {
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(11.0, 6.0);
         style.spacing.interact_size.y = 30.0;
-        style.spacing.scroll.bar_width = 9.0;
-        // Floating scrollbars hide until the pointer is already on them,
-        // which makes them hard to grab. Reserve a visible track instead and
-        // use the foreground colour so the handle is not white-on-white.
+        style.spacing.scroll.bar_width = 10.0;
+        // Native scrollbars are reserved for the few places that opt out of
+        // `kit::scroll_*` (horizontal tables). They must read as a white
+        // handle on a soft track, never a black bar.
         style.spacing.scroll.floating = false;
-        style.spacing.scroll.foreground_color = true;
+        style.spacing.scroll.foreground_color = false;
         style.spacing.scroll.handle_min_length = 28.0;
+        style.spacing.scroll.bar_inner_margin = 4.0;
         style.visuals.widgets.inactive.corner_radius = 8.into();
         style.visuals.widgets.hovered.corner_radius = 8.into();
         style.visuals.widgets.active.corner_radius = 8.into();

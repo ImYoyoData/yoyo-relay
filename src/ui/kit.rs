@@ -101,6 +101,285 @@ pub fn divider(ui: &mut Ui) {
 }
 
 // ---------------------------------------------------------------------------
+// Scroll areas
+// ---------------------------------------------------------------------------
+
+const RAIL_WIDTH: f32 = 11.0;
+
+fn lerp_color(from: Color32, to: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color32::from_rgb(
+        mix(from.r(), to.r()),
+        mix(from.g(), to.g()),
+        mix(from.b(), to.b()),
+    )
+}
+
+/// A white, bevelled scroll handle with a soft groove texture. The built-in
+/// egui bar is only a flat rectangle, so the app draws its own rail and hides
+/// the native one.
+fn paint_scroll_rail<R>(ui: &mut Ui, out: &egui::scroll_area::ScrollAreaOutput<R>) {
+    let viewport = out.inner_rect;
+    let max_offset = (out.content_size.y - viewport.height()).max(0.0);
+    if max_offset <= 0.5 || viewport.height() < 24.0 {
+        return;
+    }
+    let t = theme::tokens(ui);
+    let rail = Rect::from_min_size(
+        Pos2::new(viewport.right() + 4.0, viewport.top() + 2.0),
+        Vec2::new(RAIL_WIDTH, (viewport.height() - 4.0).max(20.0)),
+    );
+    let (track, handle_top, handle_bottom) = if t.dark_mode {
+        (
+            Color32::from_rgb(24, 30, 39),
+            Color32::from_rgb(116, 127, 144),
+            Color32::from_rgb(74, 84, 99),
+        )
+    } else {
+        (
+            Color32::from_rgb(232, 236, 244),
+            Color32::WHITE,
+            Color32::from_rgb(199, 208, 222),
+        )
+    };
+    ui.painter().rect_filled(rail, 5, track);
+    let handle_h = (viewport.height() / out.content_size.y.max(1.0) * rail.height())
+        .clamp(36.0_f32.min(rail.height()), rail.height());
+    let travel = (rail.height() - handle_h).max(0.0);
+    let ratio = (out.state.offset.y / max_offset).clamp(0.0, 1.0);
+    let handle = Rect::from_min_size(
+        Pos2::new(rail.left(), rail.top() + travel * ratio),
+        Vec2::new(rail.width(), handle_h),
+    );
+
+    let response = ui
+        .interact(
+            rail.expand2(Vec2::new(5.0, 2.0)),
+            out.id.with("rail"),
+            Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hot = response.hovered() || response.dragged();
+
+    // Rounded base, then a vertical gradient inset by one pixel so the
+    // rounded corners stay intact.
+    ui.painter()
+        .rect_filled(handle, 5, lerp_color(handle_top, handle_bottom, 0.45));
+    let inner = handle.shrink2(Vec2::new(1.0, 1.5));
+    let painter = ui.painter().with_clip_rect(inner);
+    let bands = 14;
+    for index in 0..bands {
+        let from = index as f32 / bands as f32;
+        let to = (index + 1) as f32 / bands as f32;
+        let color = lerp_color(handle_top, handle_bottom, (from + to) * 0.5);
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(inner.left(), inner.top() + inner.height() * from),
+                Pos2::new(inner.right(), inner.top() + inner.height() * to),
+            ),
+            0,
+            color,
+        );
+    }
+    // Bevel: light catching the top/left edge, shadow under the bottom/right.
+    let bevel_light = Color32::from_white_alpha(if t.dark_mode { 80 } else { 230 });
+    let bevel_dark = Color32::from_black_alpha(if t.dark_mode { 50 } else { 34 });
+    ui.painter().line_segment(
+        [
+            Pos2::new(handle.left() + 3.0, handle.top() + 1.0),
+            Pos2::new(handle.right() - 3.0, handle.top() + 1.0),
+        ],
+        Stroke::new(1.0_f32, bevel_light),
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(handle.left() + 1.0, handle.top() + 3.0),
+            Pos2::new(handle.left() + 1.0, handle.bottom() - 3.0),
+        ],
+        Stroke::new(1.0_f32, bevel_light),
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(handle.left() + 3.0, handle.bottom() - 1.0),
+            Pos2::new(handle.right() - 3.0, handle.bottom() - 1.0),
+        ],
+        Stroke::new(1.0_f32, bevel_dark),
+    );
+    ui.painter().line_segment(
+        [
+            Pos2::new(handle.right() - 1.0, handle.top() + 3.0),
+            Pos2::new(handle.right() - 1.0, handle.bottom() - 3.0),
+        ],
+        Stroke::new(1.0_f32, bevel_dark),
+    );
+    // Subtle grooves keep the handle from reading as a flat pill.
+    if handle_h >= 34.0 {
+        for step in 1..=3 {
+            let y = handle.top() + handle.height() * step as f32 / 4.0;
+            ui.painter().line_segment(
+                [
+                    Pos2::new(handle.left() + 2.5, y),
+                    Pos2::new(handle.right() - 2.5, y),
+                ],
+                Stroke::new(1.0_f32, Color32::from_black_alpha(14)),
+            );
+            ui.painter().line_segment(
+                [
+                    Pos2::new(handle.left() + 2.5, y + 1.0),
+                    Pos2::new(handle.right() - 2.5, y + 1.0),
+                ],
+                Stroke::new(1.0_f32, Color32::from_white_alpha(120)),
+            );
+        }
+    }
+    if hot {
+        ui.painter().rect_filled(
+            handle,
+            5,
+            Color32::from_white_alpha(if t.dark_mode { 18 } else { 26 }),
+        );
+    }
+
+    if response.clicked() || response.dragged() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let top = (pos.y - handle_h / 2.0).clamp(rail.top(), rail.top() + travel);
+            let new_ratio = if travel > 0.0 {
+                (top - rail.top()) / travel
+            } else {
+                0.0
+            };
+            let mut state = out.state;
+            state.offset.y = new_ratio * max_offset;
+            state.store(ui.ctx(), out.id);
+            ui.ctx().request_repaint();
+        }
+    } else if response.hovered() {
+        // The native wheel handler only covers the scroll area's own rect,
+        // so the rail has to forward wheel input itself.
+        let delta = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+        if delta.abs() > 0.01 {
+            let mut state = out.state;
+            state.offset.y = (state.offset.y - delta).clamp(0.0, max_offset);
+            state.store(ui.ctx(), out.id);
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// Vertical scroll area that fills the given height. Used by the main page
+/// content where the viewport should occupy all remaining space.
+pub fn scroll_fill<R>(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash,
+    height: f32,
+    stick_to_bottom: bool,
+    body: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let out = egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 0,
+            right: 18,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            ui.set_width(width);
+            ui.set_min_width(width);
+            ui.set_height(height.max(32.0));
+            egui::ScrollArea::vertical()
+                .id_salt(id_salt)
+                .max_height(height.max(32.0))
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .stick_to_bottom(stick_to_bottom)
+                .show(ui, |ui| {
+                    // Fill the viewport so cards and separators use the full
+                    // width instead of shrink-wrapping and leaving a gap.
+                    let width = ui.available_width();
+                    ui.set_width(width);
+                    body(ui)
+                })
+        })
+        .inner;
+    paint_scroll_rail(ui, &out);
+    out.inner
+}
+
+/// Vertical scroll area that grows with its content up to `max_height`.
+/// Used by modals and the plugin console.
+pub fn scroll_capped<R>(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash,
+    max_height: f32,
+    stick_to_bottom: bool,
+    body: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let out = egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 0,
+            right: 18,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            ui.set_width(width);
+            ui.set_min_width(width);
+            egui::ScrollArea::vertical()
+                .id_salt(id_salt)
+                .max_height(max_height)
+                .auto_shrink([false, true])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .stick_to_bottom(stick_to_bottom)
+                .show(ui, |ui| {
+                    // Fill the viewport so cards and separators use the full
+                    // width instead of shrink-wrapping and leaving a gap.
+                    let width = ui.available_width();
+                    ui.set_width(width);
+                    body(ui)
+                })
+        })
+        .inner;
+    paint_scroll_rail(ui, &out);
+    out.inner
+}
+
+/// Virtualised variant of [`scroll_capped`] for long, fixed-height rows.
+pub fn scroll_rows(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash,
+    max_height: f32,
+    stick_to_bottom: bool,
+    row_height: f32,
+    total_rows: usize,
+    add_contents: impl FnOnce(&mut Ui, std::ops::Range<usize>),
+) {
+    let out = egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 0,
+            right: 18,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            ui.set_width(width);
+            ui.set_min_width(width);
+            egui::ScrollArea::vertical()
+                .id_salt(id_salt)
+                .max_height(max_height)
+                .auto_shrink([false, true])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .stick_to_bottom(stick_to_bottom)
+                .show_rows(ui, row_height, total_rows, add_contents)
+        })
+        .inner;
+    paint_scroll_rail(ui, &out);
+}
+
+// ---------------------------------------------------------------------------
 // Page header
 // ---------------------------------------------------------------------------
 
@@ -506,7 +785,10 @@ pub fn kpi_cards_from_snapshot(ui: &mut Ui, snapshot: &crate::snapshot::UiSnapsh
             icons::CHECK_CIRCLE,
             "成功率",
             success,
-            format!("平均延迟 {} ms", today.avg_latency_ms),
+            format!(
+                "平均耗时 {}",
+                widgets::format_duration_ms(today.avg_latency_ms)
+            ),
             if today.requests > 0 && today.success_rate() >= 0.95 {
                 t.green
             } else {
@@ -714,11 +996,7 @@ pub fn modal_shell(
             .inner_margin(egui::Margin::symmetric(pad as i8, 16))
             .show(ui, |ui| {
                 ui.set_width(inner_width);
-                egui::ScrollArea::vertical()
-                    .max_height(max_body)
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .id_salt(id.with("body"))
-                    .show(ui, body);
+                scroll_capped(ui, id.with("body"), max_body, false, body);
             });
         let rect = ui.available_rect_before_wrap();
         ui.painter().line_segment(

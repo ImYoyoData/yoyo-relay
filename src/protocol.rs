@@ -1521,6 +1521,39 @@ impl StreamTranslator {
         self.produced_chars = self.produced_chars.saturating_add(text.chars().count());
     }
 
+    /// Count reasoning/thinking deltas in the live throughput meter.
+    ///
+    /// Reasoning tokens are generated at the same rate as the answer and
+    /// usually arrive first, so ignoring them made the meter read 0 tok/s for
+    /// the entire thinking phase of a reasoning model.
+    fn note_reasoning(&mut self, value: &Value) {
+        // Accept a whole SSE event (`{ delta }`, `{ choices: [{ delta }] }`)
+        // or the delta object itself.
+        let delta = value
+            .get("delta")
+            .or_else(|| value.pointer("/choices/0/delta"))
+            .unwrap_or(value);
+        // Responses-style reasoning emits a plain string delta.
+        if delta.is_string() {
+            if let Some(text) = delta.as_str() {
+                self.note_produced(text);
+            }
+            return;
+        }
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(text) = delta.get(key).and_then(Value::as_str) {
+                self.note_produced(text);
+                return;
+            }
+        }
+        if let Some(text) = value
+            .pointer("/content_block/thinking")
+            .and_then(Value::as_str)
+        {
+            self.note_produced(text);
+        }
+    }
+
     /// A terminal error frame in the client's own dialect.
     pub fn error_frame(&self, message: &str) -> String {
         let message = message.replace('"', "'");
@@ -1629,6 +1662,7 @@ impl StreamTranslator {
         self.collect_usage_from_event(&value);
         // Passthrough streams never run through the dialect parsers, so count
         // generated text here to keep the live meter accurate.
+        self.note_reasoning(&value);
         match self.ingress {
             Protocol::OpenAiChat => {
                 if let Some(text) = value
@@ -1742,6 +1776,7 @@ impl StreamTranslator {
             }
             "content_block_delta" => {
                 let delta = data.get("delta").cloned().unwrap_or_else(|| json!({}));
+                self.note_reasoning(&delta);
                 match delta.get("type").and_then(Value::as_str) {
                     Some("text_delta") => {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
@@ -1823,6 +1858,7 @@ impl StreamTranslator {
             return out;
         };
         let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
+        self.note_reasoning(&delta);
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             if !text.is_empty() {
                 self.note_produced(text);
@@ -2015,6 +2051,11 @@ impl StreamTranslator {
                     }
                 }
             }
+            // Reasoning summaries are generated tokens too; count them for
+            // the live meter even though the client does not see them.
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                self.note_reasoning(&data);
+            }
             "response.output_item.added" => {
                 if let Some(item) = data.get("item") {
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
@@ -2185,6 +2226,7 @@ impl StreamTranslator {
             return out;
         };
         let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
+        self.note_reasoning(&delta);
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             if !text.is_empty() {
                 self.note_produced(text);

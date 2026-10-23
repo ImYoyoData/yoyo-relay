@@ -7,6 +7,7 @@ mod contributors;
 mod db;
 mod fx;
 mod gateway;
+mod identity;
 mod instance;
 mod netinfo;
 mod plugins;
@@ -37,7 +38,7 @@ fn main() {
         .try_init();
 
     if let Err(err) = run() {
-        eprintln!("YoyoRelay 启动失败：{err:#}");
+        eprintln!("{} 启动失败：{err:#}", identity::APP_NAME);
         run_fatal(&format!("{err:#}"));
     }
 }
@@ -76,7 +77,7 @@ fn run() -> Result<()> {
     let _instance_guard = match instance::acquire(&store.paths.config_dir, signals.clone())? {
         instance::Instance::Primary(guard) => guard,
         instance::Instance::AlreadyRunning => {
-            println!("YoyoRelay 已在运行，已请求显示已有窗口。");
+            println!("{} 已在运行，已请求显示已有窗口。", identity::APP_NAME);
             return Ok(());
         }
     };
@@ -132,7 +133,7 @@ fn run() -> Result<()> {
             .with_transparent(false)
             .with_resizable(true)
             .with_clamp_size_to_monitor_size(true)
-            .with_title("YoyoRelay")
+            .with_title(identity::APP_NAME)
             .with_icon(app_icon()),
         renderer: eframe::Renderer::Glow,
         vsync: true,
@@ -140,7 +141,7 @@ fn run() -> Result<()> {
     };
 
     let result = eframe::run_native(
-        "YoyoRelay",
+        identity::APP_NAME,
         options,
         Box::new(move |cc| {
             Ok(Box::new(ui::App::new(
@@ -161,7 +162,10 @@ fn run() -> Result<()> {
 }
 
 fn run_headless(snap_rx: std::sync::mpsc::Receiver<Arc<snapshot::UiSnapshot>>) {
-    println!("YoyoRelay headless 模式已启动；使用 curl 访问本地端点，按 Ctrl+C 退出。");
+    println!(
+        "{} headless 模式已启动；使用 curl 访问本地端点，按 Ctrl+C 退出。",
+        identity::APP_NAME
+    );
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let _ = ctrlc::set_handler(move || {
         let _ = stop_tx.send(());
@@ -364,7 +368,7 @@ fn run_fatal(message: &str) {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.add_space(24.0);
-                ui.heading("YoyoRelay 无法启动");
+                ui.heading(format!("{} 无法启动", identity::APP_NAME));
                 ui.add_space(10.0);
                 ui.label(&self.message);
                 ui.add_space(14.0);
@@ -383,14 +387,14 @@ fn run_fatal(message: &str) {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([760.0, 420.0])
             .with_decorations(false)
-            .with_title("YoyoRelay")
+            .with_title(identity::APP_NAME)
             .with_icon(app_icon()),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     let message = message.to_string();
     let _ = eframe::run_native(
-        "YoyoRelay",
+        identity::APP_NAME,
         options,
         Box::new(move |cc| {
             ui::theme::install_fonts(&cc.egui_ctx);

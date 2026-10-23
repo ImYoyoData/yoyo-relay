@@ -30,7 +30,7 @@ impl Tray {
         self.last_detail = detail.to_string();
         self.stats_item.set_text(summary);
         self.detail_item.set_text(detail);
-        let tooltip = format!("YoyoRelay\n{summary}\n{detail}");
+        let tooltip = format!("{}\n{summary}\n{detail}", crate::identity::APP_NAME);
         // Windows truncates notifications longer than 127 UTF-16 units.
         let tooltip: String = tooltip.chars().take(120).collect();
         let _ = self.icon.set_tooltip(Some(tooltip));
@@ -49,7 +49,7 @@ pub fn install(signals: Arc<Signals>) -> Option<Tray> {
     let stats = MenuItem::new("正在加载运行状态…", false, None);
     let detail = MenuItem::new("打开主窗口查看请求与用量", false, None);
     let show = MenuItem::new("显示主窗口", true, None);
-    let quit = MenuItem::new("退出 YoyoRelay", true, None);
+    let quit = MenuItem::new(format!("退出 {}", crate::identity::APP_NAME), true, None);
     let separator = PredefinedMenuItem::separator();
     let separator2 = PredefinedMenuItem::separator();
     menu.append_items(&[&stats, &detail, &separator, &show, &separator2, &quit])
@@ -83,7 +83,7 @@ pub fn install(signals: Arc<Signals>) -> Option<Tray> {
     }));
 
     let icon = TrayIconBuilder::new()
-        .with_tooltip("YoyoRelay · 本地 LLM 代理")
+        .with_tooltip(format!("{} · 本地 LLM 代理", crate::identity::APP_NAME))
         .with_icon(icon)
         .with_menu(Box::new(menu))
         .build()

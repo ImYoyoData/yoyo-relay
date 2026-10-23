@@ -210,25 +210,38 @@ impl SpeedMeter {
         }
     }
 
-    /// Completion tokens per second over the last three seconds. Returns 0.0
-    /// after two seconds of silence so the badge drops back to zero instead of
-    /// showing a stale average.
+    /// Completion tokens per second over the recent window.
+    ///
+    /// The rate divides by the span the samples actually cover rather than the
+    /// full window: a 1-second burst of 60 tokens is 60 tok/s, not 20. The
+    /// meter only falls back to zero after a few seconds of silence.
     pub fn tokens_per_sec(&self) -> f64 {
-        const WINDOW: f64 = 3.0;
+        const WINDOW: f64 = 4.0;
+        const GRACE: f64 = 4.0;
         let now = Instant::now();
         let samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
         let Some((last_at, _)) = samples.back() else {
             return 0.0;
         };
-        if now.duration_since(*last_at) > Duration::from_secs(2) {
+        if now.duration_since(*last_at).as_secs_f64() > GRACE {
             return 0.0;
         }
-        let total: u64 = samples
-            .iter()
-            .filter(|(at, _)| now.duration_since(*at) <= Duration::from_secs_f64(WINDOW))
-            .map(|(_, tokens)| *tokens)
-            .sum();
-        total as f64 / WINDOW
+        let mut total = 0u64;
+        let mut first_at = now;
+        for (at, tokens) in samples.iter() {
+            if now.duration_since(*at).as_secs_f64() <= WINDOW {
+                total = total.saturating_add(*tokens);
+                first_at = first_at.min(*at);
+            }
+        }
+        if total == 0 {
+            return 0.0;
+        }
+        let span = now
+            .duration_since(first_at)
+            .as_secs_f64()
+            .clamp(0.5, WINDOW);
+        total as f64 / span
     }
 }
 
@@ -2564,8 +2577,9 @@ mod speed_tests {
         meter.record(60);
         let tps = meter.tokens_per_sec();
         assert!(tps > 0.0, "expected a positive rate, got {tps}");
-        // 60 tokens inside a three-second window is at most 60/s.
-        assert!(tps <= 60.0 + f64::EPSILON);
+        // A single burst divides by the minimum 0.5 s span; the old
+        // fixed-window math reported only 20 tok/s for the same samples.
+        assert!(tps <= 120.0 + f64::EPSILON, "unexpected rate: {tps}");
     }
 
     #[test]

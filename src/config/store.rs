@@ -187,7 +187,7 @@ impl ConfigStore {
         config.schema_version = CONFIG_SCHEMA_VERSION;
 
         if config.server.port == 0 {
-            config.server.port = 7789;
+            config.server.port = crate::identity::DEFAULT_PORT;
             needs_save = true;
         }
 

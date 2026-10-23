@@ -23,7 +23,7 @@ mod imp {
     use std::process::Command;
 
     const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-    const VALUE_NAME: &str = "YoyoRelay";
+    const VALUE_NAME: &str = crate::identity::AUTOSTART_VALUE;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     fn reg() -> Command {
@@ -79,7 +79,7 @@ mod imp {
         Ok(home
             .join("Library")
             .join("LaunchAgents")
-            .join("com.yoyorelay.app.plist"))
+            .join(crate::identity::LAUNCH_AGENT))
     }
 
     fn xml_escape(value: &str) -> String {
@@ -101,7 +101,7 @@ mod imp {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.yoyorelay.app</string>
+  <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
   <array>
     <string>{}</string>
@@ -111,6 +111,7 @@ mod imp {
 </dict>
 </plist>
 "#,
+                crate::identity::LAUNCH_AGENT,
                 xml_escape(&exe.display().to_string())
             );
             fs::write(&path, content).context("写入 LaunchAgent 失败")?;
@@ -143,7 +144,9 @@ mod imp {
 
     fn desktop_path() -> Result<PathBuf> {
         let config = dirs::config_dir().ok_or_else(|| anyhow!("无法定位用户配置目录"))?;
-        Ok(config.join("autostart").join("yoyo-relay.desktop"))
+        Ok(config
+            .join("autostart")
+            .join(crate::identity::autostart_desktop_file()))
     }
 
     fn desktop_exec(exe: &std::path::Path) -> String {
@@ -162,7 +165,8 @@ mod imp {
                 fs::create_dir_all(parent)?;
             }
             let content = format!(
-                "[Desktop Entry]\nType=Application\nName=YoyoRelay\nComment=Local LLM relay and failover proxy\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\nHidden=false\n",
+                "[Desktop Entry]\nType=Application\nName={}\nComment=Local LLM relay and failover proxy\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\nHidden=false\n",
+                crate::identity::APP_NAME,
                 desktop_exec(exe)
             );
             fs::write(&path, content).context("写入 XDG autostart 文件失败")?;

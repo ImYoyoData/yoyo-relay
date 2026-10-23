@@ -129,7 +129,10 @@ impl App {
                 } else {
                     format!("{:.1}%", totals.success_rate() * 100.0)
                 },
-                format!("平均延迟 {} ms", totals.avg_latency_ms),
+                format!(
+                    "平均耗时 {}",
+                    widgets::format_duration_ms(totals.avg_latency_ms)
+                ),
                 if totals.requests > 0 && totals.success_rate() >= 0.95 {
                     theme::GREEN
                 } else {
@@ -338,10 +341,10 @@ impl App {
                                 );
                                 ui.label(
                                     RichText::new(format!(
-                                        "{} 请求 · {} 成功 · 平均 {} ms",
+                                        "{} 请求 · {} 成功 · 平均耗时 {}",
                                         group.totals.requests,
                                         group.totals.ok,
-                                        group.totals.avg_latency_ms
+                                        widgets::format_duration_ms(group.totals.avg_latency_ms)
                                     ))
                                     .size(9.5)
                                     .color(theme::muted(ui)),
@@ -372,8 +375,8 @@ impl App {
                             );
                             metric_column(
                                 ui,
-                                "平均延迟",
-                                &format!("{} ms", group.totals.avg_latency_ms),
+                                "平均耗时",
+                                &widgets::format_duration_ms(group.totals.avg_latency_ms),
                                 false,
                             );
                         });

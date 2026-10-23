@@ -1151,16 +1151,26 @@ impl App {
             self.test_started_at = None;
         }
         let mut close = false;
+        let speed = result
+            .as_ref()
+            .map(|result| result.kind == "speed")
+            .unwrap_or_else(|| key.starts_with("speed:"));
+        let kind_label = if speed { "测速" } else { "连接测试" };
         let title = if let Some(result) = &result {
-            format!("连接测试 · {}", result.title)
+            format!("{kind_label} · {}", result.title)
         } else {
-            "连接测试".to_string()
+            kind_label.to_string()
+        };
+        let subtitle = if speed {
+            "流式生成速度测试（tok/s），不写入正式用量"
+        } else {
+            "最小请求探测，不写入正式用量"
         };
         let closed = super::kit::modal_shell(
             ctx,
             Id::new("yoyo_test"),
             &title,
-            "最小请求探测，不写入正式用量",
+            subtitle,
             720.0,
             |ui| {
                 if running {
@@ -1184,12 +1194,17 @@ impl App {
                                     .color(theme::muted(ui)),
                             );
                         }
-                        ui.label(
-                            RichText::new(format!("{} ms", result.latency_ms))
+                        if result.latency_ms > 0 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "耗时 {}",
+                                    widgets::format_duration_ms(result.latency_ms)
+                                ))
                                 .monospace()
                                 .size(10.5)
                                 .color(theme::muted(ui)),
-                        );
+                            );
+                        }
                     });
                     if let Some(tps) = result.tokens_per_sec {
                         ui.add_space(6.0);

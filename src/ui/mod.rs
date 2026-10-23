@@ -820,7 +820,7 @@ impl App {
             ctx,
             Id::new("yoyo_update"),
             &format!("发现新版本 v{}", update.latest),
-            &format!("当前版本 v{} · 更新后需要重新启动程序", update.current),
+            &format!("当前版本 v{} · 更新会自动替换程序并重启", update.current),
             620.0,
             |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -957,13 +957,14 @@ impl App {
         let title = if self.config.ui.show_taskbar_stats {
             let (_, label) = self.proxy_status();
             format!(
-                "YoyoRelay · {} 活跃 · {} tokens · {}",
+                "{} · {} 活跃 · {} tokens · {}",
+                crate::identity::APP_NAME,
                 self.snapshot.active_requests,
                 widgets::format_count(self.snapshot.today.totals.total_tokens),
                 label
             )
         } else {
-            "YoyoRelay".to_string()
+            crate::identity::APP_NAME.to_string()
         };
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1051,11 +1052,11 @@ impl App {
             if badge_cfg.show_speed {
                 parts.push(format!(
                     "{} tok/s",
-                    widgets::format_count(self.snapshot.tokens_per_sec.round() as u64)
+                    widgets::format_tps(self.snapshot.tokens_per_sec)
                 ));
             }
             let text = if !badge_cfg.has_content() || parts.is_empty() {
-                "YoyoRelay".to_string()
+                crate::identity::APP_NAME.to_string()
             } else {
                 parts.join(" · ")
             };
@@ -1161,7 +1162,7 @@ impl App {
                     ui.painter().text(
                         Pos2::new(text_x, center_y - 8.5),
                         Align2::LEFT_CENTER,
-                        "YoyoRelay",
+                        crate::identity::APP_NAME,
                         egui::FontId::proportional(14.5),
                         t.text,
                     );
@@ -1193,14 +1194,14 @@ impl App {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let close_hint = if self.config.ui.close_to_tray {
                                     if cfg!(windows) {
-                                        "隐藏到系统托盘"
+                                        "隐藏到系统托盘".to_string()
                                     } else {
-                                        "最小化到任务栏"
+                                        "最小化到任务栏".to_string()
                                     }
                                 } else {
-                                    "退出 YoyoRelay"
+                                    format!("退出 {}", crate::identity::APP_NAME)
                                 };
-                                if kit::window_button(ui, icons::X, close_hint, true).clicked() {
+                                if kit::window_button(ui, icons::X, &close_hint, true).clicked() {
                                     if self.config.ui.close_to_tray {
                                         self.hide_to_tray(ctx);
                                     } else {
@@ -1749,6 +1750,19 @@ impl App {
                         .size(9.5)
                         .color(t.muted),
                     );
+                    ui.label(RichText::new("·").size(9.5).color(t.muted));
+                    ui.label(
+                        RichText::new(format!(
+                            "实时 {} tok/s",
+                            widgets::format_tps(self.snapshot.tokens_per_sec)
+                        ))
+                        .size(9.5)
+                        .color(if self.snapshot.tokens_per_sec > 0.0 {
+                            t.green
+                        } else {
+                            t.muted
+                        }),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!(
@@ -1772,38 +1786,35 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(22, 16)),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("central_content")
-                    .auto_shrink([false, false])
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .show(ui, |ui| {
-                        let max_w = 1260.0_f32;
-                        let avail = ui.available_width();
-                        if avail > max_w {
-                            ui.add_space((avail - max_w) / 2.0);
-                        }
-                        let width = avail.min(max_w);
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(width, 0.0),
-                            Layout::top_down(Align::Min),
-                            |ui| {
-                                ui.set_width(width);
-                                match self.page {
-                                    Page::Overview => self.page_overview(ui),
-                                    Page::Providers => self.page_providers(ui),
-                                    Page::Accounts => self.page_accounts(ui),
-                                    Page::Routes => self.page_routes(ui),
-                                    Page::Plugins => self.page_plugins(ui),
-                                    Page::LocalKeys => self.page_local_keys(ui),
-                                    Page::Usage => self.page_usage(ui),
-                                    Page::Calls => self.page_calls(ui),
-                                    Page::Balances => self.page_balances(ui),
-                                    Page::Settings => self.page_settings(ui),
-                                }
-                                ui.add_space(24.0);
-                            },
-                        );
-                    });
+                let height = ui.available_height();
+                kit::scroll_fill(ui, "central_content", height, false, |ui| {
+                    let max_w = 1260.0_f32;
+                    let avail = ui.available_width();
+                    if avail > max_w {
+                        ui.add_space((avail - max_w) / 2.0);
+                    }
+                    let width = avail.min(max_w);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(width, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_width(width);
+                            match self.page {
+                                Page::Overview => self.page_overview(ui),
+                                Page::Providers => self.page_providers(ui),
+                                Page::Accounts => self.page_accounts(ui),
+                                Page::Routes => self.page_routes(ui),
+                                Page::Plugins => self.page_plugins(ui),
+                                Page::LocalKeys => self.page_local_keys(ui),
+                                Page::Usage => self.page_usage(ui),
+                                Page::Calls => self.page_calls(ui),
+                                Page::Balances => self.page_balances(ui),
+                                Page::Settings => self.page_settings(ui),
+                            }
+                            ui.add_space(24.0);
+                        },
+                    );
+                });
             });
     }
 
@@ -1931,11 +1942,14 @@ impl eframe::App for App {
         egui::SidePanel::left("sidebar")
             .exact_width(sidebar_w)
             .resizable(false)
+            .show_separator_line(false)
             .frame(
                 egui::Frame::new()
                     .fill(t.sidebar)
                     .inner_margin(egui::Margin::symmetric(10, 4))
-                    .stroke(Stroke::new(1.0_f32, t.card_border)),
+                    // No stroke: a 1px card border next to the scroll area
+                    // read as a heavy black divider between menu and content.
+                    .stroke(Stroke::NONE),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()

@@ -189,7 +189,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1".to_string(),
-            port: 7789,
+            port: crate::identity::DEFAULT_PORT,
             auth_enabled: true,
             max_global_concurrency: 50,
             queue_capacity: 100,
