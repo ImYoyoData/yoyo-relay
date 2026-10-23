@@ -289,6 +289,7 @@ pub struct App {
     pub(crate) editor: Option<Editor>,
     pub(crate) confirm: Option<ConfirmAction>,
     pub(crate) test_key: Option<String>,
+    pub(crate) test_started_at: Option<Instant>,
     pub(crate) toasts: Vec<Toast>,
     pub(crate) toast_seq: u64,
     pub(crate) last_notice_id: u64,
@@ -364,6 +365,7 @@ impl App {
             editor: None,
             confirm: None,
             test_key: None,
+            test_started_at: None,
             toasts: Vec::new(),
             toast_seq: 1,
             last_notice_id: 0,
@@ -487,6 +489,18 @@ impl App {
                         let _ = app.cmd_tx.send(UiCommand::TestRoute(id));
                     }
                 }
+                "test_provider" => {
+                    if let Some(provider) = app.config.providers.first() {
+                        let id = provider.id.clone();
+                        app.start_test("provider", &id);
+                    }
+                }
+                "test_account" => {
+                    if let Some(account) = app.config.accounts.first() {
+                        let id = account.id.clone();
+                        app.start_test("account", &id);
+                    }
+                }
                 "confirm" => {
                     if let Some(provider) = app.config.providers.first() {
                         app.confirm = Some(ConfirmAction::DeleteProvider(provider.id.clone()));
@@ -539,8 +553,16 @@ impl App {
     }
 
     pub(crate) fn start_test(&mut self, kind: &str, id: &str) {
-        let key = format!("{kind}:{id}");
+        // Probe results for both speed kinds are stored under `speed:<id>`,
+        // so the modal key must match (it used to wait forever for
+        // `speed_provider:<id>` / `speed_account:<id>`).
+        let key = if kind.starts_with("speed_") {
+            format!("speed:{id}")
+        } else {
+            format!("{kind}:{id}")
+        };
         self.test_key = Some(key);
+        self.test_started_at = Some(Instant::now());
         let cmd = match kind {
             "provider" => UiCommand::TestProvider(id.to_string()),
             "account" => UiCommand::TestAccount(id.to_string()),
@@ -1525,6 +1547,38 @@ impl App {
                                 self.toast(NoticeLevel::Success, "端点已复制");
                             }
                         });
+                        let lan_endpoints: Vec<_> = self
+                            .snapshot
+                            .endpoints
+                            .iter()
+                            .filter(|endpoint| endpoint.lan)
+                            .take(2)
+                            .cloned()
+                            .collect();
+                        for view in &lan_endpoints {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(&view.url)
+                                        .monospace()
+                                        .size(8.5)
+                                        .color(t.muted),
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(icons::COPY).size(9.5).color(t.muted),
+                                        )
+                                        .frame(false)
+                                        .min_size(Vec2::splat(14.0)),
+                                    )
+                                    .on_hover_text("复制局域网端点")
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(view.url.clone());
+                                    self.toast(NoticeLevel::Success, "局域网端点已复制");
+                                }
+                            });
+                        }
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             kit::status_pill(ui, &format!("代理{label}"), color);

@@ -1087,6 +1087,9 @@ impl App {
         };
         let running = self.snapshot.running_tests.contains(&key);
         let result = self.snapshot.tests.get(&key).cloned();
+        if result.is_some() {
+            self.test_started_at = None;
+        }
         let mut close = false;
         let title = if let Some(result) = &result {
             format!("连接测试 · {}", result.title)
@@ -1205,8 +1208,22 @@ impl App {
                 } else {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("等待测试结果…");
+                        let elapsed = self
+                            .test_started_at
+                            .map(|started| started.elapsed().as_secs())
+                            .unwrap_or(0);
+                        ui.label(if elapsed > 0 {
+                            format!("等待测试结果… 已等待 {elapsed} 秒")
+                        } else {
+                            "等待测试结果…".to_string()
+                        });
                     });
+                    ui.add_space(4.0);
+                    super::kit::info_row(
+                        ui,
+                        icons::INFO,
+                        "上游连接超时可能需要 30–120 秒；测试完成后这里会自动显示结果，也可以先关闭弹窗，结果会以通知形式保留。",
+                    );
                 }
             },
             |ui| {

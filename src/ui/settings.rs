@@ -869,6 +869,58 @@ impl App {
                 kit::status_pill(ui, proxy_label, proxy_color);
             },
             |ui| {
+                let lan = matches!(
+                    self.config.server.bind.trim(),
+                    "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0"
+                );
+                let mut allow_lan = lan;
+                let mut lan_changed = false;
+                ui.horizontal_wrapped(|ui| {
+                    if kit::toggle_switch(ui, &mut allow_lan).changed() {
+                        lan_changed = true;
+                    }
+                    ui.label(
+                        RichText::new("允许局域网访问")
+                            .size(11.0)
+                            .strong()
+                            .color(theme::text(ui)),
+                    );
+                    ui.label(
+                        RichText::new(if allow_lan {
+                            "监听 0.0.0.0，局域网内其他设备可用下方地址访问"
+                        } else {
+                            "仅监听 127.0.0.1，只有本机可访问"
+                        })
+                        .size(10.0)
+                        .color(theme::muted(ui)),
+                    );
+                });
+                if lan_changed {
+                    self.config.server.bind = if allow_lan {
+                        "0.0.0.0".to_string()
+                    } else {
+                        "127.0.0.1".to_string()
+                    };
+                    changed = true;
+                }
+                if allow_lan && !self.config.server.auth_enabled {
+                    ui.add_space(3.0);
+                    egui::Frame::new()
+                        .fill(theme::soft_for(ui, theme::RED))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} 局域网监听已开启，但「安全」页的本地鉴权是关闭的。请先启用鉴权，否则同网段设备可直接调用。",
+                                    icons::WARNING
+                                ))
+                                .size(10.0)
+                                .color(theme::RED),
+                            );
+                        });
+                }
+                ui.add_space(8.0);
                 ui.columns(2, |cols| {
                     changed |= proxy_fields_a(&mut cols[0], &mut self.config.server);
                     changed |= proxy_fields_b(&mut cols[1], &mut self.config.server);
@@ -901,6 +953,23 @@ impl App {
                             });
                         });
                     });
+                if self.snapshot.endpoints.len() > 1 {
+                    ui.add_space(5.0);
+                    for view in self
+                        .snapshot
+                        .endpoints
+                        .iter()
+                        .filter(|endpoint| endpoint.lan)
+                    {
+                        ui.horizontal(|ui| {
+                            kit::badge(ui, &view.label, theme::BLUE_INFO);
+                            ui.label(RichText::new(&view.url).monospace().size(10.0));
+                            if kit::icon_button(ui, icons::COPY, "复制该地址").clicked() {
+                                ui.ctx().copy_text(view.url.clone());
+                            }
+                        });
+                    }
+                }
                 ui.label(
                     RichText::new(format!(
                         "Base URL 以 /v1 结尾；OpenAI Chat、Anthropic Messages、Responses 三种客户端都填这一地址，模型列表：{endpoint}/models"

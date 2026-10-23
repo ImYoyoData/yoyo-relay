@@ -670,6 +670,17 @@ impl Runtime {
             shared.push_notice(NoticeLevel::Error, message);
         });
         self.proxy = Some(ProxyHandle { cancel, join });
+        if matches!(cfg.server.bind.trim(), "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0") {
+            let lan: Vec<String> = crate::netinfo::lan_addresses()
+                .into_iter()
+                .map(|address| format!("http://{}:{}/v1", address.ip, cfg.server.port))
+                .collect();
+            if lan.is_empty() {
+                tracing::info!("proxy listening on all interfaces (no LAN address detected)");
+            } else {
+                tracing::info!("proxy LAN endpoints: {}", lan.join(", "));
+            }
+        }
         self.shared.set_proxy(ProxyStatus::Running);
         self.shared.push_notice(
             NoticeLevel::Success,
@@ -1352,9 +1363,42 @@ impl Runtime {
             self.shared.push_notice(level, text);
         }
         let (active_requests, queued_requests) = self.gateway.queue_depth();
+        let lan_enabled = matches!(cfg.server.bind.trim(), "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0");
+        let port = cfg.server.port;
+        let loopback_bind = matches!(cfg.server.bind.trim(), "127.0.0.1" | "localhost" | "::1");
+        let mut endpoints = vec![EndpointView {
+            label: if loopback_bind || lan_enabled {
+                "本机".to_string()
+            } else {
+                "监听地址".to_string()
+            },
+            url: self.gateway.api_base(),
+            lan: !loopback_bind && !lan_enabled,
+        }];
+        if lan_enabled {
+            for address in crate::netinfo::lan_addresses() {
+                let url = format!("http://{}:{port}/v1", address.ip);
+                if endpoints.iter().any(|endpoint| endpoint.url == url) {
+                    continue;
+                }
+                endpoints.push(EndpointView {
+                    label: format!("局域网 · {}", address.name),
+                    url,
+                    lan: true,
+                });
+            }
+        }
+        if lan_enabled && !cfg.server.auth_enabled {
+            alerts.push(Alert {
+                level: AlertLevel::Critical,
+                text: "代理正在监听所有网卡（0.0.0.0），但本地鉴权已关闭。任何能访问该端口的设备都可以使用你的上游账号。".into(),
+            });
+        }
         let snapshot = UiSnapshot {
             proxy: proxy_status,
             endpoint: self.gateway.api_base(),
+            endpoints,
+            lan_enabled,
             uptime_secs: now - self.gateway.started_at,
             client_models: cfg.servable_models(),
             today: TodayView {

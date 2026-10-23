@@ -1,6 +1,6 @@
 [package]
 name = "yoyo-relay"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Local multi-upstream LLM relay with account failover"
 license = "MIT"
@@ -38,6 +38,7 @@ boa_engine = { version = "0.22", default-features = false }
 sha2 = "0.10"
 hmac = "0.12"
 urlencoding = "2"
+if-addrs = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
