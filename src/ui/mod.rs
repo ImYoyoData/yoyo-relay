@@ -1888,7 +1888,7 @@ impl eframe::App for App {
         // Enforce a usable minimum size even when the window is resized through
         // the custom borderless handles (which bypass the native minimum on
         // some Windows versions).
-        let min_size = egui::vec2(1000.0, 700.0);
+        let min_size = egui::vec2(1000.0, 600.0);
         let current_size = ctx.content_rect().size();
         if current_size.x + 0.5 < min_size.x || current_size.y + 0.5 < min_size.y {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
