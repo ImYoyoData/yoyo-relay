@@ -182,6 +182,9 @@ pub(crate) struct Toast {
     pub level: NoticeLevel,
     pub text: String,
     pub until: Instant,
+    /// Time left when the pointer first entered the toast.
+    pub remaining: Duration,
+    pub paused: bool,
 }
 
 pub(crate) enum Editor {
@@ -617,6 +620,8 @@ impl App {
             level,
             text: text.into(),
             until: Instant::now() + Duration::from_secs(4),
+            remaining: Duration::from_secs(4),
+            paused: false,
         });
     }
 
@@ -726,6 +731,8 @@ impl App {
                         level: notice.level,
                         text: notice.text.clone(),
                         until: Instant::now() + Duration::from_secs(4),
+                        remaining: Duration::from_secs(4),
+                        paused: false,
                     });
                     self.toast_seq += 1;
                 }
@@ -1753,7 +1760,6 @@ impl App {
     }
 
     fn show_toasts(&mut self, ctx: &egui::Context) {
-        self.toasts.retain(|t| t.until > Instant::now());
         if self.toasts.is_empty() {
             return;
         }
@@ -1761,6 +1767,8 @@ impl App {
         // Keep long notices inside the window: the toast column may never be
         // wider than ~45% of the viewport, and the text wraps inside it.
         let toast_width = (ctx.content_rect().width() * 0.45).clamp(260.0, 520.0);
+        let now = Instant::now();
+        let mut hovered = std::collections::HashSet::new();
         egui::Area::new(Id::new("toasts"))
             .anchor(Align2::RIGHT_BOTTOM, [-18.0, -42.0])
             .order(egui::Order::Foreground)
@@ -1773,7 +1781,7 @@ impl App {
                         NoticeLevel::Error => t.red,
                         NoticeLevel::Info => t.blue,
                     };
-                    egui::Frame::new()
+                    let response = egui::Frame::new()
                         .fill(t.card)
                         .stroke(Stroke::new(1.0_f32, t.card_border))
                         .corner_radius(10)
@@ -1793,10 +1801,30 @@ impl App {
                                     .wrap(),
                                 );
                             });
-                        });
+                        })
+                        .response;
+                    if response.hovered() {
+                        hovered.insert(toast.id);
+                    }
                     ui.add_space(6.0);
                 }
             });
+        // Freeze the countdown while the pointer is over a toast. The deadline
+        // is pushed forward each hovered frame, so leaving the toast resumes
+        // from the remaining time instead of closing immediately.
+        for toast in &mut self.toasts {
+            if hovered.contains(&toast.id) {
+                if !toast.paused {
+                    toast.remaining = toast.until.saturating_duration_since(now);
+                    toast.paused = true;
+                }
+                toast.until = now + toast.remaining;
+            } else {
+                toast.paused = false;
+            }
+        }
+        self.toasts
+            .retain(|toast| toast.until > now || hovered.contains(&toast.id));
         ctx.request_repaint_after(Duration::from_millis(300));
     }
 }
@@ -1860,7 +1888,7 @@ impl eframe::App for App {
         // Enforce a usable minimum size even when the window is resized through
         // the custom borderless handles (which bypass the native minimum on
         // some Windows versions).
-        let min_size = egui::vec2(900.0, 620.0);
+        let min_size = egui::vec2(1000.0, 700.0);
         let current_size = ctx.content_rect().size();
         if current_size.x + 0.5 < min_size.x || current_size.y + 0.5 < min_size.y {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(

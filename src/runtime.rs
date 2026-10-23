@@ -1654,7 +1654,7 @@ impl Runtime {
         }
 
         let usage = self.build_usage(&cfg);
-        const CALLS_PAGE_SIZE: usize = 20;
+        const CALLS_PAGE_SIZE: usize = 10;
         let calls_total = self.db.usage_count(&self.calls_filter).unwrap_or(0);
         let max_page = ((calls_total as usize).saturating_sub(1)) / CALLS_PAGE_SIZE;
         if self.calls_page > max_page {
