@@ -119,10 +119,31 @@ impl App {
         }
 
         let mut action: Option<KeyAction> = None;
-        for key in &keys {
-            self.key_card(ui, key, &mut action);
-            ui.add_space(8.0);
-        }
+        let columns = if ui.available_width() >= 720.0 { 2 } else { 1 };
+        let gap = 10.0;
+        let card_width =
+            ((ui.available_width() - gap * (columns - 1) as f32) / columns as f32).max(280.0);
+        egui::Grid::new("local_keys_grid")
+            .num_columns(columns)
+            .spacing([gap, 10.0])
+            .show(ui, |ui| {
+                for (index, key) in keys.iter().enumerate() {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(card_width, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(card_width);
+                            self.key_card(ui, key, &mut action);
+                        },
+                    );
+                    if (index + 1) % columns == 0 {
+                        ui.end_row();
+                    }
+                }
+                if keys.len() % columns != 0 {
+                    ui.end_row();
+                }
+            });
 
         if let Some(action) = action {
             match action {
@@ -225,6 +246,7 @@ impl App {
 
             ui.add_space(8.0);
             super::kit::soft_panel(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(
@@ -234,26 +256,28 @@ impl App {
                         .monospace()
                         .size(11.0),
                     );
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(icons::COPY)
-                                    .size(11.0)
-                                    .color(theme::muted(ui)),
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(icons::COPY)
+                                        .size(11.0)
+                                        .color(theme::muted(ui)),
+                                )
+                                .frame(false)
+                                .min_size(Vec2::splat(18.0)),
                             )
-                            .frame(false)
-                            .min_size(Vec2::splat(18.0)),
-                        )
-                        .on_hover_text("复制完整 Key")
-                        .clicked()
-                    {
-                        match self.store.decrypt(&key.key) {
-                            Ok(plain) if !plain.is_empty() => {
-                                *action = Some(KeyAction::Copy(plain));
+                            .on_hover_text("复制完整 Key")
+                            .clicked()
+                        {
+                            match self.store.decrypt(&key.key) {
+                                Ok(plain) if !plain.is_empty() => {
+                                    *action = Some(KeyAction::Copy(plain));
+                                }
+                                _ => *action = Some(KeyAction::CopyFailed),
                             }
-                            _ => *action = Some(KeyAction::CopyFailed),
                         }
-                    }
+                    });
                 });
             });
 
