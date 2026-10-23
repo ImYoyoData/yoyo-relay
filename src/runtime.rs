@@ -1631,6 +1631,9 @@ impl Runtime {
                         updated_at: view.balance_updated_at,
                         note: view.balance_source.clone(),
                         status_text: view.balance_source.clone(),
+                        quota_preset: account.balance.quota_preset.clone(),
+                        quota_note: quota_note_for(&account),
+                        quota_windows: quota_windows_for(self.db.as_ref(), &cfg, &account),
                     });
                 }
             }
@@ -2210,6 +2213,75 @@ fn quota_exceeded(q: &crate::scheduler::QuotaSnapshot) -> bool {
         || q.limit_requests
             .map(|l| q.used_requests >= l)
             .unwrap_or(false)
+}
+
+fn quota_windows_for(
+    db: &Db,
+    cfg: &AppConfig,
+    account: &crate::config::Account,
+) -> Vec<QuotaWindowView> {
+    let now = chrono::Local::now();
+    let currency = crate::config::normalize_currency(&account.balance.currency);
+    let windows: Vec<crate::config::QuotaWindowConfig> =
+        if !account.balance.quota_windows.is_empty() {
+            account.balance.quota_windows.clone()
+        } else if account.balance.percent_used && account.balance.quota_total > 0.0 {
+            vec![crate::config::QuotaWindowConfig {
+                label: "总额度".into(),
+                kind: crate::config::QuotaWindowKind::Monthly,
+                hours: 0,
+                limit: 100.0,
+                unit: crate::config::QuotaUnit::Percent,
+            }]
+        } else {
+            Vec::new()
+        };
+    windows
+        .into_iter()
+        .filter_map(|window| {
+            if window.unit == crate::config::QuotaUnit::Percent
+                && account.balance.quota_total <= 0.0
+            {
+                return None;
+            }
+            let since = window.start_at(now);
+            let used_micros = db.cost_account_since(&account.id, since).unwrap_or(0);
+            let used_money = cfg
+                .ui
+                .fx_convert(used_micros as f64 / 1_000_000.0, "USD", &currency);
+            let (used, limit, unit) = match window.unit {
+                crate::config::QuotaUnit::Percent => (
+                    used_money / account.balance.quota_total * 100.0,
+                    if window.limit > 0.0 {
+                        window.limit
+                    } else {
+                        100.0
+                    },
+                    "percent",
+                ),
+                crate::config::QuotaUnit::Money => (used_money, window.limit, "money"),
+            };
+            Some(QuotaWindowView {
+                label: window.display_label(),
+                used,
+                limit,
+                unit: unit.to_string(),
+                currency: currency.clone(),
+                reset_at: window.reset_at(now),
+            })
+        })
+        .collect()
+}
+
+fn quota_note_for(account: &crate::config::Account) -> String {
+    let note = crate::config::quota_preset_note(&account.balance.quota_preset);
+    if !note.is_empty() {
+        note.to_string()
+    } else if !account.balance.quota_windows.is_empty() {
+        "按本机请求花费估算；上游未提供额度 API。".into()
+    } else {
+        String::new()
+    }
 }
 
 fn set_update_progress(shared: &Shared, progress: f32, message: impl Into<String>) {

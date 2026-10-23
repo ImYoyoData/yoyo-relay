@@ -171,6 +171,20 @@ pub struct BalanceView {
     pub updated_at: i64,
     pub note: String,
     pub status_text: String,
+    pub quota_preset: String,
+    pub quota_note: String,
+    pub quota_windows: Vec<QuotaWindowView>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct QuotaWindowView {
+    pub label: String,
+    pub used: f64,
+    pub limit: f64,
+    /// `money` or `percent`.
+    pub unit: String,
+    pub currency: String,
+    pub reset_at: i64,
 }
 
 #[derive(Clone, Debug)]

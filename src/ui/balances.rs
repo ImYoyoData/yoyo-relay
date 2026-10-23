@@ -4,9 +4,134 @@ use egui::RichText;
 use egui_phosphor::regular as icons;
 
 use crate::runtime::UiCommand;
-use crate::snapshot::{BalanceView, NoticeLevel};
+use crate::snapshot::{BalanceView, NoticeLevel, QuotaWindowView};
 
 use super::{theme, widgets, App};
+
+fn quota_ratio(used: f64, limit: f64) -> f32 {
+    if limit <= 0.0 {
+        0.0
+    } else {
+        (used / limit).clamp(0.0, 1.0) as f32
+    }
+}
+
+fn quota_color(ratio: f32) -> egui::Color32 {
+    if ratio >= 0.9 {
+        theme::RED
+    } else if ratio >= 0.7 {
+        theme::ORANGE
+    } else {
+        theme::GREEN
+    }
+}
+
+fn quota_bar(
+    ui: &mut egui::Ui,
+    label: &str,
+    used: f64,
+    limit: f64,
+    unit: &str,
+    currency: &str,
+    reset_at: i64,
+) {
+    let t = theme::tokens(ui);
+    let ratio = quota_ratio(used, limit);
+    let color = quota_color(ratio);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(10.5).strong().color(t.text));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(format!("剩余 {:.0}%", (1.0 - ratio) * 100.0))
+                    .size(9.5)
+                    .color(color),
+            );
+        });
+    });
+    ui.add(
+        egui::ProgressBar::new(ratio)
+            .desired_height(9.0)
+            .fill(color)
+            .corner_radius(5)
+            .text(format!("{:.0}%", ratio * 100.0)),
+    );
+    ui.horizontal(|ui| {
+        let value = if unit == "percent" {
+            format!("{used:.0}% / {limit:.0}%")
+        } else {
+            format!(
+                "{} / {}",
+                widgets::format_money(used, currency),
+                widgets::format_money(limit, currency)
+            )
+        };
+        ui.label(RichText::new(value).monospace().size(9.0).color(t.muted));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let reset = if reset_at > 0 {
+                format!("重置 {}", widgets::format_time(reset_at))
+            } else {
+                "不重置".to_string()
+            };
+            ui.label(RichText::new(reset).size(8.5).color(t.muted));
+        });
+    });
+    ui.add_space(5.0);
+}
+
+fn quota_aggregate(ui: &mut egui::Ui, windows: &[&QuotaWindowView]) {
+    let t = theme::tokens(ui);
+    // Group by label + unit + currency. Percent windows average; money
+    // windows sum within the same currency.
+    let mut groups: Vec<(String, String, String, Vec<&QuotaWindowView>)> = Vec::new();
+    for window in windows {
+        let currency = if window.unit == "percent" {
+            String::new()
+        } else {
+            window.currency.clone()
+        };
+        let key = (window.label.clone(), window.unit.clone(), currency);
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|(label, unit, cur, _)| label == &key.0 && unit == &key.1 && cur == &key.2)
+        {
+            group.3.push(*window);
+        } else {
+            groups.push((key.0, key.1, key.2, vec![*window]));
+        }
+    }
+    super::kit::section_card(
+        ui,
+        icons::CHART_BAR,
+        "额度聚合",
+        "按账号汇总 · 本机请求花费估算",
+        |ui| {
+            super::kit::badge(ui, &format!("{} 个窗口", windows.len()), theme::BLUE_INFO);
+        },
+        |ui| {
+            for (label, unit, currency, group) in groups {
+                let (used, limit, reset_at) = if unit == "percent" {
+                    let used = group.iter().map(|w| w.used).sum::<f64>() / group.len() as f64;
+                    let limit = group.iter().map(|w| w.limit).sum::<f64>() / group.len() as f64;
+                    (used, limit, group.first().map(|w| w.reset_at).unwrap_or(0))
+                } else {
+                    (
+                        group.iter().map(|w| w.used).sum(),
+                        group.iter().map(|w| w.limit).sum(),
+                        group.first().map(|w| w.reset_at).unwrap_or(0),
+                    )
+                };
+                quota_bar(ui, &label, used, limit, &unit, &currency, reset_at);
+            }
+            ui.label(
+                RichText::new(
+                    "订阅额度按本机记录的上游请求花费估算；上游未提供额度 API 时无法精确到官方剩余量。",
+                )
+                .size(9.5)
+                .color(t.muted),
+            );
+        },
+    );
+}
 
 impl App {
     pub(crate) fn page_balances(&mut self, ui: &mut egui::Ui) {
@@ -119,6 +244,14 @@ impl App {
             ),
         ];
         super::kit::kpi_grid(ui, &cards);
+        let quota_windows: Vec<&QuotaWindowView> = balances
+            .iter()
+            .flat_map(|balance| balance.quota_windows.iter())
+            .collect();
+        if !quota_windows.is_empty() {
+            ui.add_space(10.0);
+            quota_aggregate(ui, &quota_windows);
+        }
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
@@ -218,6 +351,14 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&balance.account_name).size(14.5).strong());
                         super::kit::badge(ui, &balance.mode, theme::MUTED);
+                        if !balance.quota_windows.is_empty() {
+                            let preset = crate::config::quota_preset_label(&balance.quota_preset);
+                            super::kit::badge(
+                                ui,
+                                if preset == "无" { "额度制" } else { preset },
+                                theme::BLUE_INFO,
+                            );
+                        }
                         if balance.estimated {
                             super::kit::badge(ui, "估算", theme::ORANGE);
                         }
@@ -236,6 +377,8 @@ impl App {
                                 .strong()
                                 .color(if low_amount { theme::RED } else { theme::GREEN }),
                         );
+                    } else if !balance.quota_windows.is_empty() {
+                        ui.label(RichText::new("额度制").size(12.0).color(theme::BLUE_INFO));
                     } else {
                         ui.label(RichText::new("—").color(theme::muted(ui)));
                     }
@@ -291,6 +434,27 @@ impl App {
                     }
                 });
             });
+            if !balance.quota_windows.is_empty() {
+                ui.add_space(8.0);
+                for window in &balance.quota_windows {
+                    quota_bar(
+                        ui,
+                        &window.label,
+                        window.used,
+                        window.limit,
+                        &window.unit,
+                        &window.currency,
+                        window.reset_at,
+                    );
+                }
+                if !balance.quota_note.is_empty() {
+                    ui.label(
+                        RichText::new(&balance.quota_note)
+                            .size(9.0)
+                            .color(theme::muted(ui)),
+                    );
+                }
+            }
         });
     }
 }

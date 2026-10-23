@@ -1280,9 +1280,16 @@ pub fn modal_shell(
             Stroke::new(1.0_f32, t.card_border),
         );
         egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(pad as i8, 16))
+            // No right padding: the scroll column is drawn in the reserved
+            // 24 px strip at the modal's right edge instead of floating over
+            // the form fields.
+            .inner_margin(egui::Margin {
+                left: pad as i8,
+                right: 0,
+                top: 16,
+                bottom: 16,
+            })
             .show(ui, |ui| {
-                ui.set_width(inner_width);
                 scroll_capped(ui, id.with("body"), max_body, false, body);
             });
         let rect = ui.available_rect_before_wrap();

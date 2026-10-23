@@ -952,7 +952,11 @@ impl App {
                     .checkbox(&mut checked, "隐藏到系统托盘（代理继续运行）")
                     .changed()
                 {
+                    // Persist the draft immediately. Rebuilding the cell from
+                    // `self.close_hide_to_tray` next frame would otherwise
+                    // snap the checkbox back to its initial checked state.
                     hide_choice.set(checked);
+                    self.close_hide_to_tray = checked;
                 }
                 ui.add_space(6.0);
                 if hide_choice.get() {
@@ -4619,10 +4623,123 @@ fn balance_setup_form(app: &App, ui: &mut egui::Ui, draft: &mut BalanceSetupDraf
                 .color(theme::muted(ui)),
         );
     });
+    ui.add_space(8.0);
+    section(ui, "订阅额度窗口");
+    ui.label(
+        RichText::new(
+            "适用于 OpenCode Go、Command Code Go 等订阅额度：可显示 5 小时 / 每周 / 每月三条进度，也可只显示单个百分比。",
+        )
+        .size(10.0)
+        .color(theme::muted(ui)),
+    );
+    ui.horizontal_wrapped(|ui| {
+        for (preset, label) in [
+            ("", "无"),
+            ("single_percent", "单额度百分比"),
+            ("opencode_go", "OpenCode Go"),
+            ("command_code_go", "Command Code Go"),
+            ("custom", "自定义"),
+        ] {
+            if ui
+                .selectable_label(balance.quota_preset == preset, label)
+                .clicked()
+            {
+                balance.quota_preset = preset.to_string();
+                balance.quota_windows = crate::config::quota_preset_windows(preset);
+                if preset == "command_code_go" {
+                    balance.currency = "USD".into();
+                }
+            }
+        }
+    });
+    let preset_note = crate::config::quota_preset_note(&balance.quota_preset);
+    if !preset_note.is_empty() {
+        ui.label(RichText::new(preset_note).size(9.5).color(theme::muted(ui)));
+    }
+    if matches!(
+        balance.quota_preset.as_str(),
+        "opencode_go" | "single_percent"
+    ) && balance.quota_total <= 0.0
+    {
+        ui.label(
+            RichText::new("请在上方「总额度」填写月度额度，否则百分比窗口无法换算。")
+                .size(9.5)
+                .color(theme::ORANGE),
+        );
+    }
+    if !balance.quota_windows.is_empty() {
+        ui.add_space(4.0);
+        let mut remove = None;
+        for (index, window) in balance.quota_windows.iter_mut().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    kit::text_input(&mut window.label)
+                        .desired_width(86.0)
+                        .hint_text("名称"),
+                );
+                ComboBox::from_id_salt(("quota_window_kind", index))
+                    .selected_text(window.kind.label())
+                    .show_ui(ui, |ui| {
+                        for kind in [
+                            crate::config::QuotaWindowKind::Rolling,
+                            crate::config::QuotaWindowKind::Weekly,
+                            crate::config::QuotaWindowKind::Monthly,
+                            crate::config::QuotaWindowKind::AllTime,
+                        ] {
+                            ui.selectable_value(&mut window.kind, kind, kind.label());
+                        }
+                    });
+                if window.kind == crate::config::QuotaWindowKind::Rolling {
+                    ui.add(
+                        egui::DragValue::new(&mut window.hours)
+                            .range(1..=720)
+                            .suffix(" 小时"),
+                    );
+                }
+                ui.add(
+                    egui::DragValue::new(&mut window.limit)
+                        .speed(0.1)
+                        .range(0.0..=1_000_000_000.0)
+                        .prefix(if window.unit == crate::config::QuotaUnit::Money {
+                            symbol
+                        } else {
+                            ""
+                        })
+                        .suffix(if window.unit == crate::config::QuotaUnit::Percent {
+                            " %"
+                        } else {
+                            ""
+                        }),
+                );
+                ComboBox::from_id_salt(("quota_window_unit", index))
+                    .selected_text(window.unit.label())
+                    .show_ui(ui, |ui| {
+                        for unit in [
+                            crate::config::QuotaUnit::Money,
+                            crate::config::QuotaUnit::Percent,
+                        ] {
+                            ui.selectable_value(&mut window.unit, unit, unit.label());
+                        }
+                    });
+                if super::kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除额度窗口").clicked()
+                {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            balance.quota_windows.remove(index);
+        }
+        if super::kit::secondary_button(ui, icons::PLUS, "添加额度窗口").clicked() {
+            balance
+                .quota_windows
+                .push(crate::config::QuotaWindowConfig::default());
+        }
+    }
     ui.add_space(4.0);
     super::kit::info_row(
         ui,
         icons::INFO,
-        "余额设置的改动与「账号 → 编辑 → 余额」完全互通，保存后立即生效。",
+        "余额设置的改动与「账号 → 编辑 → 余额」完全互通，保存后立即生效。额度窗口按本机请求花费估算，不写入上游。",
     );
 }

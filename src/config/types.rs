@@ -948,6 +948,218 @@ impl BalanceMode {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaWindowKind {
+    #[default]
+    Rolling,
+    Weekly,
+    Monthly,
+    AllTime,
+}
+
+impl QuotaWindowKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            QuotaWindowKind::Rolling => "滚动窗口",
+            QuotaWindowKind::Weekly => "每周",
+            QuotaWindowKind::Monthly => "每月",
+            QuotaWindowKind::AllTime => "全部",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaUnit {
+    #[default]
+    Money,
+    Percent,
+}
+
+impl QuotaUnit {
+    pub fn label(self) -> &'static str {
+        match self {
+            QuotaUnit::Money => "金额",
+            QuotaUnit::Percent => "百分比",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct QuotaWindowConfig {
+    pub label: String,
+    pub kind: QuotaWindowKind,
+    /// Rolling window length; ignored for weekly/monthly/all-time.
+    pub hours: u32,
+    pub limit: f64,
+    pub unit: QuotaUnit,
+}
+
+impl Default for QuotaWindowConfig {
+    fn default() -> Self {
+        Self {
+            label: "5 小时".into(),
+            kind: QuotaWindowKind::Rolling,
+            hours: 5,
+            limit: 0.0,
+            unit: QuotaUnit::Money,
+        }
+    }
+}
+
+impl QuotaWindowConfig {
+    pub fn display_label(&self) -> String {
+        if !self.label.trim().is_empty() {
+            return self.label.trim().to_string();
+        }
+        match self.kind {
+            QuotaWindowKind::Rolling => format!("滚动 {} 小时", self.hours.max(1)),
+            QuotaWindowKind::Weekly => "本周".into(),
+            QuotaWindowKind::Monthly => "本月".into(),
+            QuotaWindowKind::AllTime => "全部".into(),
+        }
+    }
+
+    pub fn start_at(&self, now: chrono::DateTime<chrono::Local>) -> i64 {
+        use chrono::{Datelike, Duration, TimeZone};
+        match self.kind {
+            QuotaWindowKind::Rolling => now.timestamp() - (self.hours.max(1) as i64) * 3600,
+            QuotaWindowKind::Weekly => {
+                let days = now.weekday().num_days_from_monday() as i64;
+                (now - Duration::days(days))
+                    .date_naive()
+                    .and_hms_opt(0, 0, 0)
+                    .and_then(|d| chrono::Local.from_local_datetime(&d).single())
+                    .map(|d| d.timestamp())
+                    .unwrap_or_else(|| now.timestamp() - 7 * 86_400)
+            }
+            QuotaWindowKind::Monthly => {
+                let first = now.date_naive().with_day(1).unwrap_or(now.date_naive());
+                first
+                    .and_hms_opt(0, 0, 0)
+                    .and_then(|d| chrono::Local.from_local_datetime(&d).single())
+                    .map(|d| d.timestamp())
+                    .unwrap_or_else(|| now.timestamp() - 30 * 86_400)
+            }
+            QuotaWindowKind::AllTime => 0,
+        }
+    }
+
+    pub fn reset_at(&self, now: chrono::DateTime<chrono::Local>) -> i64 {
+        use chrono::{Datelike, Duration, TimeZone};
+        match self.kind {
+            QuotaWindowKind::Rolling => now.timestamp() + (self.hours.max(1) as i64) * 3600,
+            QuotaWindowKind::Weekly => {
+                let days_to_monday = 7 - now.weekday().num_days_from_monday() as i64;
+                let next = now.date_naive() + Duration::days(days_to_monday);
+                next.and_hms_opt(0, 0, 0)
+                    .and_then(|d| chrono::Local.from_local_datetime(&d).single())
+                    .map(|d| d.timestamp())
+                    .unwrap_or_else(|| now.timestamp() + 7 * 86_400)
+            }
+            QuotaWindowKind::Monthly => {
+                let (y, m) = if now.month() == 12 {
+                    (now.year() + 1, 1)
+                } else {
+                    (now.year(), now.month() + 1)
+                };
+                chrono::NaiveDate::from_ymd_opt(y, m, 1)
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .and_then(|d| chrono::Local.from_local_datetime(&d).single())
+                    .map(|d| d.timestamp())
+                    .unwrap_or_else(|| now.timestamp() + 30 * 86_400)
+            }
+            QuotaWindowKind::AllTime => 0,
+        }
+    }
+}
+
+/// Built-in quota shapes for subscription gateways. OpenCode Go reports
+/// percentages of a monthly pool (5h = 20%, week = 50%, month = 100%);
+/// Command Code Go uses fixed $3 / $6 / $10 windows.
+pub fn quota_preset_windows(preset: &str) -> Vec<QuotaWindowConfig> {
+    match preset {
+        "opencode_go" => vec![
+            QuotaWindowConfig {
+                label: "5 小时".into(),
+                kind: QuotaWindowKind::Rolling,
+                hours: 5,
+                limit: 20.0,
+                unit: QuotaUnit::Percent,
+            },
+            QuotaWindowConfig {
+                label: "本周".into(),
+                kind: QuotaWindowKind::Weekly,
+                hours: 0,
+                limit: 50.0,
+                unit: QuotaUnit::Percent,
+            },
+            QuotaWindowConfig {
+                label: "本月".into(),
+                kind: QuotaWindowKind::Monthly,
+                hours: 0,
+                limit: 100.0,
+                unit: QuotaUnit::Percent,
+            },
+        ],
+        "command_code_go" => vec![
+            QuotaWindowConfig {
+                label: "5 小时".into(),
+                kind: QuotaWindowKind::Rolling,
+                hours: 5,
+                limit: 3.0,
+                unit: QuotaUnit::Money,
+            },
+            QuotaWindowConfig {
+                label: "本周".into(),
+                kind: QuotaWindowKind::Weekly,
+                hours: 0,
+                limit: 6.0,
+                unit: QuotaUnit::Money,
+            },
+            QuotaWindowConfig {
+                label: "本月".into(),
+                kind: QuotaWindowKind::Monthly,
+                hours: 0,
+                limit: 10.0,
+                unit: QuotaUnit::Money,
+            },
+        ],
+        "single_percent" => vec![QuotaWindowConfig {
+            label: "总额度".into(),
+            kind: QuotaWindowKind::Monthly,
+            hours: 0,
+            limit: 100.0,
+            unit: QuotaUnit::Percent,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+pub fn quota_preset_label(preset: &str) -> &'static str {
+    match preset {
+        "opencode_go" => "OpenCode Go",
+        "command_code_go" => "Command Code Go",
+        "single_percent" => "单额度百分比",
+        "custom" => "自定义",
+        _ => "无",
+    }
+}
+
+pub fn quota_preset_note(preset: &str) -> &'static str {
+    match preset {
+        "opencode_go" => {
+            "OpenCode Go：5 小时 = 月度额度的 20%，每周 = 50%，每月 = 100%；按本机请求花费估算。"
+        }
+        "command_code_go" => "Command Code Go：5 小时 $3，每周 $6，每月 $10；按本机请求花费估算。",
+        "single_percent" => "单额度：只显示一个月度百分比进度；按本机请求花费估算。",
+        "custom" => "自定义额度窗口；按本机请求花费估算。",
+        _ => "",
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct BalanceConfig {
@@ -968,6 +1180,13 @@ pub struct BalanceConfig {
     /// Total subscription/quota amount in `currency`, used by percent mode and
     /// by the percentage quick converter in the balance editor.
     pub quota_total: f64,
+    /// Built-in quota shape: empty/`none`, `single_percent`, `opencode_go`,
+    /// `command_code_go` or `custom`.
+    pub quota_preset: String,
+    /// Optional multi-window quota definition (5h / weekly / monthly / all).
+    /// When non-empty these windows drive the balance page instead of the
+    /// single monetary amount.
+    pub quota_windows: Vec<QuotaWindowConfig>,
 }
 
 impl Default for BalanceConfig {
@@ -983,6 +1202,8 @@ impl Default for BalanceConfig {
             currency: "USD".to_string(),
             percent_used: false,
             quota_total: 0.0,
+            quota_preset: String::new(),
+            quota_windows: Vec::new(),
         }
     }
 }
@@ -1776,5 +1997,52 @@ mod tests {
         assert!(ui.currency_supported("CNY"));
         assert!(!ui.currency_supported("XXX"));
         assert!((ui.fx_convert(1.0, "USD", "CNY") - 7.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quota_presets_define_expected_windows() {
+        let opencode = quota_preset_windows("opencode_go");
+        assert_eq!(opencode.len(), 3);
+        assert_eq!(opencode[0].limit, 20.0);
+        assert_eq!(opencode[1].limit, 50.0);
+        assert_eq!(opencode[2].limit, 100.0);
+        assert!(opencode
+            .iter()
+            .all(|window| window.unit == QuotaUnit::Percent));
+
+        let command = quota_preset_windows("command_code_go");
+        assert_eq!(command.len(), 3);
+        assert_eq!(command[0].limit, 3.0);
+        assert_eq!(command[1].limit, 6.0);
+        assert_eq!(command[2].limit, 10.0);
+        assert!(command.iter().all(|window| window.unit == QuotaUnit::Money));
+
+        let single = quota_preset_windows("single_percent");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].limit, 100.0);
+        assert_eq!(single[0].unit, QuotaUnit::Percent);
+    }
+
+    #[test]
+    fn quota_windows_have_reset_times() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 10, 23, 12, 0, 0)
+            .single()
+            .unwrap();
+        let rolling = QuotaWindowConfig {
+            label: "5h".into(),
+            kind: QuotaWindowKind::Rolling,
+            hours: 5,
+            limit: 1.0,
+            unit: QuotaUnit::Money,
+        };
+        assert!(rolling.start_at(now) < now.timestamp());
+        assert!(rolling.reset_at(now) > now.timestamp());
+        let monthly = QuotaWindowConfig {
+            kind: QuotaWindowKind::Monthly,
+            ..rolling.clone()
+        };
+        assert!(monthly.reset_at(now) > now.timestamp());
     }
 }
