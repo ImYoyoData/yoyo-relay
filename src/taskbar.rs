@@ -88,7 +88,7 @@ mod imp {
 
     fn register_class() {
         REGISTER_CLASS.call_once(|| unsafe {
-            let class_name = wide("YoyoRelayTaskbarBadge");
+            let class_name = wide(crate::identity::BADGE_CLASS);
             let instance = GetModuleHandleW(std::ptr::null());
             let wnd = WNDCLASSW {
                 style: 0,
@@ -227,8 +227,8 @@ mod imp {
         pub fn new() -> Option<Self> {
             register_class();
             unsafe {
-                let class_name = wide("YoyoRelayTaskbarBadge");
-                let title = wide("YoyoRelay 状态");
+                let class_name = wide(crate::identity::BADGE_CLASS);
+                let title = wide(&format!("{} 状态", crate::identity::APP_NAME));
                 let hwnd = CreateWindowExW(
                     WS_EX_LAYERED
                         | WS_EX_TOOLWINDOW

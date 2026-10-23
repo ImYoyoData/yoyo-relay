@@ -433,15 +433,16 @@ impl App {
                     .corner_radius(9)
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("plugin_log_console_scroll")
-                            .max_height(500.0)
-                            .auto_shrink([false, false])
-                            .scroll_bar_visibility(
-                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                            )
-                            .stick_to_bottom(self.plugin_console_auto_scroll)
-                            .show_rows(ui, 18.0, logs.len(), |ui, range| {
+                        let rows = logs.len();
+                        let stick = self.plugin_console_auto_scroll;
+                        kit::scroll_rows(
+                            ui,
+                            "plugin_log_console_scroll",
+                            500.0,
+                            stick,
+                            18.0,
+                            rows,
+                            |ui, range| {
                                 for index in range {
                                     let log = &logs[index];
                                     let color = match log.level.as_str() {
@@ -489,7 +490,8 @@ impl App {
                                         },
                                     );
                                 }
-                            });
+                            },
+                        );
                     });
                 if view.is_none() {
                     ui.add_space(4.0);
