@@ -979,21 +979,17 @@ pub fn overview_kpi_grid(
     } else {
         1
     };
-    let width = ((avail - gap * (per_row.saturating_sub(1)) as f32) / per_row as f32).max(140.0);
     let total_rows = cards.len().div_ceil(per_row);
     let mut changed = false;
     for (row_index, chunk) in cards.chunks(per_row).enumerate() {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            for spec in chunk {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(width, 122.0),
-                    Layout::top_down(Align::Min),
-                    |ui| {
-                        ui.set_width(width);
-                        changed |= overview_kpi_card(ui, spec, cfg);
-                    },
-                );
+        // `ui.columns` divides the full row width evenly, so the four cards
+        // always line up with the section cards below and with each other.
+        ui.columns(per_row, |cols| {
+            for (index, spec) in chunk.iter().enumerate() {
+                let ui = &mut cols[index];
+                ui.set_min_height(122.0);
+                ui.set_width(ui.available_width());
+                changed |= overview_kpi_card(ui, spec, cfg);
             }
         });
         if row_index + 1 < total_rows {
