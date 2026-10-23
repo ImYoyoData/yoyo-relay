@@ -2,6 +2,7 @@ use egui::RichText;
 use egui_phosphor::regular as icons;
 
 use crate::config::ProviderKind;
+use crate::runtime::UiCommand;
 
 use super::{brands, theme, widgets, App, ConfirmAction, Page};
 
@@ -28,7 +29,22 @@ impl App {
             })
             .cloned()
             .collect();
-        if self.config.providers.is_empty() && self.search.trim().is_empty() {
+        let temporary: Vec<_> = self
+            .snapshot
+            .temporary_providers()
+            .into_iter()
+            .filter(|p| {
+                self.matches_search(&format!(
+                    "{} {} {} {}",
+                    p.name,
+                    p.plugin_name,
+                    p.protocol,
+                    p.models.join(" ")
+                ))
+            })
+            .collect();
+        if self.config.providers.is_empty() && temporary.is_empty() && self.search.trim().is_empty()
+        {
             super::kit::section_card(
                 ui,
                 icons::HARD_DRIVES,
@@ -46,7 +62,7 @@ impl App {
             ui.add_space(12.0);
             return;
         }
-        if providers.is_empty() {
+        if providers.is_empty() && temporary.is_empty() {
             if super::kit::empty_state(
                 ui,
                 icons::MAGNIFYING_GLASS,
@@ -57,7 +73,7 @@ impl App {
             ) {
                 self.open_new_provider();
             }
-            if ui.small_button("清空搜索").clicked() {
+            if super::kit::ghost_button(ui, icons::X, "清空搜索").clicked() {
                 self.search.clear();
             }
             return;
@@ -101,6 +117,123 @@ impl App {
             }
             ui.add_space(4.0);
         }
+
+        if !temporary.is_empty() {
+            ui.horizontal(|ui| {
+                super::kit::section_label(ui, "临时供应商");
+                ui.label(
+                    RichText::new(format!("{}", temporary.len()))
+                        .size(10.0)
+                        .color(theme::muted(ui)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let line = ui.available_width();
+                    let y = ui.cursor().center().y;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(ui.cursor().left(), y),
+                            egui::pos2(ui.cursor().left() + line, y),
+                        ],
+                        egui::Stroke::new(1.0_f32, theme::border_color(ui)),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+            for provider in &temporary {
+                self.temporary_provider_card(ui, provider);
+                ui.add_space(10.0);
+            }
+        }
+    }
+
+    fn temporary_provider_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        provider: &crate::snapshot::TemporaryProvider,
+    ) {
+        super::kit::surface(ui, |ui| {
+            ui.horizontal(|ui| {
+                super::kit::icon_chip(ui, icons::PUZZLE_PIECE, theme::PURPLE, 42.0);
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&provider.name).size(15.5).strong());
+                        super::kit::badge(ui, "临时", theme::PURPLE);
+                        super::kit::badge(ui, &provider.protocol, theme::BLUE_INFO);
+                        if provider.streaming {
+                            super::kit::plain_badge(ui, "流式");
+                        }
+                    });
+                    ui.label(
+                        RichText::new(format!(
+                            "由插件「{}」注入 · {}",
+                            provider.plugin_name, provider.id
+                        ))
+                        .monospace()
+                        .size(10.0)
+                        .color(theme::muted(ui)),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    super::kit::status_pill(
+                        ui,
+                        if provider.running {
+                            "插件运行中"
+                        } else {
+                            "插件已停止"
+                        },
+                        if provider.running {
+                            theme::GREEN
+                        } else {
+                            theme::MUTED
+                        },
+                    );
+                    let supports_refresh = self
+                        .snapshot
+                        .plugins
+                        .iter()
+                        .find(|plugin| plugin.id == provider.plugin_id)
+                        .map(|plugin| plugin.events.iter().any(|event| event == "onListModels"))
+                        .unwrap_or(false);
+                    if provider.running
+                        && supports_refresh
+                        && super::kit::ghost_button(ui, icons::ARROWS_CLOCKWISE, "刷新模型")
+                            .on_hover_text("调用插件的 onListModels() 重新查询模型列表")
+                            .clicked()
+                    {
+                        let _ = self
+                            .cmd_tx
+                            .send(UiCommand::RefreshPluginModels(provider.plugin_id.clone()));
+                    }
+                });
+            });
+            if !provider.description.trim().is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(&provider.description)
+                        .size(10.5)
+                        .color(theme::muted(ui)),
+                );
+            }
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("模型").size(10.0).color(theme::muted(ui)));
+                for model in provider.models.iter().take(12) {
+                    super::kit::plain_badge(ui, model);
+                }
+                if provider.models.len() > 12 {
+                    super::kit::plain_badge(ui, &format!("+{}", provider.models.len() - 12));
+                }
+            });
+            ui.add_space(5.0);
+            ui.label(
+                RichText::new(
+                    "临时供应商、虚拟账号与自动路由只在插件运行时存在，不会写入配置文件；插件禁用或卸载后自动移除。可在「路由」页手动把它选为上游。",
+                )
+                .size(10.0)
+                .color(theme::muted(ui)),
+            );
+        });
     }
 
     fn provider_card(&mut self, ui: &mut egui::Ui, provider: &crate::config::Provider) {

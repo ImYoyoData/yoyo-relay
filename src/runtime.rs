@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures_util::FutureExt;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -66,6 +69,8 @@ pub enum UiCommand {
     CheckUpdate {
         manual: bool,
     },
+    /// Download the latest release, replace this executable and restart.
+    InstallUpdate,
     ReloadPlugins,
     SetPluginEnabled {
         id: String,
@@ -73,17 +78,36 @@ pub enum UiCommand {
     },
     LoadPlugin(String),
     UnloadPlugin(String),
+    /// Remove the plugin's files (and optionally its data directory).
+    UninstallPlugin {
+        id: String,
+        keep_data: bool,
+    },
     ReloadPlugin(String),
     InvokePlugin {
         id: String,
         method: String,
     },
+    /// Ask a provider plugin for its current model list.
+    RefreshPluginModels(String),
     AnswerPluginUi {
         id: u64,
         accepted: bool,
         text: String,
     },
     InstallSamplePlugins,
+    ExportPluginSkill,
+    SetPluginConsole(Option<String>),
+    ClearPluginLogs(String),
+    RefreshContributors,
+    GenerateAiPricing {
+        route_id: String,
+        provider_id: String,
+        model: String,
+        prompt: String,
+        token: u64,
+    },
+    ClearAiPricing,
     CleanupNow,
     Shutdown,
 }
@@ -138,11 +162,20 @@ struct Shared {
     balance_refreshing: AtomicBool,
     fetched_model: Mutex<Option<FetchedModelView>>,
     model_fetch_running: AtomicBool,
+    ai_pricing: Mutex<Option<AiPricingView>>,
     provider_models: Mutex<HashMap<String, ProviderModelsView>>,
     models_fetching: Mutex<HashSet<String>>,
     fx_refreshing: AtomicBool,
     update_checking: AtomicBool,
     update_error: Mutex<Option<String>>,
+    update_installing: AtomicBool,
+    update_progress: Mutex<f32>,
+    update_message: Mutex<String>,
+    update_install_error: Mutex<Option<String>>,
+    update_restart_pending: AtomicBool,
+    contributors: Mutex<Vec<crate::contributors::Contributor>>,
+    contributors_loading: AtomicBool,
+    contributors_error: Mutex<Option<String>>,
     warnings: Mutex<Vec<String>>,
 }
 
@@ -158,11 +191,20 @@ impl Shared {
             balance_refreshing: AtomicBool::new(false),
             fetched_model: Mutex::new(None),
             model_fetch_running: AtomicBool::new(false),
+            ai_pricing: Mutex::new(None),
             provider_models: Mutex::new(HashMap::new()),
             models_fetching: Mutex::new(HashSet::new()),
             fx_refreshing: AtomicBool::new(false),
             update_checking: AtomicBool::new(false),
             update_error: Mutex::new(None),
+            update_installing: AtomicBool::new(false),
+            update_progress: Mutex::new(0.0),
+            update_message: Mutex::new(String::new()),
+            update_install_error: Mutex::new(None),
+            update_restart_pending: AtomicBool::new(false),
+            contributors: Mutex::new(Vec::new()),
+            contributors_loading: AtomicBool::new(false),
+            contributors_error: Mutex::new(None),
             warnings: Mutex::new(warnings),
         }
     }
@@ -275,6 +317,7 @@ pub struct Runtime {
     last_balance_refresh: Instant,
     last_fx_refresh: Instant,
     last_cleanup: Instant,
+    last_dynamic_version: u64,
 }
 
 impl Runtime {
@@ -326,12 +369,23 @@ impl Runtime {
             // a realistic CNY total without waiting for the interval.
             last_fx_refresh: Instant::now() - Duration::from_secs(24 * 3600),
             last_cleanup: Instant::now() - Duration::from_secs(6 * 3600),
+            last_dynamic_version: 0,
         })
     }
 
     async fn run(mut self) {
         self.start_proxy().await;
         self.plugins.load_all_enabled().await;
+        self.refresh_dynamic();
+        if self.proxy.is_some() {
+            self.plugins.notify(
+                "onProxyStart",
+                serde_json::json!({
+                    "event": "onProxyStart",
+                    "endpoint": self.gateway.api_base(),
+                }),
+            );
+        }
         self.emit_snapshot();
         // Emit twice as often while requests are in flight so the live
         // tokens-per-second badge stays responsive; fall back to a slower
@@ -349,11 +403,13 @@ impl Runtime {
                             if !keep_running {
                                 break;
                             }
+                            self.refresh_dynamic();
                             self.emit_snapshot();
                         }
                     }
                 }
                 _ = tick.tick() => {
+                    self.refresh_dynamic();
                     let busy = self.gateway.queue_depth().0 > 0
                         || self.gateway.speed.tokens_per_sec() > 0.0;
                     idle_ticks = if busy { 0 } else { idle_ticks.saturating_add(1) };
@@ -370,6 +426,22 @@ impl Runtime {
         }
         self.plugins.unload_all().await;
         self.stop_proxy().await;
+    }
+
+    fn refresh_dynamic(&mut self) {
+        let version = self.plugins.dynamic_version();
+        if version == self.last_dynamic_version {
+            return;
+        }
+        self.last_dynamic_version = version;
+        let entries = self.plugins.dynamic_entries();
+        self.gateway.set_dynamic(entries);
+        self.scheduler
+            .remove_missing_accounts(&self.gateway.config());
+        self.plugins.set_runtime_info(
+            self.gateway.api_base(),
+            self.gateway.config().servable_models(),
+        );
     }
 
     fn emit_snapshot(&mut self) -> bool {
@@ -429,10 +501,23 @@ impl Runtime {
                         }
                     }
                 }
-                self.scheduler.remove_missing_accounts(&new);
                 let permissions_changed = old.plugins.allow_network != new.plugins.allow_network
                     || old.plugins.allow_process != new.plugins.allow_process;
                 self.gateway.update_config(new.clone());
+                // Use the merged config so plugin-provided virtual accounts are
+                // not treated as removed on every settings save.
+                self.scheduler
+                    .remove_missing_accounts(&self.gateway.config());
+                self.plugins.notify(
+                    "onConfigChanged",
+                    serde_json::json!({
+                        "event": "onConfigChanged",
+                        "providers": new.providers.len(),
+                        "accounts": new.accounts.len(),
+                        "routes": new.routes.len(),
+                        "models": new.client_models().len(),
+                    }),
+                );
                 self.plugins.apply_settings(new.plugins.clone());
                 let host = self.plugins.clone();
                 tokio::spawn(async move {
@@ -510,6 +595,7 @@ impl Runtime {
             UiCommand::RefreshFxRates { manual } => self.spawn_fx_refresh(manual),
             UiCommand::RefreshBalance(only) => self.spawn_balance_refresh(only, true),
             UiCommand::CheckUpdate { manual } => self.spawn_update_check(manual),
+            UiCommand::InstallUpdate => self.spawn_update_install(),
             UiCommand::ReloadPlugins => {
                 self.plugins.scan();
                 let host = self.plugins.clone();
@@ -520,7 +606,7 @@ impl Runtime {
                     .push_notice(NoticeLevel::Info, "已重新扫描插件目录。");
             }
             UiCommand::SetPluginEnabled { id, enabled } => {
-                let mut cfg = (*self.gateway.config()).clone();
+                let mut cfg = (*self.gateway.base_config()).clone();
                 cfg.plugins.disabled.retain(|plugin| plugin != &id);
                 if !enabled {
                     cfg.plugins.disabled.push(id.clone());
@@ -529,21 +615,28 @@ impl Runtime {
                     Ok(()) => {
                         self.gateway.update_config(Arc::new(cfg.clone()));
                         self.plugins.apply_settings(cfg.plugins.clone());
-                        if enabled {
-                            if let Err(err) = self.plugins.load(&id, &cfg.plugins).await {
-                                self.shared.push_notice(
-                                    NoticeLevel::Error,
-                                    format!("启用插件失败：{err}"),
-                                );
+                        // Load/unload can take seconds; never block the
+                        // runtime loop (and the UI snapshot pump) on it.
+                        let host = self.plugins.clone();
+                        let shared = self.shared.clone();
+                        let settings = cfg.plugins.clone();
+                        tokio::spawn(async move {
+                            if enabled {
+                                match host.load(&id, &settings).await {
+                                    Ok(()) => host.notify(
+                                        "onEnable",
+                                        serde_json::json!({"event": "onEnable"}),
+                                    ),
+                                    Err(err) => shared.push_notice(
+                                        NoticeLevel::Error,
+                                        format!("启用插件失败：{err}"),
+                                    ),
+                                }
                             } else {
-                                self.plugins
-                                    .notify("onEnable", serde_json::json!({"event": "onEnable"}));
+                                host.notify("onDisable", serde_json::json!({"event": "onDisable"}));
+                                host.unload(&id).await;
                             }
-                        } else {
-                            self.plugins
-                                .notify("onDisable", serde_json::json!({"event": "onDisable"}));
-                            self.plugins.unload(&id).await;
-                        }
+                        });
                     }
                     Err(err) => self
                         .shared
@@ -551,26 +644,76 @@ impl Runtime {
                 }
             }
             UiCommand::LoadPlugin(id) => {
-                let settings = self.gateway.config().plugins.clone();
-                if let Err(err) = self.plugins.load(&id, &settings).await {
-                    self.shared
-                        .push_notice(NoticeLevel::Error, format!("加载插件失败：{err}"));
-                }
+                let settings = self.gateway.base_config().plugins.clone();
+                let host = self.plugins.clone();
+                let shared = self.shared.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = host.load(&id, &settings).await {
+                        shared.push_notice(NoticeLevel::Error, format!("加载插件失败：{err}"));
+                    }
+                });
             }
             UiCommand::UnloadPlugin(id) => {
-                self.plugins.unload(&id).await;
+                let host = self.plugins.clone();
+                tokio::spawn(async move {
+                    host.unload(&id).await;
+                });
+            }
+            UiCommand::UninstallPlugin { id, keep_data } => {
+                let mut cfg = (*self.gateway.base_config()).clone();
+                cfg.plugins.disabled.retain(|plugin| plugin != &id);
+                // Drop manual routes/accounts that selected this plugin's
+                // temporary providers; they would otherwise point at nothing.
+                let provider_prefix = format!("plugin:{id}:");
+                cfg.routes
+                    .retain(|route| !route.provider_id.starts_with(&provider_prefix));
+                cfg.accounts
+                    .retain(|account| !account.provider_id.starts_with(&provider_prefix));
+                if let Err(err) = self.store.save(&mut cfg) {
+                    self.shared
+                        .push_notice(NoticeLevel::Error, format!("保存插件设置失败：{err}"));
+                    return true;
+                }
+                self.gateway.update_config(Arc::new(cfg.clone()));
+                self.plugins.apply_settings(cfg.plugins.clone());
+                let host = self.plugins.clone();
+                let shared = self.shared.clone();
+                let plugin_id = id.clone();
+                tokio::spawn(async move {
+                    match host.uninstall(&id, keep_data).await {
+                        Ok(removed) => shared.push_notice(
+                            NoticeLevel::Success,
+                            format!(
+                                "插件「{plugin_id}」已卸载，删除 {} 个文件/目录{}",
+                                removed.len(),
+                                if keep_data {
+                                    "，已保留插件数据"
+                                } else {
+                                    "，插件数据也已删除"
+                                }
+                            ),
+                        ),
+                        Err(err) => shared.push_notice(
+                            NoticeLevel::Error,
+                            format!("卸载插件「{plugin_id}」失败：{err}"),
+                        ),
+                    }
+                });
             }
             UiCommand::ReloadPlugin(id) => {
-                let settings = self.gateway.config().plugins.clone();
-                match self.plugins.reload(&id).await {
-                    Ok(()) => self
-                        .shared
-                        .push_notice(NoticeLevel::Success, "插件已重新加载。"),
-                    Err(err) => self
-                        .shared
-                        .push_notice(NoticeLevel::Error, format!("重载失败：{err}")),
-                }
-                let _ = settings;
+                let host = self.plugins.clone();
+                let shared = self.shared.clone();
+                tokio::spawn(async move {
+                    match host.reload(&id).await {
+                        Ok(()) => {
+                            host.notify("onReload", serde_json::json!({"event": "onReload"}));
+                            shared.push_notice(NoticeLevel::Success, "插件已重新加载。")
+                        }
+                        Err(err) => {
+                            shared.push_notice(NoticeLevel::Error, format!("重载失败：{err}"))
+                        }
+                    }
+                });
             }
             UiCommand::InvokePlugin { id, method } => {
                 match self
@@ -596,9 +739,95 @@ impl Runtime {
                     }
                 }
             }
+            UiCommand::RefreshPluginModels(id) => {
+                let host = self.plugins.clone();
+                let shared = self.shared.clone();
+                tokio::spawn(async move {
+                    match host.refresh_models(&id).await {
+                        Ok(count) => shared.push_notice(
+                            NoticeLevel::Success,
+                            format!("插件「{id}」模型列表已刷新，共 {count} 个模型。"),
+                        ),
+                        Err(err) => shared
+                            .push_notice(NoticeLevel::Error, format!("刷新插件模型失败：{err}")),
+                    }
+                });
+            }
             UiCommand::AnswerPluginUi { id, accepted, text } => {
                 self.plugins
                     .answer_ui(id, PluginUiAnswer { accepted, text });
+            }
+            UiCommand::SetPluginConsole(target) => self.plugins.set_console_target(target),
+            UiCommand::ClearPluginLogs(id) => self.plugins.clear_logs(&id),
+            UiCommand::RefreshContributors => self.spawn_contributors_fetch(),
+            UiCommand::ClearAiPricing => {
+                if let Ok(mut slot) = self.shared.ai_pricing.lock() {
+                    *slot = None;
+                }
+            }
+            UiCommand::GenerateAiPricing {
+                route_id,
+                provider_id,
+                model,
+                prompt,
+                token,
+            } => {
+                if let Ok(mut slot) = self.shared.ai_pricing.lock() {
+                    *slot = Some(AiPricingView {
+                        route_id: route_id.clone(),
+                        token,
+                        running: true,
+                        plan: None,
+                        error: None,
+                    });
+                }
+                let gateway = self.gateway.clone();
+                let shared = self.shared.clone();
+                tokio::spawn(async move {
+                    let result =
+                        probe::generate_price_plan(&gateway, &provider_id, &model, &prompt).await;
+                    let (plan, error) = match result {
+                        Ok(value) => match parse_ai_price_plan(value) {
+                            Ok(plan) => (Some(plan), None),
+                            Err(err) => (None, Some(err)),
+                        },
+                        Err(err) => (None, Some(err)),
+                    };
+                    let Ok(mut slot) = shared.ai_pricing.lock() else {
+                        return;
+                    };
+                    if slot.as_ref().map(|view| view.token) != Some(token) {
+                        return;
+                    }
+                    match (&plan, &error) {
+                        (Some(plan), _) => shared.push_notice(
+                            NoticeLevel::Success,
+                            format!("AI 已生成价格方案「{}」，请检查后应用。", plan.name),
+                        ),
+                        (_, Some(err)) => {
+                            shared.push_notice(NoticeLevel::Error, format!("AI 生成失败：{err}"))
+                        }
+                        _ => {}
+                    }
+                    *slot = Some(AiPricingView {
+                        route_id,
+                        token,
+                        running: false,
+                        plan,
+                        error,
+                    });
+                });
+            }
+            UiCommand::ExportPluginSkill => {
+                match crate::plugins::docs::export_skill(&self.store.paths.exports_dir) {
+                    Ok(path) => self.shared.push_notice(
+                        NoticeLevel::Success,
+                        format!("插件开发 Skill 已导出到 {}", path.display()),
+                    ),
+                    Err(err) => self
+                        .shared
+                        .push_notice(NoticeLevel::Error, format!("导出插件 Skill 失败：{err}")),
+                }
             }
             UiCommand::InstallSamplePlugins => match self.plugins.install_samples() {
                 Ok(dirs) => {
@@ -681,6 +910,15 @@ impl Runtime {
                 tracing::info!("proxy LAN endpoints: {}", lan.join(", "));
             }
         }
+        self.plugins.notify(
+            "onProxyStart",
+            serde_json::json!({
+                "event": "onProxyStart",
+                "endpoint": self.gateway.api_base(),
+                "bind": cfg.server.bind,
+                "port": cfg.server.port,
+            }),
+        );
         self.shared.set_proxy(ProxyStatus::Running);
         self.shared.push_notice(
             NoticeLevel::Success,
@@ -699,6 +937,8 @@ impl Runtime {
                 join.abort();
             }
         }
+        self.plugins
+            .notify("onProxyStop", serde_json::json!({"event": "onProxyStop"}));
         self.shared.set_proxy(ProxyStatus::Stopped);
     }
 
@@ -956,6 +1196,46 @@ impl Runtime {
         });
     }
 
+    fn spawn_contributors_fetch(&self) {
+        if self
+            .shared
+            .contributors_loading
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let gateway = self.gateway.clone();
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            let client = gateway.client_for("https://api.github.com").clone();
+            let result = match crate::contributors::fetch(&client).await {
+                Ok(contributors) => Ok(contributors),
+                // A broken system proxy should not hide the contributor list.
+                Err(first) => crate::contributors::fetch(gateway.direct_client())
+                    .await
+                    .map_err(|second| anyhow::anyhow!("{first:#}；直连重试失败：{second:#}")),
+            };
+            match result {
+                Ok(contributors) => {
+                    tracing::info!("contributors loaded: {}", contributors.len());
+                    if let Ok(mut slot) = shared.contributors.lock() {
+                        *slot = contributors;
+                    }
+                    if let Ok(mut slot) = shared.contributors_error.lock() {
+                        *slot = None;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("contributors fetch failed: {err:#}");
+                    if let Ok(mut slot) = shared.contributors_error.lock() {
+                        *slot = Some(format!("{err:#}"));
+                    }
+                }
+            }
+            shared.contributors_loading.store(false, Ordering::SeqCst);
+        });
+    }
+
     fn spawn_update_check(&self, manual: bool) {
         if self.shared.update_checking.swap(true, Ordering::SeqCst) {
             if manual {
@@ -974,7 +1254,7 @@ impl Runtime {
                 Ok(release) => {
                     let current = env!("CARGO_PKG_VERSION");
                     let newer = crate::update::is_newer(&release.version, current);
-                    let mut cfg = (*gateway.config()).clone();
+                    let mut cfg = (*gateway.base_config()).clone();
                     cfg.ui.update_latest_version = release.version.clone();
                     cfg.ui.update_latest_url = release.url.clone();
                     cfg.ui.update_latest_notes = release.notes.clone();
@@ -1017,6 +1297,40 @@ impl Runtime {
         });
     }
 
+    fn spawn_update_install(&self) {
+        if cfg!(debug_assertions) {
+            self.shared.push_notice(
+                NoticeLevel::Warning,
+                "调试构建不支持自动更新，请使用正式发布版。",
+            );
+            return;
+        }
+        if self.shared.update_installing.swap(true, Ordering::SeqCst) {
+            self.shared
+                .push_notice(NoticeLevel::Info, "更新正在下载或安装中。");
+            return;
+        }
+        if let Ok(mut error) = self.shared.update_install_error.lock() {
+            *error = None;
+        }
+        self.shared
+            .update_restart_pending
+            .store(false, Ordering::SeqCst);
+        set_update_progress(&self.shared, 0.0, "正在获取最新版本…");
+        let gateway = self.gateway.clone();
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            if let Err(err) = install_update(&gateway, &shared).await {
+                shared.update_installing.store(false, Ordering::SeqCst);
+                if let Ok(mut slot) = shared.update_install_error.lock() {
+                    *slot = Some(err.clone());
+                }
+                set_update_progress(&shared, 0.0, "更新失败");
+                shared.push_notice(NoticeLevel::Error, format!("自动更新失败：{err}"));
+            }
+        });
+    }
+
     fn spawn_fx_refresh(&self, manual: bool) {
         if self.shared.fx_refreshing.swap(true, Ordering::SeqCst) {
             if manual {
@@ -1035,7 +1349,7 @@ impl Runtime {
             let result = crate::fx::fetch_rates(&client).await;
             match result {
                 Ok(rates) => {
-                    let mut cfg = (*gateway.config()).clone();
+                    let mut cfg = (*gateway.base_config()).clone();
                     cfg.ui.fx_rates = rates.rates.clone();
                     cfg.ui.fx_updated_at = now_ts();
                     cfg.ui.fx_source = rates.source.clone();
@@ -1081,8 +1395,27 @@ impl Runtime {
         }
         let gateway = self.gateway.clone();
         let shared = self.shared.clone();
+        let plugins = self.plugins.clone();
         tokio::spawn(async move {
             let results = balance::refresh_balances(&gateway, only.as_deref()).await;
+            let rows: Vec<serde_json::Value> = results
+                .iter()
+                .map(|(id, result)| {
+                    serde_json::json!({
+                        "accountId": id,
+                        "ok": result.is_ok(),
+                        "error": result.as_ref().err().map(|err| format!("{err:#}")),
+                    })
+                })
+                .collect();
+            plugins.notify(
+                "onBalanceUpdated",
+                serde_json::json!({
+                    "event": "onBalanceUpdated",
+                    "count": results.len(),
+                    "results": rows,
+                }),
+            );
             let errors: Vec<String> = results
                 .iter()
                 .filter_map(|(id, r)| r.as_ref().err().map(|e| format!("{id}: {e}")))
@@ -1430,6 +1763,12 @@ impl Runtime {
                 .map(|slot| slot.clone())
                 .unwrap_or(None),
             model_fetch_running: self.shared.model_fetch_running.load(Ordering::SeqCst),
+            ai_pricing: self
+                .shared
+                .ai_pricing
+                .lock()
+                .map(|slot| slot.clone())
+                .unwrap_or(None),
             provider_models: self
                 .shared
                 .provider_models
@@ -1444,6 +1783,20 @@ impl Runtime {
                 .unwrap_or_default(),
             plugins: self.plugins.views(),
             plugin_ui: self.plugins.ui_request(),
+            plugin_console: self.plugins.console_view(),
+            contributors: self
+                .shared
+                .contributors
+                .lock()
+                .map(|slot| slot.clone())
+                .unwrap_or_default(),
+            contributors_loading: self.shared.contributors_loading.load(Ordering::SeqCst),
+            contributors_error: self
+                .shared
+                .contributors_error
+                .lock()
+                .map(|slot| slot.clone())
+                .unwrap_or(None),
             plugin_settings: cfg.plugins.clone(),
             update: UpdateView {
                 current: env!("CARGO_PKG_VERSION").to_string(),
@@ -1465,6 +1818,26 @@ impl Runtime {
                     .lock()
                     .map(|slot| slot.clone())
                     .unwrap_or(None),
+                installing: self.shared.update_installing.load(Ordering::SeqCst),
+                progress: self
+                    .shared
+                    .update_progress
+                    .lock()
+                    .map(|slot| *slot)
+                    .unwrap_or(0.0),
+                install_message: self
+                    .shared
+                    .update_message
+                    .lock()
+                    .map(|slot| slot.clone())
+                    .unwrap_or_default(),
+                install_error: self
+                    .shared
+                    .update_install_error
+                    .lock()
+                    .map(|slot| slot.clone())
+                    .unwrap_or(None),
+                restart_pending: self.shared.update_restart_pending.load(Ordering::SeqCst),
             },
             fx_rates: cfg.ui.fx_rates.clone(),
             fx_updated_at: cfg.ui.fx_updated_at,
@@ -1742,4 +2115,309 @@ fn quota_exceeded(q: &crate::scheduler::QuotaSnapshot) -> bool {
         || q.limit_requests
             .map(|l| q.used_requests >= l)
             .unwrap_or(false)
+}
+
+fn set_update_progress(shared: &Shared, progress: f32, message: impl Into<String>) {
+    if let Ok(mut slot) = shared.update_progress.lock() {
+        *slot = progress.clamp(0.0, 1.0);
+    }
+    if let Ok(mut slot) = shared.update_message.lock() {
+        *slot = message.into();
+    }
+}
+
+async fn install_update(gateway: &Gateway, shared: &Shared) -> Result<(), String> {
+    let client = gateway.client_for("https://api.github.com").clone();
+    let release = crate::update::fetch_latest_release(&client)
+        .await
+        .map_err(|err| format!("{err:#}"))?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    if !crate::update::is_newer(&release.version, current_version) {
+        return Err(format!("当前已是最新版本 v{current_version}。"));
+    }
+    let asset = crate::update::select_asset(&release.assets)
+        .ok_or_else(|| format!("Release v{} 没有适用于当前平台的安装包。", release.version))?;
+    let kind = asset
+        .archive_kind()
+        .ok_or_else(|| "更新包格式不受支持。".to_string())?;
+
+    let work = std::env::temp_dir().join(format!("yoyo-relay-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|err| format!("创建更新临时目录失败：{err}"))?;
+    let archive = work.join(&asset.name);
+
+    set_update_progress(
+        shared,
+        0.0,
+        format!("正在下载 v{} · {}", release.version, asset.name),
+    );
+    let mut response = client
+        .get(&asset.url)
+        .send()
+        .await
+        .map_err(|err| format!("下载更新包失败：{err}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载更新包失败：HTTP {}", response.status()));
+    }
+    let total = if asset.size > 0 {
+        asset.size
+    } else {
+        response.content_length().unwrap_or(0)
+    };
+    let mut file = tokio::fs::File::create(&archive)
+        .await
+        .map_err(|err| format!("创建更新包失败：{err}"))?;
+    let mut hasher = Sha256::new();
+    let mut downloaded = 0u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| format!("读取更新包失败：{err}"))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| format!("写入更新包失败：{err}"))?;
+        hasher.update(&chunk);
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            let ratio = (downloaded as f32 / total as f32).clamp(0.0, 0.99);
+            set_update_progress(
+                shared,
+                ratio,
+                format!(
+                    "正在下载 v{} · {:.1} / {:.1} MB",
+                    release.version,
+                    downloaded as f64 / 1_048_576.0,
+                    total as f64 / 1_048_576.0
+                ),
+            );
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|err| format!("写入更新包失败：{err}"))?;
+    drop(file);
+    if asset.size > 0 && downloaded != asset.size {
+        return Err(format!(
+            "更新包大小不一致（期望 {} 字节，实际 {} 字节）。",
+            asset.size, downloaded
+        ));
+    }
+    if let Some(digest) = &asset.digest {
+        let expected = digest
+            .strip_prefix("sha256:")
+            .unwrap_or(digest)
+            .to_ascii_lowercase();
+        let actual = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if actual != expected {
+            return Err("更新包 SHA-256 校验失败，已停止安装。".into());
+        }
+    }
+
+    set_update_progress(shared, 0.99, "正在解压更新包…");
+    let extract = work.join("extract");
+    std::fs::create_dir_all(&extract).map_err(|err| format!("创建解压目录失败：{err}"))?;
+    let exe_name = if cfg!(windows) {
+        "yoyo-relay.exe"
+    } else {
+        "yoyo-relay"
+    };
+    let status = match kind {
+        crate::update::ArchiveKind::Zip => std::process::Command::new("tar")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&extract)
+            .status(),
+        crate::update::ArchiveKind::TarGz => std::process::Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&extract)
+            .status(),
+    }
+    .map_err(|err| format!("无法启动解压程序：{err}"))?;
+    #[cfg(windows)]
+    let status = if status.success() {
+        status
+    } else {
+        let script = format!(
+            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+            archive.display(),
+            extract.display()
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .map_err(|err| format!("无法启动解压程序：{err}"))?
+    };
+    if !status.success() {
+        return Err(format!(
+            "解压更新包失败（tar 退出码 {:?}）。",
+            status.code()
+        ));
+    }
+    let new_exe = extract.join(exe_name);
+    let header = std::fs::read(&new_exe).map_err(|err| format!("读取更新程序失败：{err}"))?;
+    if header.len() < 4 {
+        return Err("更新包中的可执行文件为空或损坏。".into());
+    }
+    let valid = if cfg!(windows) {
+        header.starts_with(b"MZ")
+    } else if cfg!(target_os = "macos") {
+        matches!(
+            header.as_slice(),
+            [0xcf, 0xfa, 0xed, 0xfe, ..]
+                | [0xce, 0xfa, 0xed, 0xfe, ..]
+                | [0xca, 0xfe, 0xba, 0xbe, ..]
+                | [0xfe, 0xed, 0xfa, 0xcf, ..]
+                | [0xfe, 0xed, 0xfa, 0xce, ..]
+        )
+    } else {
+        header.starts_with(b"\x7fELF")
+    };
+    if !valid {
+        return Err("更新包中的文件不是可执行程序。".into());
+    }
+
+    set_update_progress(shared, 0.995, "正在准备替换程序…");
+    let current = std::env::current_exe().map_err(|err| format!("无法定位当前程序：{err}"))?;
+    let file_name = current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "当前程序路径无效。".to_string())?;
+    let staged = current.with_file_name(format!(".{file_name}.new-{}", std::process::id()));
+    let _ = std::fs::remove_file(&staged);
+    std::fs::copy(&new_exe, &staged)
+        .map_err(|err| format!("无法写入程序目录（可能需要管理员权限）：{err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&staged) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o755);
+            let _ = std::fs::set_permissions(&staged, permissions);
+        }
+    }
+
+    spawn_restart_helper(&current, &staged)?;
+    shared.update_installing.store(false, Ordering::SeqCst);
+    shared.update_restart_pending.store(true, Ordering::SeqCst);
+    set_update_progress(shared, 1.0, "更新完成，正在重启…");
+    shared.push_notice(
+        NoticeLevel::Success,
+        format!("已下载 v{}，正在替换并重启…", release.version),
+    );
+    let _ = std::fs::remove_dir_all(&work);
+    Ok(())
+}
+
+fn spawn_restart_helper(current: &Path, staged: &Path) -> Result<(), String> {
+    let pid = std::process::id();
+    #[cfg(windows)]
+    {
+        let helper = std::env::temp_dir().join(format!("yoyo-relay-restart-{pid}.cmd"));
+        let script = format!(
+            "@echo off\r\nsetlocal\r\nset \"TARGET={}\"\r\nset \"STAGED={}\"\r\nset /a COUNT=0\r\n:wait\r\ntasklist /FI \"PID eq {pid}\" /NH 2>nul | find \"{pid}\" >nul\r\nif errorlevel 1 goto install\r\nset /a COUNT+=1\r\nif %COUNT% GEQ 120 goto install\r\nping 127.0.0.1 -n 2 >nul\r\ngoto wait\r\n:install\r\nping 127.0.0.1 -n 2 >nul\r\nmove /Y \"%STAGED%\" \"%TARGET%\" >nul 2>nul\r\nstart \"\" \"%TARGET%\"\r\ndel \"%~f0\" >nul 2>nul\r\n",
+            current.display(),
+            staged.display()
+        );
+        std::fs::write(&helper, script).map_err(|err| format!("写入重启脚本失败：{err}"))?;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", "/MIN"])
+            .arg(&helper)
+            .spawn()
+            .map_err(|err| format!("启动重启脚本失败：{err}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        let helper = std::env::temp_dir().join(format!("yoyo-relay-restart-{pid}.sh"));
+        let script = format!(
+            "#!/bin/sh\ni=0\nwhile kill -0 {pid} 2>/dev/null && [ \"$i\" -lt 120 ]; do sleep 1; i=$((i+1)); done\nsleep 1\nmv -f {} {} 2>/dev/null\nchmod +x {} 2>/dev/null\nnohup {} >/dev/null 2>&1 &\nrm -f \"$0\"\n",
+            shell_quote(staged),
+            shell_quote(current),
+            shell_quote(current),
+            shell_quote(current)
+        );
+        std::fs::write(&helper, script).map_err(|err| format!("写入重启脚本失败：{err}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&helper) {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o755);
+                let _ = std::fs::set_permissions(&helper, permissions);
+            }
+        }
+        std::process::Command::new("sh")
+            .arg(&helper)
+            .spawn()
+            .map_err(|err| format!("启动重启脚本失败：{err}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn parse_ai_price_plan(value: serde_json::Value) -> Result<crate::config::PricePlan, String> {
+    let mut plan = serde_json::from_value::<crate::config::PricePlan>(value)
+        .map_err(|err| format!("AI 返回的 JSON 无法解析为价格方案：{err}"))?
+        .normalized();
+    plan.base.input_per_mtok = plan.base.input_per_mtok.max(0.0);
+    plan.base.cached_input_per_mtok = plan.base.cached_input_per_mtok.max(0.0);
+    plan.base.output_per_mtok = plan.base.output_per_mtok.max(0.0);
+    plan.periods.truncate(48);
+    if plan.base.is_zero() && plan.periods.iter().all(|period| period.tier.is_zero()) {
+        return Err("AI 返回的方案没有任何价格，请补充需求后重试。".into());
+    }
+    if plan.name.trim().is_empty() {
+        plan.name = "AI 生成方案".into();
+    }
+    Ok(plan)
+}
+
+#[cfg(test)]
+mod ai_plan_tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_normalizes_ai_price_plans() {
+        let value = serde_json::json!({
+            "currency": "CNY",
+            "base": {"input_per_mtok": -1.0, "cached_input_per_mtok": 0.5, "output_per_mtok": 4.0},
+            "periods": [
+                {
+                    "name": "工作日高峰",
+                    "start_hour": 9,
+                    "end_hour": 18,
+                    "days": [0, 1, 2, 3, 4],
+                    "tier": {"input_per_mtok": 4.0, "cached_input_per_mtok": 1.0, "output_per_mtok": 16.0}
+                }
+            ],
+            "note": "测试"
+        });
+        let plan = parse_ai_price_plan(value).expect("plan");
+        assert_eq!(plan.currency, crate::config::PriceCurrency::Cny);
+        assert_eq!(plan.base.input_per_mtok, 0.0);
+        assert_eq!(plan.base.output_per_mtok, 4.0);
+        assert_eq!(plan.periods.len(), 1);
+        assert_eq!(plan.name, "AI 生成方案");
+    }
+
+    #[test]
+    fn rejects_ai_plans_without_any_price() {
+        let value = serde_json::json!({
+            "currency": "usd",
+            "base": {},
+            "periods": [{"name": "x", "start_hour": 9, "end_hour": 18}]
+        });
+        assert!(parse_ai_price_plan(value).is_err());
+    }
 }

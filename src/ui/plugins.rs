@@ -5,7 +5,7 @@ use crate::plugins::{PluginInfo, PluginStatus, PluginUiKind};
 use crate::runtime::UiCommand;
 use crate::snapshot::NoticeLevel;
 
-use super::{kit, theme, widgets, App, Page};
+use super::{kit, theme, widgets, App, ConfirmAction, Page};
 
 impl App {
     pub(crate) fn page_plugins(&mut self, ui: &mut egui::Ui) {
@@ -151,8 +151,10 @@ impl App {
         let mut toggle = None;
         let mut load = false;
         let mut unload = false;
+        let mut uninstall = false;
         let mut reload = false;
         let mut test = false;
+        let mut open_console = false;
         kit::surface(ui, |ui| {
             ui.horizontal(|ui| {
                 kit::icon_chip(ui, icons::PUZZLE_PIECE, theme::PURPLE, 38.0);
@@ -164,6 +166,14 @@ impl App {
                         kit::status_pill(ui, label, color);
                         if !plugin.enabled {
                             kit::plain_badge(ui, "已禁用");
+                        }
+                        if self
+                            .plugin_overrides
+                            .get(&plugin.id)
+                            .map(|(value, _)| *value != plugin.enabled)
+                            .unwrap_or(false)
+                        {
+                            kit::badge(ui, "切换中…", theme::ORANGE);
                         }
                     });
                     if plugin.description.trim().is_empty() {
@@ -182,15 +192,14 @@ impl App {
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut enabled = plugin.enabled;
-                    if kit::toggle_switch(ui, &mut enabled).changed() {
+                    let mut enabled = self
+                        .plugin_overrides
+                        .get(&plugin.id)
+                        .map(|(value, _)| *value)
+                        .unwrap_or(plugin.enabled);
+                    if kit::toggle_row(ui, &mut enabled, "启用").changed() {
                         toggle = Some(enabled);
                     }
-                    ui.label(
-                        RichText::new(if plugin.enabled { "启用" } else { "禁用" })
-                            .size(10.0)
-                            .color(theme::muted(ui)),
-                    );
                     if running {
                         if kit::secondary_button(ui, icons::FLASK, "自检").clicked() {
                             test = true;
@@ -198,7 +207,7 @@ impl App {
                         if kit::icon_button(ui, icons::ARROWS_CLOCKWISE, "重新加载").clicked() {
                             reload = true;
                         }
-                        if kit::icon_button(ui, icons::STOP, "卸载插件（保留启用状态）").clicked()
+                        if kit::icon_button(ui, icons::STOP, "停止插件（保留启用状态）").clicked()
                         {
                             unload = true;
                         }
@@ -206,6 +215,15 @@ impl App {
                         if kit::secondary_button(ui, icons::PLAY, "加载").clicked() {
                             load = true;
                         }
+                    }
+                    if kit::icon_button(ui, icons::TRASH_SIMPLE, "卸载插件（删除插件文件）")
+                        .clicked()
+                    {
+                        uninstall = true;
+                    }
+                    if kit::icon_button(ui, icons::TERMINAL_WINDOW, "运行日志控制台").clicked()
+                    {
+                        open_console = true;
                     }
                     if kit::ghost_button(ui, icons::COPY, "路径").clicked() {
                         self.copy(
@@ -239,6 +257,9 @@ impl App {
                         .size(9.0)
                         .color(theme::muted(ui)),
                 );
+                if plugin.log_count > 0 {
+                    kit::badge(ui, &format!("日志 {}", plugin.log_count), theme::MUTED);
+                }
                 if plugin.loaded_at > 0 && running {
                     ui.label(
                         RichText::new(format!(
@@ -250,6 +271,35 @@ impl App {
                     );
                 }
             });
+            if !plugin.providers.is_empty() {
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("临时供应商")
+                            .size(9.5)
+                            .strong()
+                            .color(theme::PURPLE),
+                    );
+                    for provider in &plugin.providers {
+                        kit::badge(
+                            ui,
+                            &format!("{} · {}", provider.name, provider.protocol),
+                            theme::PURPLE,
+                        );
+                        for model in provider.models.iter().take(6) {
+                            kit::plain_badge(ui, model);
+                        }
+                        if provider.models.len() > 6 {
+                            kit::plain_badge(ui, &format!("+{}", provider.models.len() - 6));
+                        }
+                    }
+                });
+                ui.label(
+                    RichText::new("虚拟账号自动创建并参与调度；插件卸载或禁用时自动移除。")
+                        .size(9.0)
+                        .color(theme::muted(ui)),
+                );
+            }
             if let Some(error) = &plugin.last_error {
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
@@ -257,50 +307,10 @@ impl App {
                     ui.label(RichText::new(error).size(10.0).color(theme::RED));
                 });
             }
-            if !plugin.logs.is_empty() {
-                ui.add_space(2.0);
-                egui::CollapsingHeader::new(
-                    RichText::new(format!("运行日志（{}）", plugin.logs.len()))
-                        .size(10.5)
-                        .color(theme::muted(ui)),
-                )
-                .id_salt(format!("plugin_logs_{}", plugin.id))
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt(format!("plugin_logs_scroll_{}", plugin.id))
-                        .max_height(160.0)
-                        .show(ui, |ui| {
-                            for log in plugin.logs.iter().rev().take(60) {
-                                let color = match log.level.as_str() {
-                                    "error" => theme::RED,
-                                    "warn" => theme::ORANGE,
-                                    _ => theme::muted(ui),
-                                };
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(
-                                        RichText::new(widgets::format_time(log.at))
-                                            .monospace()
-                                            .size(9.0)
-                                            .color(theme::muted(ui)),
-                                    );
-                                    ui.label(
-                                        RichText::new(&log.level)
-                                            .monospace()
-                                            .size(9.0)
-                                            .color(color),
-                                    );
-                                    ui.label(
-                                        RichText::new(&log.message)
-                                            .size(9.5)
-                                            .color(theme::text(ui)),
-                                    );
-                                });
-                            }
-                        });
-                });
-            }
         });
         if let Some(enabled) = toggle {
+            self.plugin_overrides
+                .insert(plugin.id.clone(), (enabled, std::time::Instant::now()));
             let _ = self.cmd_tx.send(UiCommand::SetPluginEnabled {
                 id: plugin.id.clone(),
                 enabled,
@@ -320,6 +330,10 @@ impl App {
         if unload {
             let _ = self.cmd_tx.send(UiCommand::UnloadPlugin(plugin.id.clone()));
         }
+        if uninstall {
+            self.plugin_uninstall_keep_data = true;
+            self.confirm = Some(ConfirmAction::UninstallPlugin(plugin.id.clone()));
+        }
         if reload {
             let _ = self.cmd_tx.send(UiCommand::ReloadPlugin(plugin.id.clone()));
         }
@@ -330,6 +344,208 @@ impl App {
             });
             self.toast(NoticeLevel::Info, "正在运行插件自检…");
         }
+        if open_console {
+            self.plugin_console = Some(plugin.id.clone());
+            self.plugin_console_auto_scroll = true;
+            let _ = self
+                .cmd_tx
+                .send(UiCommand::SetPluginConsole(Some(plugin.id.clone())));
+        }
+    }
+
+    /// Log console modal. Rows are virtualised with `show_rows`, so the full
+    /// 500-line buffer stays cheap even while it updates.
+    pub(crate) fn show_plugin_console(&mut self, ctx: &egui::Context) {
+        if self.plugin_console.is_none() {
+            return;
+        }
+        let view = self
+            .snapshot
+            .plugin_console
+            .clone()
+            .filter(|view| Some(&view.id) == self.plugin_console.as_ref());
+        let mut close = false;
+        let mut clear = false;
+        let mut copy = false;
+        let title = view
+            .as_ref()
+            .map(|view| format!("插件控制台 · {}", view.name))
+            .unwrap_or_else(|| "插件控制台".to_string());
+        let logs = view
+            .as_ref()
+            .map(|view| {
+                view.logs
+                    .iter()
+                    .filter(|log| match self.plugin_console_level {
+                        1 => log.level == "info" || log.level == "debug",
+                        2 => log.level == "warn",
+                        3 => log.level == "error",
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let total = view.as_ref().map(|view| view.logs.len()).unwrap_or(0);
+        let closed = kit::modal_shell(
+            ctx,
+            egui::Id::new("plugin_log_console"),
+            &title,
+            "最新 500 条运行日志 · 级别过滤 · 自动滚动",
+            840.0,
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("级别").size(10.0).color(theme::muted(ui)));
+                    if let Some(level) = widgets::segmented(
+                        ui,
+                        &[(0u8, "全部"), (1, "信息"), (2, "警告"), (3, "错误")],
+                        self.plugin_console_level,
+                    ) {
+                        self.plugin_console_level = level;
+                    }
+                    ui.checkbox(&mut self.plugin_console_auto_scroll, "自动滚动");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "显示 {} / 共 {} 条（最多保留 500）",
+                                logs.len(),
+                                total
+                            ))
+                            .size(9.5)
+                            .color(theme::muted(ui)),
+                        );
+                        if kit::secondary_button(ui, icons::COPY, "复制").clicked() {
+                            copy = true;
+                        }
+                        if kit::danger_button(ui, icons::TRASH_SIMPLE, "清空").clicked() {
+                            clear = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                let dark = theme::tokens(ui).dark_mode;
+                egui::Frame::new()
+                    .fill(if dark {
+                        egui::Color32::from_rgb(12, 16, 22)
+                    } else {
+                        egui::Color32::from_rgb(15, 23, 42)
+                    })
+                    .corner_radius(9)
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("plugin_log_console_scroll")
+                            .max_height(500.0)
+                            .auto_shrink([false, false])
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            )
+                            .stick_to_bottom(self.plugin_console_auto_scroll)
+                            .show_rows(ui, 18.0, logs.len(), |ui, range| {
+                                for index in range {
+                                    let log = &logs[index];
+                                    let color = match log.level.as_str() {
+                                        "error" => theme::RED,
+                                        "warn" => theme::ORANGE,
+                                        "debug" => theme::MUTED,
+                                        _ => theme::GREEN,
+                                    };
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(ui.available_width(), 18.0),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add_sized(
+                                                egui::vec2(124.0, 16.0),
+                                                egui::Label::new(
+                                                    RichText::new(widgets::format_time(log.at))
+                                                        .monospace()
+                                                        .size(9.0)
+                                                        .color(theme::MUTED),
+                                                )
+                                                .truncate(),
+                                            );
+                                            ui.add_sized(
+                                                egui::vec2(38.0, 16.0),
+                                                egui::Label::new(
+                                                    RichText::new(&log.level)
+                                                        .monospace()
+                                                        .size(9.0)
+                                                        .color(color),
+                                                )
+                                                .truncate(),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&log.message)
+                                                        .monospace()
+                                                        .size(9.5)
+                                                        .color(egui::Color32::from_rgb(
+                                                            226, 232, 240,
+                                                        )),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(&log.message);
+                                        },
+                                    );
+                                }
+                            });
+                    });
+                if view.is_none() {
+                    ui.add_space(4.0);
+                    let exists = self
+                        .snapshot
+                        .plugins
+                        .iter()
+                        .any(|plugin| Some(&plugin.id) == self.plugin_console.as_ref());
+                    ui.horizontal(|ui| {
+                        if exists {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("正在读取日志…")
+                                    .size(10.5)
+                                    .color(theme::muted(ui)),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("插件已移除，日志不再可用。")
+                                    .size(10.5)
+                                    .color(theme::muted(ui)),
+                            );
+                        }
+                    });
+                }
+            },
+            |ui| {
+                if kit::secondary_button(ui, icons::X, "关闭").clicked() {
+                    close = true;
+                }
+            },
+        );
+        if clear {
+            if let Some(id) = self.plugin_console.clone() {
+                let _ = self.cmd_tx.send(UiCommand::ClearPluginLogs(id));
+            }
+        }
+        if copy {
+            let text = logs
+                .iter()
+                .map(|log| {
+                    format!(
+                        "{} [{}] {}",
+                        widgets::format_time(log.at),
+                        log.level,
+                        log.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.copy(ctx, &text, "插件日志");
+        }
+        if closed || close {
+            self.plugin_console = None;
+            let _ = self.cmd_tx.send(UiCommand::SetPluginConsole(None));
+        }
     }
 
     pub(crate) fn show_plugin_docs(&mut self, ctx: &egui::Context) {
@@ -337,33 +553,29 @@ impl App {
             return;
         }
         let mut close = false;
+        let mut download_skill = false;
         let closed = kit::modal_shell(
             ctx,
             egui::Id::new("plugin_api_docs"),
             "插件 API 文档",
-            "ES Module · 生命周期事件 · 宿主 API · 资源限制",
+            "ES Module · 生命周期事件 · 宿主 API · 虚拟供应商 · WebSocket / SSE · 资源限制",
             780.0,
             |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("plugin_docs_scroll")
-                    .max_height(520.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(crate::plugins::docs::API_DOC)
-                                    .monospace()
-                                    .size(10.5),
-                            )
-                            .wrap(),
-                        );
-                    });
+                super::markdown::api_doc(ui);
             },
             |ui| {
+                if kit::secondary_button(ui, icons::DOWNLOAD_SIMPLE, "下载开发 Skill").clicked()
+                {
+                    download_skill = true;
+                }
                 if kit::primary_button(ui, icons::CHECK, "关闭").clicked() {
                     close = true;
                 }
             },
         );
+        if download_skill {
+            let _ = self.cmd_tx.send(UiCommand::ExportPluginSkill);
+        }
         if closed || close {
             self.plugin_docs_open = false;
         }
@@ -382,6 +594,7 @@ impl App {
         let mut text = self.plugin_ui_text.clone();
         let mut accepted = false;
         let is_prompt = request.kind == PluginUiKind::Prompt;
+        let is_alert = request.kind == PluginUiKind::Alert;
         let closed = kit::modal_shell(
             ctx,
             egui::Id::new(("plugin_ui", request.id)),
@@ -403,19 +616,25 @@ impl App {
                     ui.add_space(8.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut text)
+                            .id(egui::Id::new("plugin_ui_prompt"))
                             .desired_width(f32::INFINITY)
                             .hint_text("输入内容"),
                     );
                 }
             },
             |ui| {
-                if kit::primary_button(ui, icons::CHECK, if is_prompt { "提交" } else { "确认" })
-                    .clicked()
-                {
+                let confirm_text = if is_alert {
+                    "知道了"
+                } else if is_prompt {
+                    "提交"
+                } else {
+                    "确认"
+                };
+                if kit::primary_button(ui, icons::CHECK, confirm_text).clicked() {
                     accepted = true;
                     answer = Some((true, String::new()));
                 }
-                if kit::secondary_button(ui, icons::X, "取消").clicked() {
+                if !is_alert && kit::secondary_button(ui, icons::X, "取消").clicked() {
                     answer = Some((false, String::new()));
                 }
             },
@@ -433,6 +652,11 @@ impl App {
                 accepted: false,
                 text: String::new(),
             });
+            self.plugin_ui_text.clear();
+        } else {
+            // Keep the in-progress text across frames; the modal is rebuilt
+            // from this field every frame.
+            self.plugin_ui_text = text;
         }
     }
 }

@@ -700,6 +700,10 @@ impl App {
                                     if ui
                                         .add(
                                             egui::TextEdit::singleline(&mut plan.name)
+                                                .id(egui::Id::new((
+                                                    "price_plan_library_name",
+                                                    index,
+                                                )))
                                                 .desired_width(220.0)
                                                 .hint_text("方案名称"),
                                         )
@@ -708,7 +712,7 @@ impl App {
                                         changed = true;
                                     }
                                     let periods = if plan.periods.is_empty() {
-                                        "全天基础价".to_string()
+                                        "全天默认价".to_string()
                                     } else {
                                         plan.periods
                                             .iter()
@@ -876,15 +880,9 @@ impl App {
                 let mut allow_lan = lan;
                 let mut lan_changed = false;
                 ui.horizontal_wrapped(|ui| {
-                    if kit::toggle_switch(ui, &mut allow_lan).changed() {
+                    if kit::toggle_row(ui, &mut allow_lan, "允许局域网访问").changed() {
                         lan_changed = true;
                     }
-                    ui.label(
-                        RichText::new("允许局域网访问")
-                            .size(11.0)
-                            .strong()
-                            .color(theme::text(ui)),
-                    );
                     ui.label(
                         RichText::new(if allow_lan {
                             "监听 0.0.0.0，局域网内其他设备可用下方地址访问"
@@ -901,6 +899,10 @@ impl App {
                     } else {
                         "127.0.0.1".to_string()
                     };
+                    // The bind TextEdit may still hold focus with its old
+                    // buffer; drop it so a pending edit cannot write 127.0.0.1
+                    // back over the switch in the same frame.
+                    ui.memory_mut(|memory| memory.surrender_focus(proxy_bind_id()));
                     changed = true;
                 }
                 if allow_lan && !self.config.server.auth_enabled {
@@ -1368,7 +1370,146 @@ impl App {
 
     // -- About --------------------------------------------------------------
 
+    fn contributors_card(&mut self, ui: &mut egui::Ui) {
+        let mut refresh = false;
+        let loading = self.snapshot.contributors_loading;
+        let error = self.snapshot.contributors_error.clone();
+        let contributors = self.snapshot.contributors.clone();
+        kit::section_card(
+            ui,
+            icons::USERS_THREE,
+            "贡献者",
+            "来自 GitHub 仓库的贡献者列表",
+            |ui| {
+                if kit::ghost_button(ui, icons::ARROWS_CLOCKWISE, "刷新").clicked() {
+                    refresh = true;
+                }
+            },
+            |ui| {
+                if loading && contributors.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("正在获取贡献者…")
+                                .size(10.5)
+                                .color(theme::muted(ui)),
+                        );
+                    });
+                    return;
+                }
+                if let Some(error) = &error {
+                    ui.label(RichText::new(error).size(10.0).color(theme::ORANGE));
+                }
+                if contributors.is_empty() {
+                    ui.label(
+                        RichText::new("暂未获取到贡献者列表，可稍后重试。")
+                            .size(10.5)
+                            .color(theme::muted(ui)),
+                    );
+                    ui.hyperlink_to(
+                        "在 GitHub 查看贡献者",
+                        "https://github.com/ImYoyoData/yoyo-relay/graphs/contributors",
+                    );
+                    return;
+                }
+                for contributor in &contributors {
+                    if self.contributor_textures.get(&contributor.login).is_none() {
+                        if let Some(bytes) = &contributor.avatar {
+                            if let Ok(image) = image::load_from_memory(bytes) {
+                                let rgba = image.to_rgba8();
+                                let (width, height) = rgba.dimensions();
+                                let color = egui::ColorImage::from_rgba_unmultiplied(
+                                    [width as usize, height as usize],
+                                    rgba.as_raw(),
+                                );
+                                let texture = ui.ctx().load_texture(
+                                    format!("contributor-{}", contributor.login),
+                                    color,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                self.contributor_textures
+                                    .insert(contributor.login.clone(), texture);
+                            }
+                        }
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for contributor in &contributors {
+                        let profile_url = contributor.url.clone();
+                        let response = ui.allocate_ui(egui::Vec2::new(86.0, 88.0), |ui| {
+                            ui.vertical_centered(|ui| {
+                                let size = 48.0;
+                                if let Some(texture) =
+                                    self.contributor_textures.get(&contributor.login)
+                                {
+                                    ui.add(
+                                        egui::Image::new(texture)
+                                            .fit_to_exact_size(egui::Vec2::splat(size))
+                                            .corner_radius(size / 2.0),
+                                    );
+                                } else {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::Vec2::splat(size),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(
+                                        rect.center(),
+                                        size / 2.0,
+                                        theme::soft_for(ui, theme::PURPLE),
+                                    );
+                                    let initial = contributor
+                                        .login
+                                        .chars()
+                                        .next()
+                                        .unwrap_or('?')
+                                        .to_ascii_uppercase();
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        initial,
+                                        egui::FontId::proportional(19.0),
+                                        theme::PURPLE,
+                                    );
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&contributor.login)
+                                            .size(9.2)
+                                            .color(theme::muted(ui)),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(format!(
+                                    "{} · {} 次提交",
+                                    contributor.login, contributor.contributions
+                                ));
+                            });
+                        });
+                        response
+                            .response
+                            .interact(egui::Sense::click())
+                            .on_hover_text(format!("打开 {profile_url}"))
+                            .clicked()
+                            .then(|| crate::ui::open_url(&profile_url));
+                    }
+                });
+            },
+        );
+        if refresh {
+            self.contributors_requested = true;
+            let _ = self.cmd_tx.send(UiCommand::RefreshContributors);
+        }
+    }
+
     fn settings_about(&mut self, ui: &mut egui::Ui) {
+        if self.snapshot.contributors.is_empty()
+            && !self.snapshot.contributors_loading
+            && self.snapshot.contributors_error.is_none()
+            && !self.contributors_requested
+        {
+            self.contributors_requested = true;
+            let _ = self.cmd_tx.send(UiCommand::RefreshContributors);
+        }
         let uptime = crate::config::fmt_duration_secs(self.snapshot.uptime_secs);
         let mut changed = false;
         let mut restart_onboarding = false;
@@ -1518,6 +1659,8 @@ impl App {
             },
         );
         ui.add_space(12.0);
+        self.contributors_card(ui);
+        ui.add_space(12.0);
         kit::section_card(
             ui,
             icons::INFO,
@@ -1618,6 +1761,10 @@ fn path_row(ui: &mut Ui, icon: &str, label: &str, value: &str, copied: &mut bool
     });
 }
 
+fn proxy_bind_id() -> egui::Id {
+    egui::Id::new("proxy_bind")
+}
+
 fn proxy_fields_a(ui: &mut Ui, server: &mut crate::config::ServerConfig) -> bool {
     let mut changed = false;
     egui::Grid::new("proxy_a")
@@ -1628,6 +1775,7 @@ fn proxy_fields_a(ui: &mut Ui, server: &mut crate::config::ServerConfig) -> bool
             changed |= ui
                 .add(
                     egui::TextEdit::singleline(&mut server.bind)
+                        .id(proxy_bind_id())
                         .desired_width(170.0)
                         .hint_text("127.0.0.1"),
                 )

@@ -271,8 +271,13 @@ pub fn apply(ctx: &Context, dark: bool) {
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(11.0, 6.0);
         style.spacing.interact_size.y = 30.0;
-        style.spacing.scroll.bar_width = 8.0;
-        style.spacing.scroll.floating = true;
+        style.spacing.scroll.bar_width = 9.0;
+        // Floating scrollbars hide until the pointer is already on them,
+        // which makes them hard to grab. Reserve a visible track instead and
+        // use the foreground colour so the handle is not white-on-white.
+        style.spacing.scroll.floating = false;
+        style.spacing.scroll.foreground_color = true;
+        style.spacing.scroll.handle_min_length = 28.0;
         style.visuals.widgets.inactive.corner_radius = 8.into();
         style.visuals.widgets.hovered.corner_radius = 8.into();
         style.visuals.widgets.active.corner_radius = 8.into();

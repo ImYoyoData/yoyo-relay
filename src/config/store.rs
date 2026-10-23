@@ -401,7 +401,12 @@ pub fn validate(config: &AppConfig) -> Vec<String> {
         if p.name.trim().is_empty() {
             errors.push("供应商名称不能为空".into());
         }
-        if !(p.base_url.starts_with("http://") || p.base_url.starts_with("https://")) {
+        // Plugin-contributed providers use `plugin://<plugin-id>` and never
+        // make an HTTP request themselves; the plugin host handles their calls.
+        let plugin_origin = p.id.starts_with("plugin:") || p.base_url.starts_with("plugin://");
+        if !plugin_origin
+            && !(p.base_url.starts_with("http://") || p.base_url.starts_with("https://"))
+        {
             errors.push(format!(
                 "供应商「{}」的 Base URL 必须以 http:// 或 https:// 开头",
                 p.name
@@ -421,7 +426,11 @@ pub fn validate(config: &AppConfig) -> Vec<String> {
         if a.name.trim().is_empty() {
             errors.push("账号名称不能为空".into());
         }
-        if !config.providers.iter().any(|p| p.id == a.provider_id) {
+        // `plugin:` ids are injected at runtime by the plugin host. A saved
+        // base config may legitimately reference them (temporary provider).
+        if !a.provider_id.starts_with("plugin:")
+            && !config.providers.iter().any(|p| p.id == a.provider_id)
+        {
             errors.push(format!("账号「{}」引用了不存在的供应商", a.name));
         }
         if let Some(q) = &a.quota {
@@ -444,7 +453,9 @@ pub fn validate(config: &AppConfig) -> Vec<String> {
         if r.upstream_model.trim().is_empty() {
             errors.push(format!("路由「{}」的上游模型名不能为空", r.client_model));
         }
-        if !config.providers.iter().any(|p| p.id == r.provider_id) {
+        if !r.provider_id.starts_with("plugin:")
+            && !config.providers.iter().any(|p| p.id == r.provider_id)
+        {
             errors.push(format!("路由「{}」引用了不存在的供应商", r.client_model));
         }
     }
@@ -494,6 +505,38 @@ pub fn is_sensitive_header(name: &str) -> bool {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn plugin_providers_use_plugin_urls_and_can_back_saved_routes() {
+        let mut config = AppConfig::default();
+        config.providers.push(Provider {
+            id: "plugin:demo:0".into(),
+            name: "Echo".into(),
+            base_url: "plugin://demo".into(),
+            ..Provider::default()
+        });
+        // Dynamic providers are never HTTP endpoints, even if an older
+        // runtime left the base URL empty.
+        config.providers.push(Provider {
+            id: "plugin:demo:1".into(),
+            name: "Echo Empty URL".into(),
+            base_url: String::new(),
+            ..Provider::default()
+        });
+        config.routes.push(ModelRoute {
+            id: "route-demo".into(),
+            client_model: "echo-plugin".into(),
+            provider_id: "plugin:demo:0".into(),
+            upstream_model: "echo-plugin".into(),
+            ..ModelRoute::default()
+        });
+        assert!(validate(&config).is_empty(), "{:?}", validate(&config));
+
+        // The base config does not contain plugin providers; a route saved
+        // while the plugin was running must still pass validation.
+        config.providers.clear();
+        assert!(validate(&config).is_empty(), "{:?}", validate(&config));
+    }
 
     #[test]
     fn roundtrip_config_with_secrets() {

@@ -166,7 +166,7 @@ impl App {
             }
         }
 
-        if ui.small_button("管理供应商").clicked() {
+        if super::kit::ghost_button(ui, icons::HARD_DRIVES, "管理供应商").clicked() {
             self.page = super::Page::Providers;
         }
     }
@@ -181,6 +181,7 @@ impl App {
     ) {
         let test_key = format!("route:{}", row.route_id);
         let running = snapshot.running_tests.contains(&test_key);
+        let dynamic = row.route_id.starts_with("plugin:");
         egui::Frame::new()
             .fill(theme::subtle_fill(ui))
             .corner_radius(9)
@@ -210,52 +211,63 @@ impl App {
                     if !row.enabled {
                         super::kit::badge(ui, "已停用", theme::MUTED);
                     }
+                    if dynamic {
+                        super::kit::badge(ui, "插件供应商", theme::PURPLE);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if super::kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除路由")
-                            .clicked()
+                        if !dynamic
+                            && super::kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除路由")
+                                .clicked()
                         {
                             pending.push(RouteAction::Delete(row.route_id.clone()));
                         }
-                        if super::kit::icon_button(ui, icons::PENCIL_SIMPLE, "编辑路由").clicked()
+                        if !dynamic
+                            && super::kit::icon_button(ui, icons::PENCIL_SIMPLE, "编辑路由")
+                                .clicked()
                         {
                             pending.push(RouteAction::Edit(row.route_id.clone()));
                         }
-                        if super::kit::icon_button(
-                            ui,
-                            if row.enabled {
-                                icons::PAUSE
-                            } else {
-                                icons::PLAY
-                            },
-                            if row.enabled {
-                                "停用该上游（保留在列表，不参与调度）"
-                            } else {
-                                "启用该上游"
-                            },
-                        )
-                        .clicked()
+                        if !dynamic
+                            && super::kit::icon_button(
+                                ui,
+                                if row.enabled {
+                                    icons::PAUSE
+                                } else {
+                                    icons::PLAY
+                                },
+                                if row.enabled {
+                                    "停用该上游（保留在列表，不参与调度）"
+                                } else {
+                                    "启用该上游"
+                                },
+                            )
+                            .clicked()
                         {
                             pending.push(RouteAction::Toggle(row.route_id.clone()));
                         }
-                        if super::kit::icon_button(
-                            ui,
-                            if running {
-                                icons::SPINNER
-                            } else {
-                                icons::FLASK
-                            },
-                            "测试路由",
-                        )
-                        .clicked()
+                        if !dynamic
+                            && super::kit::icon_button(
+                                ui,
+                                if running {
+                                    icons::SPINNER
+                                } else {
+                                    icons::FLASK
+                                },
+                                "测试路由",
+                            )
+                            .clicked()
                             && !running
                         {
                             pending.push(RouteAction::Test(row.route_id.clone()));
                         }
-                        if super::kit::icon_button(ui, icons::ARROW_UP, "提高优先级").clicked()
+                        if !dynamic
+                            && super::kit::icon_button(ui, icons::ARROW_UP, "提高优先级").clicked()
                         {
                             pending.push(RouteAction::Priority(row.route_id.clone(), 1));
                         }
-                        if super::kit::icon_button(ui, icons::ARROW_DOWN, "降低优先级").clicked()
+                        if !dynamic
+                            && super::kit::icon_button(ui, icons::ARROW_DOWN, "降低优先级")
+                                .clicked()
                         {
                             pending.push(RouteAction::Priority(row.route_id.clone(), -1));
                         }

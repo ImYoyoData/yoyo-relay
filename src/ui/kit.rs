@@ -1182,11 +1182,33 @@ pub fn brand_logo(ui: &mut Ui, texture: &egui::TextureHandle, size: f32) {
     ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
 }
 
+/// Switch plus a clickable label. The whole row responds, which avoids the
+/// "switch looks dead" problem when the user clicks the text instead of the
+/// 40×22 track.
+pub fn toggle_row(ui: &mut Ui, value: &mut bool, text: &str) -> Response {
+    let mut response = toggle_switch(ui, value);
+    let label = ui.add(
+        egui::Label::new(RichText::new(text).size(11.0).color(theme::text(ui)))
+            .sense(Sense::click()),
+    );
+    if label.clicked() {
+        *value = !*value;
+        response.mark_changed();
+        ui.ctx().request_repaint();
+    }
+    // Union keeps the hover/click region meaningful for callers and tests.
+    response.union(label)
+}
+
 pub fn toggle_switch(ui: &mut Ui, value: &mut bool) -> Response {
     let t = theme::tokens(ui);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::click());
+    let (rect, mut response) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::click());
     if response.clicked() {
         *value = !*value;
+        // Callers persist on `.changed()`; without this the switch flips for a
+        // single frame and then snaps back to the saved value.
+        response.mark_changed();
+        ui.ctx().request_repaint();
     }
     let on = *value;
     let bg = if on {
@@ -1241,5 +1263,82 @@ mod tests {
         assert_eq!(points[2].tokens, 9);
         assert_eq!(points[2].requests, 1);
         assert_eq!(points[2].cost_micros, 3);
+    }
+}
+
+#[cfg(test)]
+mod toggle_tests {
+    use super::*;
+
+    fn render(ctx: &egui::Context, value: &mut bool) -> egui::Rect {
+        let mut rect = egui::Rect::NOTHING;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                rect = toggle_row(ui, value, "测试开关").rect;
+            });
+        });
+        rect
+    }
+
+    fn click(ctx: &egui::Context, value: &mut bool, pos: egui::Pos2) -> bool {
+        let mut press = egui::RawInput::default();
+        press.events.push(egui::Event::PointerMoved(pos));
+        press.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        let _ = ctx.run(press, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                toggle_row(ui, value, "测试开关");
+            });
+        });
+        let mut release = egui::RawInput::default();
+        release.events.push(egui::Event::PointerMoved(pos));
+        release.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let mut changed = false;
+        let _ = ctx.run(release, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                changed = toggle_row(ui, value, "测试开关").changed();
+            });
+        });
+        changed
+    }
+
+    #[test]
+    fn toggle_row_responds_to_clicks() {
+        let ctx = egui::Context::default();
+        let mut value = false;
+        let rect = render(&ctx, &mut value);
+        // Click the 40×22 track first: it must flip exactly once and report
+        // the change so settings can be persisted.
+        let changed = click(
+            &ctx,
+            &mut value,
+            egui::pos2(rect.left() + 20.0, rect.center().y),
+        );
+        assert!(changed, "clicking the switch should report a change");
+        assert!(value, "clicking the switch should turn it on");
+        let changed = click(
+            &ctx,
+            &mut value,
+            egui::pos2(rect.left() + 20.0, rect.center().y),
+        );
+        assert!(changed, "clicking the switch off should report a change");
+        assert!(!value, "clicking the switch again should turn it off");
+        // Clicking the label must also flip it and report the change.
+        let changed = click(
+            &ctx,
+            &mut value,
+            egui::pos2(rect.right() - 10.0, rect.center().y),
+        );
+        assert!(changed, "clicking the label should report a change");
+        assert!(value, "clicking the label should turn it on");
     }
 }

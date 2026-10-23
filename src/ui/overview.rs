@@ -119,15 +119,14 @@ impl App {
             },
             |ui| {
                 if self.snapshot.recent.is_empty() {
-                    super::kit::empty_state(
+                    if super::kit::empty_state(
                         ui,
                         icons::PAPER_PLANE_TILT,
                         "还没有请求",
                         "把客户端指向本地端点并发起一次请求即可在这里看到。",
                         icons::KEY,
                         "查看本地 Key",
-                    );
-                    if ui.small_button("查看本地 Key").clicked() {
+                    ) {
                         self.page = super::Page::LocalKeys;
                     }
                     return;
@@ -141,8 +140,9 @@ impl App {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    RichText::new(widgets::time_ago(request.ts, now_ts()))
-                                        .size(9.5)
+                                    RichText::new(widgets::format_call_time(request.ts))
+                                        .monospace()
+                                        .size(9.0)
                                         .color(theme::muted(ui)),
                                 );
                                 ui.label(
@@ -183,10 +183,13 @@ impl App {
                                             self.copy(ui.ctx(), &curl, "curl 命令");
                                         }
                                         ui.label(
-                                            RichText::new(format!("{} ms", request.latency_ms))
-                                                .monospace()
-                                                .size(9.5)
-                                                .color(theme::muted(ui)),
+                                            RichText::new(format!(
+                                                "{:.2} s",
+                                                request.latency_ms as f64 / 1000.0
+                                            ))
+                                            .monospace()
+                                            .size(9.5)
+                                            .color(theme::muted(ui)),
                                         );
                                         ui.label(
                                             RichText::new(widgets::format_count(

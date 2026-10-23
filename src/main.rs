@@ -3,6 +3,7 @@
 mod autostart;
 mod balance;
 mod config;
+mod contributors;
 mod db;
 mod fx;
 mod gateway;

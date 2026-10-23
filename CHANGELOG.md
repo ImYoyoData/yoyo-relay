@@ -4,6 +4,46 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-23
+
+### 新增
+
+- **一键自动更新**：更新弹窗的「立即更新」不再打开浏览器，而是从 GitHub Release 选择当前平台的非 UPX 安装包，校验大小与 SHA-256（Release 提供时）、解压并替换当前程序，然后自动退出、等待旧进程结束后重启新版本；失败会保留原程序并提供重试/打开 Release 页面回退。
+- **插件虚拟供应商**：插件可导出 `providers`，YoyoRelay 自动创建临时供应商、虚拟账号与路由，把插件模型加入 `/v1/models`；插件卸载、禁用或加载失败时自动移除，不写入用户配置。新增 `onProviderRequest` 事件：插件可直接返回非流式响应，或通过 `host.upstream.emitRaw/emitJson/error` 输出协议 SSE 帧；`host.http.sse` 支持把其他服务的 SSE 流式转发进来。
+- 路由页对插件提供的临时路由标记「插件供应商」并设为只读，避免误改用户配置；插件卡片显示其提供的临时供应商和模型。
+- 插件 API 扩展：`host.storage` 持久键值存储、`host.time.now/nowIso`、`host.util.uuid`、`host.fs.readBase64/writeBase64`、`host.http.download`、`host.http.sse`、`host.upstream.*`、`host.crypto.constantTimeEqual`、`host.ui.alert`。
+- **插件 WebSocket**：新增 `host.ws` / `host.net.ws`，支持 `connect`、`send`、`sendBinary`、`recv`、`close` 客户端与 `serve`、`stop` 服务端；服务端通过 `onWebSocketConnection`、`onWebSocketMessage`、`onWebSocketClosed` 事件收发文本/二进制帧，支持 `ws://` 与 `wss://` 客户端。`host.net.sse` 作为 `host.http.sse` 的别名，SSE 客户端能力保留并补充文档/测试。
+- **插件模型列表查询**：新增 `onListModels()` 事件，插件可动态返回模型数组或供应商数组；供应商页的临时供应商卡片新增「刷新模型」，刷新后同步临时供应商、虚拟账号、自动路由与 `/v1/models`。
+- 供应商页新增「临时供应商」分组：显示插件注入的供应商、协议、模型、流式能力与插件运行状态，并标注「临时」；路由编辑器可直接选择临时供应商并读取其模型列表。
+- 插件卸载改为真正的删除：停止插件并删除插件文件/目录，弹窗可勾选是否保留 `plugin-data/<id>`；不保留时数据目录一并删除。原「停止插件（保留启用状态）」按钮独立保留。
+- 插件 API 文档弹窗改为 Markdown 渲染（标题、列表、表格、代码块、行内代码/粗体），代码块支持一键复制。
+- 插件事件扩展：`onProviderRequest`、`onListModels`、`onWebSocketConnection`、`onWebSocketMessage`、`onWebSocketClosed`、`onProxyStart`、`onProxyStop`、`onConfigChanged`、`onRouteSelected`、`onError`、`onBalanceUpdated`、`onReload`。
+- 插件内置文档重写为完整参考：逐项列出参数类型、返回值、错误行为、事件对象字段与示例代码，并新增虚拟供应商/SSE 桥接示例。
+- 插件文档支持下载**开发 Skill**（`SKILL.md` + `API.md` + 可运行的 `echo-provider` 示例），供编码代理直接用于插件开发。
+- 「关于 YoyoRelay」新增 GitHub 贡献者列表：头像、登录名、提交数提示，点击打开主页；支持刷新与失败回退。
+- **AI 价格方案生成**：路由计费价格新增「AI 生成」，用中文描述高峰/低谷价格即可调用当前路由的上游模型生成方案；弹窗内预览默认价与高峰时段，确认后填入路由，保存路由前不会落盘。支持 OpenAI Chat、Anthropic Messages、OpenAI Responses 三种上游协议。
+- 计费价格明确为「默认价（低谷/空闲）+ 高峰时段」模型：只需添加高峰时段，未命中的时间自动使用默认价；新增「工作日 9–18 点」「每天 22–次日 8 点」快捷预设，并同步更新方案弹窗与说明文案。
+
+### 变更
+
+- 移除标题栏的搜索框（无实际作用）。
+- 调用明细与概览最近请求的耗时改为秒并保留两位小数（如 `11.89 s`）。
+- 调用时间改为绝对时间：当天显示 `HH:MM:SS`，非当天加“日”，非当月加月份，非本年显示完整日期时间。
+
+### 修复
+
+- 插件运行日志改为图标按钮打开的独立控制台：不再在卡片内折叠展开；日志缓冲区保留最新 500 条，弹窗使用虚拟化行渲染（`show_rows`），支持级别过滤、自动滚动、复制与清空，避免日志量大时卡顿。
+- **修复开关回弹的根因**：`kit::toggle_switch` 点击后只修改布尔值，从未调用 `Response::mark_changed()`，导致所有依赖 `.changed()` 保存的开关（插件启用、局域网访问、鉴权、自动更新等）在下一帧恢复原值。现在点击开关会正确标记变更并请求重绘，新增开关 changed 回归测试。
+- 修复「允许局域网访问」开关与监听地址输入框相互覆盖：切换时主动释放监听地址输入框焦点并固定其 ID，避免旧编辑缓冲在同一帧写回 `127.0.0.1`。
+- 修复插件提供的临时供应商被配置校验拦截（`plugin://` Base URL 与 `plugin:` 路由引用被判定为非法）；临时供应商现在可以正常出现在供应商列表、被路由编辑器选用并保存为路由。
+- 修复插件卸载只停止运行、不删除文件的问题；卸载现在删除插件目录/单文件，并按用户选择保留或删除 `plugin-data/<id>`。
+- **修复价格编辑框无法输入**：时段名称的 `TextEdit` 没有把 `.changed()` 计入修改，导致每帧被 `route.effective_pricing()` 重置；「存为方案」弹窗每帧从克隆值重绘且未写回名称/备注，输入同样会丢失；插件 `host.ui.prompt` 弹窗也有相同的写回缺失。三处均已修复并固定控件 ID。
+- 修复切换局域网后侧栏显示多个长 IP 导致左侧变宽/出现粗黑线：侧栏改为单个「局域网 N 个地址」摘要并截断，悬停可看全部地址；滚动条改为非浮动、主内容始终显示，移除了编辑器和文档弹窗内多余的嵌套滚动区域，恢复上下滚动条可拖动。
+- 修复探测/测速的 POST 请求未绕过系统代理的问题：本地模型服务（localhost）现在和 GET 一样使用直连客户端。
+- 全局界面一致性检查：统一复核所有自绘开关、复选框与 `TextEdit` 的状态写回；把编辑器/供应商/路由页残留的原生小按钮换成 `kit` 按钮；更新弹窗移除嵌套滚动区域，进度、错误与回退操作统一使用卡片与状态色。
+- 补充缓存命中 token 的来源：除 OpenAI `prompt_tokens_details.cached_tokens` 与 Anthropic `cache_read_input_tokens` 外，支持 DeepSeek `prompt_cache_hit_tokens`、`cached_tokens` 等兼容字段。
+- 项目规范新增界面交互约定，要求开关点击即生效、文字可点击、验证开关双向状态，避免再次出现“开关关不掉”。
+
 ## [0.4.2] - 2026-10-23
 
 ### 修复

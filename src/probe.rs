@@ -94,10 +94,13 @@ async fn send_probe(
     timeout_secs: u64,
 ) -> ProbeResponse {
     let started = Instant::now();
+    // Both verbs must honour the loopback bypass; local model servers behind
+    // the system proxy used to fail their POST probes.
+    let client = gw.client_for(url);
     let mut req = if method == "GET" {
-        gw.client_for(url).get(url)
+        client.get(url)
     } else {
-        gw.http.post(url)
+        client.post(url)
     };
     req = req.header(reqwest::header::ACCEPT, "application/json");
     if let Some(body) = body {
@@ -220,6 +223,199 @@ fn minimal_url(provider: &Provider, protocol: Protocol) -> String {
         Protocol::OpenAiResponses => "responses",
     };
     provider.join_url(path)
+}
+
+const AI_PRICING_SYSTEM_PROMPT: &str = r#"你是 YoyoRelay 的 LLM API 计费配置助手。根据用户的需求生成一个价格方案。
+只返回一个 JSON 对象，不要 Markdown、不要解释、不要代码围栏。
+
+JSON 结构：
+{
+  "name": "方案名称",
+  "note": "对假设和未提及价格的说明",
+  "currency": "CNY" 或 "USD",
+  "base": {
+    "input_per_mtok": 0,
+    "cached_input_per_mtok": 0,
+    "output_per_mtok": 0
+  },
+  "periods": [
+    {
+      "name": "高峰",
+      "start_hour": 9,
+      "end_hour": 18,
+      "days": [0, 1, 2, 3, 4],
+      "tier": {
+        "input_per_mtok": 0,
+        "cached_input_per_mtok": 0,
+        "output_per_mtok": 0
+      }
+    }
+  ]
+}
+
+规则：
+1. base 是「未命中任何时段」时的默认价，通常就是用户说的低谷/空闲价。periods 只放用户明确说的高峰时段；不要为低谷时间创建时段。
+2. 价格单位统一为「每百万 tokens」。用户说“每千 tokens”时乘以 1000，说“每 token”时乘以 1,000,000。
+3. days 用 0=周一、1=周二……6=周日；空数组表示每天。只提到“工作日”时用 [0,1,2,3,4]。
+4. start_hour 为 0–23，end_hour 为 0–24；end_hour 小于 start_hour 表示跨午夜。整天的时段用 start_hour=end_hour。
+5. 用户明确给出的数字必须原样使用；没有提到的字段填 0，并在 note 中说明。
+6. 如果用户只描述高峰价，没有描述低谷价，base 全部填 0，并在 note 中提示需要补充默认价。
+7. 用户使用“元、¥、人民币”时 currency=CNY，否则 currency=USD。
+8. 方案名称要简短，例如“工作日峰谷价”。"#;
+
+/// Ask the route's upstream model to turn a natural-language pricing request
+/// into the JSON shape consumed by `PricePlan`.
+pub async fn generate_price_plan(
+    gw: &Gateway,
+    provider_id: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<Value, String> {
+    let config = gw.config();
+    let provider = config
+        .provider(provider_id)
+        .cloned()
+        .ok_or_else(|| "供应商不存在".to_string())?;
+    if provider.base_url.starts_with("plugin://") {
+        return Err("临时供应商没有可直接调用的账号，请选择真实上游再生成。".into());
+    }
+    let account = config
+        .accounts
+        .iter()
+        .find(|account| account.provider_id == provider_id && account.enabled)
+        .cloned()
+        .ok_or_else(|| "该供应商没有启用的账号，无法调用 AI。".to_string())?;
+    let key = if account.api_key.trim().is_empty() {
+        String::new()
+    } else {
+        gw.master
+            .decrypt(&account.api_key)
+            .map_err(|err| format!("读取账号 Key 失败：{err}"))?
+    };
+    let protocol = provider.protocol_for(model, None);
+    let body = ai_pricing_body(protocol, model, prompt);
+    let url = minimal_url(&provider, protocol);
+    let timeout = provider.timeout_secs.unwrap_or(120).clamp(30, 300);
+    let response = send_probe(gw, &provider, &key, "POST", &url, Some(&body), timeout).await;
+    if let Some(err) = response.error {
+        return Err(err);
+    }
+    let status = response.status.unwrap_or(0);
+    if !(200..300).contains(&status) {
+        let snippet: String = response.body.chars().take(300).collect();
+        return Err(format!("上游返回 HTTP {status}：{snippet}"));
+    }
+    let text = ai_response_text(protocol, &response.body)?;
+    extract_json_object(&text).ok_or_else(|| {
+        format!(
+            "AI 没有返回有效 JSON：{}",
+            text.chars().take(200).collect::<String>()
+        )
+    })
+}
+
+fn ai_pricing_body(protocol: Protocol, model: &str, prompt: &str) -> Value {
+    match protocol {
+        Protocol::OpenAiChat => json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": AI_PRICING_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 1600,
+            "stream": false
+        }),
+        Protocol::AnthropicMessages => json!({
+            "model": model,
+            "max_tokens": 1600,
+            "system": AI_PRICING_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}]
+        }),
+        Protocol::OpenAiResponses => json!({
+            "model": model,
+            "instructions": AI_PRICING_SYSTEM_PROMPT,
+            "input": prompt,
+            "max_output_tokens": 1600,
+            "stream": false
+        }),
+    }
+}
+
+fn ai_response_text(protocol: Protocol, body: &str) -> Result<String, String> {
+    let value: Value =
+        serde_json::from_str(body).map_err(|err| format!("解析上游响应失败：{err}"))?;
+    let text = match protocol {
+        Protocol::OpenAiChat => value
+            .pointer("/choices/0/message/content")
+            .and_then(|content| {
+                content.as_str().map(str::to_string).or_else(|| {
+                    content.as_array().map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| part.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                })
+            })
+            .unwrap_or_default(),
+        Protocol::AnthropicMessages => value
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default(),
+        Protocol::OpenAiResponses => value
+            .get("output_text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                value.get("output").and_then(Value::as_array).map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("content").and_then(Value::as_array))
+                        .flatten()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+            })
+            .unwrap_or_default(),
+    };
+    if text.trim().is_empty() {
+        return Err(format!(
+            "AI 响应没有文本内容：{}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(text)
+}
+
+fn extract_json_object(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    let without_fence = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|inner| inner.trim_start())
+        .unwrap_or(trimmed)
+        .trim_end_matches("```")
+        .trim();
+    if let Ok(value) = serde_json::from_str::<Value>(without_fence) {
+        return Some(value);
+    }
+    let start = without_fence.find('{')?;
+    let end = without_fence.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(&without_fence[start..=end]).ok()
 }
 
 async fn probe_credentials(
@@ -1966,5 +2162,64 @@ mod speed_probe_tests {
             nonstream_text_chars(Protocol::OpenAiResponses, &responses),
             5
         );
+    }
+}
+
+#[cfg(test)]
+mod ai_pricing_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_json_from_fenced_and_chatty_replies() {
+        let fenced = r#"```json
+{"name":"峰谷","currency":"CNY","base":{"input_per_mtok":1.0}}
+```"#;
+        let value = extract_json_object(fenced).expect("fenced json");
+        assert_eq!(value.get("name").and_then(Value::as_str), Some("峰谷"));
+
+        let chatty = "Here you go:\n{\"name\":\"x\",\"periods\":[]}\nThanks";
+        let value = extract_json_object(chatty).expect("embedded json");
+        assert_eq!(value.get("name").and_then(Value::as_str), Some("x"));
+    }
+
+    #[test]
+    fn reads_text_from_each_protocol_response() {
+        let chat = json!({"choices":[{"message":{"content":"{\"base\":{}}"}}]}).to_string();
+        assert_eq!(
+            ai_response_text(Protocol::OpenAiChat, &chat).unwrap(),
+            "{\"base\":{}}"
+        );
+
+        let anthropic =
+            json!({"content":[{"type":"text","text":"abc"},{"type":"text","text":"de"}]})
+                .to_string();
+        assert_eq!(
+            ai_response_text(Protocol::AnthropicMessages, &anthropic).unwrap(),
+            "abcde"
+        );
+
+        let responses = json!({"output":[{"content":[{"text":"hi"},{"text":"!"}]}]}).to_string();
+        assert_eq!(
+            ai_response_text(Protocol::OpenAiResponses, &responses).unwrap(),
+            "hi!"
+        );
+    }
+
+    #[test]
+    fn builds_protocol_specific_pricing_requests() {
+        let prompt = "工作日 9-18 点高峰";
+        for protocol in [
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+        ] {
+            let body = ai_pricing_body(protocol, "model-x", prompt);
+            assert_eq!(body.get("model").and_then(Value::as_str), Some("model-x"));
+            match protocol {
+                Protocol::OpenAiChat => assert!(body.get("messages").is_some()),
+                Protocol::AnthropicMessages => assert!(body.get("system").is_some()),
+                Protocol::OpenAiResponses => assert!(body.get("instructions").is_some()),
+            }
+        }
     }
 }

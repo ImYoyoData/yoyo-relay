@@ -241,10 +241,20 @@ pub fn usage_from_object(protocol: Protocol, usage: &serde_json::Map<String, Val
             u.input_tokens = num("prompt_tokens");
             u.output_tokens = num("completion_tokens");
             u.total_tokens = num("total_tokens");
+            // OpenAI reports `prompt_tokens_details.cached_tokens`, while
+            // DeepSeek-style gateways use `prompt_cache_hit_tokens` and some
+            // compatible servers use `cached_tokens` directly.
             u.cached_tokens = usage
                 .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|details| {
+                    details
+                        .get("cached_tokens")
+                        .or_else(|| details.get("cache_read_tokens"))
+                })
                 .and_then(Value::as_u64)
+                .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+                .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+                .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64))
                 .unwrap_or(0);
         }
         Protocol::AnthropicMessages => {
@@ -269,8 +279,13 @@ pub fn usage_from_object(protocol: Protocol, usage: &serde_json::Map<String, Val
             u.total_tokens = num("total_tokens");
             u.cached_tokens = usage
                 .get("input_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|details| {
+                    details
+                        .get("cached_tokens")
+                        .or_else(|| details.get("cache_read_tokens"))
+                })
                 .and_then(Value::as_u64)
+                .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64))
                 .unwrap_or(0);
         }
     }
@@ -2619,6 +2634,22 @@ mod tests {
         assert_eq!(usage.input_tokens, 1000);
         assert_eq!(usage.cached_tokens, 800);
         assert_eq!(usage.total(), 1050);
+    }
+
+    #[test]
+    fn extracts_deepseek_style_cache_hits() {
+        let value = json!({
+            "usage": {
+                "prompt_tokens": 1000,
+                "prompt_cache_hit_tokens": 700,
+                "prompt_cache_miss_tokens": 300,
+                "completion_tokens": 10,
+                "total_tokens": 1010
+            }
+        });
+        let usage = extract_nonstream_usage(Protocol::OpenAiChat, &value);
+        assert_eq!(usage.cached_tokens, 700);
+        assert_eq!(usage.input_tokens, 1000);
     }
 
     #[test]
