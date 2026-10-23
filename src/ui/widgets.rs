@@ -17,7 +17,7 @@ pub fn state_color(state: &SchedState) -> Color32 {
         SchedState::Healthy => theme::GREEN,
         SchedState::Cooling { .. } => theme::ORANGE,
         SchedState::HalfOpen => theme::BLUE_INFO,
-        SchedState::Exhausted { .. } => theme::RED,
+        SchedState::Exhausted { .. } | SchedState::QuotaBlocked { .. } => theme::RED,
         SchedState::Disabled => theme::MUTED,
     }
 }
@@ -38,6 +38,9 @@ pub fn state_text(state: &SchedState, now: i64) -> String {
         SchedState::Exhausted { reset_at } => {
             format!("额度用尽 · {} 后重置", fmt_duration_secs(reset_at - now))
         }
+        SchedState::QuotaBlocked { reset_at } => {
+            format!("额度不可用 · {} 后重置", fmt_duration_secs(reset_at - now))
+        }
         SchedState::Disabled => "已禁用".into(),
     }
 }
@@ -49,6 +52,9 @@ pub fn state_short(state: &SchedState, now: i64) -> String {
         SchedState::HalfOpen => "探测中".into(),
         SchedState::Exhausted { reset_at } => {
             format!("额度用尽 {}", fmt_duration_secs(reset_at - now))
+        }
+        SchedState::QuotaBlocked { reset_at } => {
+            format!("额度不可用 {}", fmt_duration_secs(reset_at - now))
         }
         SchedState::Disabled => "已禁用".into(),
     }

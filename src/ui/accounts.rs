@@ -58,7 +58,12 @@ impl App {
             .snapshot
             .accounts
             .iter()
-            .filter(|a| matches!(a.state, AccountState::Exhausted { .. }))
+            .filter(|a| {
+                matches!(
+                    a.state,
+                    AccountState::Exhausted { .. } | AccountState::QuotaBlocked { .. }
+                )
+            })
             .count();
         super::kit::soft_panel(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -418,7 +423,9 @@ fn state_icon(state: &AccountState) -> &'static str {
         AccountState::Healthy => icons::CHECK_CIRCLE,
         AccountState::Cooling { .. } => icons::CLOCK_COUNTER_CLOCKWISE,
         AccountState::HalfOpen => icons::PULSE,
-        AccountState::Exhausted { .. } => icons::HOURGLASS_MEDIUM,
+        AccountState::Exhausted { .. } | AccountState::QuotaBlocked { .. } => {
+            icons::HOURGLASS_MEDIUM
+        }
         AccountState::Disabled => icons::PROHIBIT,
     }
 }

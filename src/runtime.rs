@@ -1610,7 +1610,9 @@ impl Runtime {
                     Some(SchedState::Healthy) => healthy += 1,
                     Some(SchedState::Cooling { .. }) => cooling += 1,
                     Some(SchedState::HalfOpen) => half_open += 1,
-                    Some(SchedState::Exhausted { .. }) => exhausted += 1,
+                    Some(SchedState::Exhausted { .. }) | Some(SchedState::QuotaBlocked { .. }) => {
+                        exhausted += 1
+                    }
                     Some(SchedState::Disabled) | None => disabled += 1,
                 }
                 if let Some(view) = view {
@@ -1623,6 +1625,22 @@ impl Runtime {
                         .get(&account.id)
                         .and_then(|row| serde_json::from_str(&row.quota_json).ok())
                         .unwrap_or_default();
+                    let quota_windows =
+                        quota_windows_for(self.db.as_ref(), &cfg, &account, &api_windows);
+                    // Any exhausted window keeps the account out of rotation
+                    // until its own reset time. The scheduler clears the block
+                    // automatically when the timestamp passes.
+                    let block_until = quota_windows
+                        .iter()
+                        .filter(|window| {
+                            window.limit > 0.0
+                                && window.used >= window.limit
+                                && window.reset_at > now
+                        })
+                        .map(|window| window.reset_at)
+                        .max()
+                        .unwrap_or(0);
+                    self.scheduler.set_quota_block(&account.id, block_until);
                     balances.push(BalanceView {
                         account_id: account.id.clone(),
                         provider_id: provider.id.clone(),
@@ -1641,12 +1659,7 @@ impl Runtime {
                         } else {
                             "上游额度接口返回".into()
                         },
-                        quota_windows: quota_windows_for(
-                            self.db.as_ref(),
-                            &cfg,
-                            &account,
-                            &api_windows,
-                        ),
+                        quota_windows,
                     });
                 }
             }

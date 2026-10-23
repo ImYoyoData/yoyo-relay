@@ -24,6 +24,11 @@ pub enum AccountState {
     Exhausted {
         reset_at: i64,
     },
+    /// A subscription quota window (5h / weekly / monthly) is exhausted.
+    /// The account becomes available again automatically at `reset_at`.
+    QuotaBlocked {
+        reset_at: i64,
+    },
     Disabled,
 }
 
@@ -34,6 +39,7 @@ impl AccountState {
             AccountState::Cooling { .. } => "冷却中",
             AccountState::HalfOpen => "探测中",
             AccountState::Exhausted { .. } => "额度用尽",
+            AccountState::QuotaBlocked { .. } => "额度不可用",
             AccountState::Disabled => "已禁用",
         }
     }
@@ -63,6 +69,9 @@ pub struct AccountRuntime {
     pub inflight: AtomicUsize,
     quota: Mutex<QuotaCache>,
     probe: Mutex<ProbeState>,
+    /// Unix timestamp until which a subscription quota window keeps this
+    /// account out of scheduling.
+    quota_block_until: AtomicI64,
 }
 
 impl AccountRuntime {
@@ -73,7 +82,16 @@ impl AccountRuntime {
             inflight: AtomicUsize::new(0),
             quota: Mutex::new(QuotaCache::default()),
             probe: Mutex::new(ProbeState::default()),
+            quota_block_until: AtomicI64::new(0),
         }
+    }
+
+    pub fn set_quota_block(&self, until: i64) {
+        self.quota_block_until.store(until.max(0), Ordering::SeqCst);
+    }
+
+    fn quota_block_until(&self) -> i64 {
+        self.quota_block_until.load(Ordering::SeqCst)
     }
 
     pub fn state(&self) -> AccountState {
@@ -399,6 +417,20 @@ impl Scheduler {
 
     fn normalize_state(&self, rt: &AccountRuntime, account: &Account, now: i64) {
         let mut state = rt.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !account.enabled {
+            *state = AccountState::Disabled;
+            return;
+        }
+        let quota_until = rt.quota_block_until();
+        if quota_until > now {
+            *state = AccountState::QuotaBlocked {
+                reset_at: quota_until,
+            };
+            return;
+        }
+        if quota_until > 0 {
+            rt.set_quota_block(0);
+        }
         match &*state {
             AccountState::Cooling { until, .. } if now >= *until => {
                 *state = AccountState::HalfOpen;
@@ -406,13 +438,13 @@ impl Scheduler {
             AccountState::Exhausted { reset_at } if now >= *reset_at => {
                 *state = AccountState::Healthy;
             }
-            AccountState::Disabled if account.enabled => {
+            AccountState::QuotaBlocked { .. } => {
+                *state = AccountState::Healthy;
+            }
+            AccountState::Disabled => {
                 *state = AccountState::Healthy;
             }
             _ => {}
-        }
-        if !account.enabled {
-            *state = AccountState::Disabled;
         }
     }
 
@@ -420,6 +452,12 @@ impl Scheduler {
         let rt = self.runtime_for(&account.id);
         self.normalize_state(&rt, account, now);
         rt.state()
+    }
+
+    /// Block an account until a subscription quota window resets. Passing 0
+    /// clears the block. The scheduler re-checks this on every chain build.
+    pub fn set_quota_block(&self, account_id: &str, until: i64) {
+        self.runtime_for(account_id).set_quota_block(until);
     }
 
     pub fn inflight_of(&self, account_id: &str) -> usize {
@@ -1109,5 +1147,18 @@ mod tests {
             s.state_of(&account, now),
             AccountState::Exhausted { .. }
         ));
+    }
+
+    #[test]
+    fn quota_block_hides_account_until_reset() {
+        let (s, cfg, account_id, _) = setup();
+        let account = cfg.account(&account_id).unwrap().clone();
+        let now = Local::now().timestamp();
+        s.set_quota_block(&account_id, now + 60);
+        assert!(matches!(
+            s.state_of(&account, now),
+            AccountState::QuotaBlocked { .. }
+        ));
+        assert_eq!(s.state_of(&account, now + 61), AccountState::Healthy);
     }
 }
