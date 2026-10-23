@@ -387,6 +387,30 @@ impl App {
                             );
                         });
                     });
+                let lan_endpoints: Vec<_> = self
+                    .snapshot
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.lan)
+                    .cloned()
+                    .collect();
+                for view in &lan_endpoints {
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        super::kit::badge(ui, &view.label, theme::BLUE_INFO);
+                        ui.label(
+                            RichText::new(&view.url)
+                                .monospace()
+                                .size(10.0)
+                                .color(theme::text(ui)),
+                        );
+                        if super::kit::icon_button(ui, icons::COPY, "复制局域网端点").clicked()
+                        {
+                            ui.ctx().copy_text(view.url.clone());
+                            self.toast(crate::snapshot::NoticeLevel::Success, "局域网端点已复制");
+                        }
+                    });
+                }
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(

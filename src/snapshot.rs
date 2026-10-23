@@ -88,6 +88,15 @@ pub struct Alert {
     pub text: String,
 }
 
+/// One client-facing base URL, local or LAN.
+#[derive(Clone, Debug)]
+pub struct EndpointView {
+    pub label: String,
+    pub url: String,
+    /// True for addresses other devices can reach.
+    pub lan: bool,
+}
+
 /// Cached release lookup result shown in the title bar and update modal.
 #[derive(Clone, Debug, Default)]
 pub struct UpdateView {
@@ -308,6 +317,10 @@ pub struct FetchedModelView {
 pub struct UiSnapshot {
     pub proxy: ProxyStatus,
     pub endpoint: String,
+    /// Local plus LAN base URLs. The first entry is always loopback.
+    pub endpoints: Vec<EndpointView>,
+    /// The listener is bound to all interfaces (0.0.0.0 / ::).
+    pub lan_enabled: bool,
     pub uptime_secs: i64,
     pub client_models: Vec<String>,
     pub today: TodayView,
@@ -352,6 +365,8 @@ impl Default for UiSnapshot {
         Self {
             proxy: ProxyStatus::Stopped,
             endpoint: String::new(),
+            endpoints: Vec::new(),
+            lan_enabled: false,
             uptime_secs: 0,
             client_models: Vec::new(),
             today: TodayView::default(),

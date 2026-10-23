@@ -2169,6 +2169,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5356,7 +5366,7 @@ dependencies = [
 
 [[package]]
 name = "yoyo-relay"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -5375,6 +5385,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "hmac",
+ "if-addrs",
  "rand 0.8.8",
  "raw-window-handle",
  "reqwest",
