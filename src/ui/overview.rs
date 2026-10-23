@@ -630,7 +630,7 @@ impl App {
 
     fn alert_card(&mut self, ui: &mut egui::Ui) {
         let alert_count = self.snapshot.alerts.len();
-        let rows: Vec<_> = self.snapshot.alerts.iter().take(4).cloned().collect();
+        let rows: Vec<_> = self.snapshot.alerts.iter().take(1).cloned().collect();
         let healthy: usize = self
             .snapshot
             .providers
@@ -711,40 +711,70 @@ impl App {
                                 });
                             });
                         });
-                } else {
-                    for alert in &rows {
-                        let (color, icon) = match alert.level {
-                            AlertLevel::Info => (theme::BLUE_INFO, icons::INFO),
-                            AlertLevel::Warning => (theme::ORANGE, icons::WARNING),
-                            AlertLevel::Critical => (theme::RED, icons::WARNING_OCTAGON),
-                        };
-                        egui::Frame::new()
-                            .fill(theme::soft_for(ui, color))
-                            .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.28)))
-                            .corner_radius(10)
-                            .inner_margin(egui::Margin::symmetric(11, 9))
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.set_min_height(34.0);
-                                ui.horizontal_top(|ui| {
-                                    ui.label(RichText::new(icon).size(14.0).color(color));
-                                    ui.add_space(2.0);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&alert.text).size(10.8).color(t.text),
-                                        )
-                                        .wrap(),
-                                    );
+                } else if let Some(alert) = rows.first() {
+                    let (color, icon) = match alert.level {
+                        AlertLevel::Info => (theme::BLUE_INFO, icons::INFO),
+                        AlertLevel::Warning => (theme::ORANGE, icons::WARNING),
+                        AlertLevel::Critical => (theme::RED, icons::WARNING_OCTAGON),
+                    };
+                    let inner = ui
+                        .scope(|ui| {
+                            egui::Frame::new()
+                                .fill(theme::soft_for(ui, color))
+                                .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.28)))
+                                .corner_radius(10)
+                                .inner_margin(egui::Margin::symmetric(11, 9))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.set_min_height(34.0);
+                                    ui.horizontal_top(|ui| {
+                                        ui.label(RichText::new(icon).size(14.0).color(color));
+                                        ui.add_space(2.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&alert.text).size(10.8).color(t.text),
+                                            )
+                                            .wrap(),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Min),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(icons::ARROW_RIGHT)
+                                                        .size(11.0)
+                                                        .color(color),
+                                                );
+                                            },
+                                        );
+                                    });
                                 });
-                            });
-                        ui.add_space(5.0);
+                        })
+                        .response;
+                    let click = ui.interact(
+                        inner.rect,
+                        egui::Id::new("overview_latest_alert"),
+                        egui::Sense::click(),
+                    );
+                    if click.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    if alert_count > rows.len() {
-                        ui.label(
-                            RichText::new(format!("另有 {} 项见设置页", alert_count - rows.len()))
-                                .size(10.0)
-                                .color(t.muted),
-                        );
+                    if click.clicked() {
+                        self.alerts_open = true;
+                    }
+                    ui.add_space(5.0);
+                    if alert_count > 1 {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("共 {alert_count} 项告警"))
+                                    .size(9.5)
+                                    .color(t.muted),
+                            );
+                            if super::kit::ghost_labeled(ui, icons::ARROW_RIGHT, "查看全部")
+                                .clicked()
+                            {
+                                self.alerts_open = true;
+                            }
+                        });
                     }
                 }
 

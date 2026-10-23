@@ -349,6 +349,8 @@ pub struct App {
     pub(crate) close_hide_to_tray: bool,
     /// Runtime status modal opened from the title-bar status pill.
     pub(crate) proxy_status_open: bool,
+    /// All-alerts modal opened from the overview alert card.
+    pub(crate) alerts_open: bool,
     pub(crate) closing: bool,
     pub(crate) last_zoom: f32,
     pub(crate) signals: Arc<crate::instance::Signals>,
@@ -452,6 +454,7 @@ impl App {
             close_confirm_open: false,
             close_hide_to_tray: true,
             proxy_status_open: false,
+            alerts_open: false,
             closing: false,
             last_zoom: 1.0,
             signals,
@@ -769,6 +772,8 @@ impl App {
                 self.close_confirm_open = false;
             } else if self.proxy_status_open {
                 self.proxy_status_open = false;
+            } else if self.alerts_open {
+                self.alerts_open = false;
             } else if self.editor.is_some() {
                 self.editor = None;
             } else if self.confirm.is_some() {
@@ -1929,6 +1934,7 @@ impl eframe::App for App {
         self.show_currency_error(ctx);
         self.show_close_confirm(ctx);
         self.show_proxy_status_modal(ctx);
+        self.show_alerts_modal(ctx);
         self.show_confirm(ctx);
         self.show_test_modal(ctx);
         self.show_onboarding(ctx);

@@ -1130,6 +1130,67 @@ impl App {
         }
     }
 
+    pub(crate) fn show_alerts_modal(&mut self, ctx: &egui::Context) {
+        if !self.alerts_open {
+            return;
+        }
+        let alerts = self.snapshot.alerts.clone();
+        let mut close = false;
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_alerts"),
+            "系统告警",
+            &format!("共 {} 项 · 按严重程度汇总", alerts.len()),
+            680.0,
+            |ui| {
+                if alerts.is_empty() {
+                    super::kit::info_row(ui, icons::CHECK_CIRCLE, "当前没有需要处理的告警。");
+                    return;
+                }
+                super::kit::scroll_capped(ui, "alerts_modal_scroll", 420.0, false, |ui| {
+                    for alert in &alerts {
+                        let (color, icon) = match alert.level {
+                            crate::snapshot::AlertLevel::Info => (theme::BLUE_INFO, icons::INFO),
+                            crate::snapshot::AlertLevel::Warning => (theme::ORANGE, icons::WARNING),
+                            crate::snapshot::AlertLevel::Critical => {
+                                (theme::RED, icons::WARNING_OCTAGON)
+                            }
+                        };
+                        egui::Frame::new()
+                            .fill(theme::soft_for(ui, color))
+                            .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.28)))
+                            .corner_radius(10)
+                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal_top(|ui| {
+                                    ui.label(RichText::new(icon).size(15.0).color(color));
+                                    ui.add_space(3.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&alert.text)
+                                                .size(11.0)
+                                                .color(theme::text(ui)),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                            });
+                        ui.add_space(6.0);
+                    }
+                });
+            },
+            |ui| {
+                if super::kit::secondary_button(ui, "", "关闭").clicked() {
+                    close = true;
+                }
+            },
+        );
+        if closed || close {
+            self.alerts_open = false;
+        }
+    }
+
     fn confirm_text(&self, action: &ConfirmAction) -> (&'static str, String, bool, &'static str) {
         match action {
             ConfirmAction::DeleteProvider(id) => {
