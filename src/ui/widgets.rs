@@ -214,6 +214,25 @@ pub fn format_time(ts: i64) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+/// Absolute call time: `14:22:31` today, `23日 14:22:31` this month,
+/// `10月23日 14:22:31` this year, full date otherwise.
+pub fn format_call_time(ts: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    let Some(datetime) = Local.timestamp_opt(ts, 0).single() else {
+        return "—".to_string();
+    };
+    let now = Local::now();
+    if datetime.date_naive() == now.date_naive() {
+        datetime.format("%H:%M:%S").to_string()
+    } else if datetime.year() == now.year() && datetime.month() == now.month() {
+        datetime.format("%d日 %H:%M:%S").to_string()
+    } else if datetime.year() == now.year() {
+        datetime.format("%m月%d日 %H:%M:%S").to_string()
+    } else {
+        datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+}
+
 pub fn time_ago(ts: i64, now: i64) -> String {
     let diff = now - ts;
     if diff < 5 {
@@ -236,4 +255,22 @@ pub fn format_day(ts: i64) -> String {
         .single()
         .map(|d| d.format("%m-%d").to_string())
         .unwrap_or_else(|| "—".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn formats_absolute_call_times() {
+        let today = format_call_time(crate::config::now_ts());
+        assert_eq!(today.len(), 8, "today should be HH:MM:SS: {today}");
+        let old = chrono::Local
+            .with_ymd_and_hms(2020, 1, 2, 3, 4, 5)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(format_call_time(old), "2020-01-02 03:04:05");
+    }
 }

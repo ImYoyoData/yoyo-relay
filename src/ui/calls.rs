@@ -138,7 +138,6 @@ impl App {
         }
 
         let mut delete: Option<i64> = None;
-        let now = crate::config::now_ts();
         for row in &calls.rows {
             let status_color = if row.cancelled {
                 theme::ORANGE
@@ -172,7 +171,7 @@ impl App {
                     ui.horizontal(|ui| {
                         kit::status_badge(ui, status_text, status_color);
                         ui.label(
-                            RichText::new(widgets::format_time(row.ts))
+                            RichText::new(widgets::format_call_time(row.ts))
                                 .monospace()
                                 .size(9.5)
                                 .color(theme::muted(ui)),
@@ -211,14 +210,9 @@ impl App {
                                     .color(theme::ORANGE),
                             );
                             ui.label(
-                                RichText::new(format!("{} ms", row.latency_ms))
+                                RichText::new(format!("{:.2} s", row.latency_ms as f64 / 1000.0))
                                     .monospace()
                                     .size(9.5)
-                                    .color(theme::muted(ui)),
-                            );
-                            ui.label(
-                                RichText::new(widgets::time_ago(row.ts, now))
-                                    .size(9.0)
                                     .color(theme::muted(ui)),
                             );
                         });
@@ -288,5 +282,11 @@ impl App {
         if let Some(page) = goto {
             let _ = self.cmd_tx.send(UiCommand::SetCallsPage(page));
         }
+        ui.add_space(6.0);
+        super::kit::info_row(
+            ui,
+            icons::INFO,
+            "缓存命中来自上游返回的 usage；上游未上报该字段时显示 0。耗时统一换算为秒并保留两位小数。",
+        );
     }
 }

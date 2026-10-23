@@ -1,8 +1,9 @@
-//! GitHub release lookup for the update indicator.
+//! GitHub release lookup and self-update asset selection.
 //!
-//! Release metadata is fetched from the public GitHub API. The app never
-//! downloads or executes an installer itself; "立即更新" opens the release
-//! page so the user stays in control of what runs on their machine.
+//! Release metadata is fetched from the public GitHub API. "立即更新" downloads
+//! the matching release archive, verifies its size/digest, replaces the
+//! running executable and restarts it. A failed install leaves the original
+//! executable untouched and falls back to the release page.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -15,6 +16,34 @@ pub struct ReleaseInfo {
     pub version: String,
     pub url: String,
     pub notes: String,
+    pub assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReleaseAsset {
+    pub name: String,
+    pub url: String,
+    pub size: u64,
+    /// `sha256:<hex>` when GitHub provides a digest for the asset.
+    pub digest: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveKind {
+    Zip,
+    TarGz,
+}
+
+impl ReleaseAsset {
+    pub fn archive_kind(&self) -> Option<ArchiveKind> {
+        if self.name.ends_with(".zip") {
+            Some(ArchiveKind::Zip)
+        } else if self.name.ends_with(".tar.gz") {
+            Some(ArchiveKind::TarGz)
+        } else {
+            None
+        }
+    }
 }
 
 pub async fn fetch_latest_release(client: &reqwest::Client) -> Result<ReleaseInfo> {
@@ -41,6 +70,34 @@ pub async fn fetch_latest_release(client: &reqwest::Client) -> Result<ReleaseInf
     if version.is_empty() {
         return Err(anyhow!("Release 缺少版本标签"));
     }
+    let assets = value
+        .get("assets")
+        .and_then(Value::as_array)
+        .map(|assets| {
+            assets
+                .iter()
+                .filter_map(|asset| {
+                    let name = asset.get("name").and_then(Value::as_str)?.to_string();
+                    let url = asset
+                        .get("browser_download_url")
+                        .and_then(Value::as_str)?
+                        .to_string();
+                    let size = asset.get("size").and_then(Value::as_u64).unwrap_or(0);
+                    let digest = asset
+                        .get("digest")
+                        .and_then(Value::as_str)
+                        .filter(|digest| digest.starts_with("sha256:"))
+                        .map(str::to_string);
+                    Some(ReleaseAsset {
+                        name,
+                        url,
+                        size,
+                        digest,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(ReleaseInfo {
         version,
         url: value
@@ -53,7 +110,51 @@ pub async fn fetch_latest_release(client: &reqwest::Client) -> Result<ReleaseInf
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        assets,
     })
+}
+
+/// Pick the non-UPX archive for the running platform. UPX builds are only a
+/// fallback when a plain build is missing.
+pub fn select_asset(assets: &[ReleaseAsset]) -> Option<&ReleaseAsset> {
+    select_asset_for(
+        assets,
+        if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "linux"
+        },
+        if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        },
+    )
+}
+
+pub fn select_asset_for<'a>(
+    assets: &'a [ReleaseAsset],
+    os: &str,
+    arch: &str,
+) -> Option<&'a ReleaseAsset> {
+    let platform = match (os, arch) {
+        ("windows", "x86_64" | "aarch64") => "windows-x64",
+        ("linux", "x86_64") => "linux-x64",
+        ("macos", "aarch64") => "macos-arm64",
+        ("macos", "x86_64") => "macos-x64",
+        _ => return None,
+    };
+    let candidates: Vec<&ReleaseAsset> = assets
+        .iter()
+        .filter(|asset| asset.name.contains(platform) && asset.archive_kind().is_some())
+        .collect();
+    candidates
+        .iter()
+        .copied()
+        .find(|asset| !asset.name.contains("-upx"))
+        .or_else(|| candidates.first().copied())
 }
 
 pub fn normalize_version(value: &str) -> String {
@@ -103,5 +204,54 @@ mod tests {
         assert!(!is_newer("0.2.0", "0.2.0"));
         assert!(!is_newer("0.1.9", "0.2.0"));
         assert!(is_newer("1.0.0-rc1", "0.9.9"));
+    }
+
+    fn asset(name: &str) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.into(),
+            url: format!("https://example.com/{name}"),
+            size: 10,
+            digest: None,
+        }
+    }
+
+    #[test]
+    fn selects_plain_platform_archive_before_upx() {
+        let assets = vec![
+            asset("yoyo-relay-v0.5.0-windows-x64-upx.zip"),
+            asset("yoyo-relay-v0.5.0-windows-x64.zip"),
+            asset("yoyo-relay-v0.5.0-linux-x64.tar.gz"),
+            asset("yoyo-relay-v0.5.0-macos-arm64.tar.gz"),
+            asset("yoyo-relay-v0.5.0-macos-x64.tar.gz"),
+        ];
+        assert_eq!(
+            select_asset_for(&assets, "windows", "x86_64").unwrap().name,
+            "yoyo-relay-v0.5.0-windows-x64.zip"
+        );
+        assert_eq!(
+            select_asset_for(&assets, "linux", "x86_64").unwrap().name,
+            "yoyo-relay-v0.5.0-linux-x64.tar.gz"
+        );
+        assert_eq!(
+            select_asset_for(&assets, "macos", "aarch64").unwrap().name,
+            "yoyo-relay-v0.5.0-macos-arm64.tar.gz"
+        );
+        assert_eq!(
+            select_asset_for(&assets, "macos", "x86_64").unwrap().name,
+            "yoyo-relay-v0.5.0-macos-x64.tar.gz"
+        );
+    }
+
+    #[test]
+    fn recognizes_archive_types() {
+        assert_eq!(
+            asset("x-windows-x64.zip").archive_kind(),
+            Some(ArchiveKind::Zip)
+        );
+        assert_eq!(
+            asset("x-linux-x64.tar.gz").archive_kind(),
+            Some(ArchiveKind::TarGz)
+        );
+        assert_eq!(asset("x.txt").archive_kind(), None);
     }
 }

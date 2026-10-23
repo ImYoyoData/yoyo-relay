@@ -109,6 +109,12 @@ pub struct UpdateView {
     pub dismissed: bool,
     pub checking: bool,
     pub error: Option<String>,
+    /// Self-update download/install progress.
+    pub installing: bool,
+    pub progress: f32,
+    pub install_message: String,
+    pub install_error: Option<String>,
+    pub restart_pending: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -294,6 +300,34 @@ pub struct ProviderModelsView {
     pub at: i64,
 }
 
+/// Provider contributed by a running (or discovered) plugin. These are never
+/// written to the user's config; the UI shows them with a "临时" badge and the
+/// route editor can select them.
+#[derive(Clone, Debug, Default)]
+pub struct TemporaryProvider {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub protocol: String,
+    pub models: Vec<String>,
+    pub streaming: bool,
+    pub running: bool,
+}
+
+/// Result of a natural-language price-plan generation. The UI only applies a
+/// plan to the route that requested it.
+#[derive(Clone, Debug, Default)]
+pub struct AiPricingView {
+    pub route_id: String,
+    /// Monotonic request id; stale background results are ignored.
+    pub token: u64,
+    pub running: bool,
+    pub plan: Option<crate::config::PricePlan>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FetchedModelView {
     pub id: u64,
@@ -332,6 +366,11 @@ pub struct UiSnapshot {
     pub update: UpdateView,
     pub plugins: Vec<PluginInfo>,
     pub plugin_ui: Option<PluginUiRequest>,
+    pub plugin_console: Option<crate::plugins::PluginConsoleView>,
+    /// GitHub contributors, loaded on demand by the About page.
+    pub contributors: Vec<crate::contributors::Contributor>,
+    pub contributors_loading: bool,
+    pub contributors_error: Option<String>,
     pub plugin_settings: crate::config::PluginSettings,
     pub providers: Vec<ProviderHealth>,
     pub accounts: Vec<AccountView>,
@@ -349,6 +388,8 @@ pub struct UiSnapshot {
     pub balance_refreshing: bool,
     pub fetched_model: Option<FetchedModelView>,
     pub model_fetch_running: bool,
+    /// Background natural-language pricing generation.
+    pub ai_pricing: Option<AiPricingView>,
     /// Latest `/models` catalogue per provider id.
     pub provider_models: HashMap<String, ProviderModelsView>,
     pub models_fetching: HashSet<String>,
@@ -382,6 +423,10 @@ impl Default for UiSnapshot {
             update: UpdateView::default(),
             plugins: Vec::new(),
             plugin_ui: None,
+            plugin_console: None,
+            contributors: Vec::new(),
+            contributors_loading: false,
+            contributors_error: None,
             plugin_settings: crate::config::PluginSettings::default(),
             providers: Vec::new(),
             accounts: Vec::new(),
@@ -399,6 +444,7 @@ impl Default for UiSnapshot {
             balance_refreshing: false,
             fetched_model: None,
             model_fetch_running: false,
+            ai_pricing: None,
             provider_models: HashMap::new(),
             models_fetching: HashSet::new(),
             fx_rates: BTreeMap::new(),
@@ -417,5 +463,34 @@ impl UiSnapshot {
 
     pub fn provider(&self, id: &str) -> Option<&ProviderHealth> {
         self.providers.iter().find(|p| p.id == id)
+    }
+
+    /// Providers injected by plugins. The id mirrors
+    /// `plugin:<plugin-id>:<provider-index>` from the plugin host.
+    pub fn temporary_providers(&self) -> Vec<TemporaryProvider> {
+        let mut out = Vec::new();
+        for plugin in &self.plugins {
+            for (index, spec) in plugin.providers.iter().enumerate() {
+                if spec.models.is_empty() {
+                    continue;
+                }
+                out.push(TemporaryProvider {
+                    id: format!("plugin:{}:{index}", plugin.id),
+                    name: if spec.name.trim().is_empty() {
+                        format!("{} · 插件供应商", plugin.name)
+                    } else {
+                        spec.name.clone()
+                    },
+                    description: spec.description.clone(),
+                    plugin_id: plugin.id.clone(),
+                    plugin_name: plugin.name.clone(),
+                    protocol: spec.protocol.clone(),
+                    models: spec.models.clone(),
+                    streaming: spec.streaming,
+                    running: plugin.status == crate::plugins::PluginStatus::Running,
+                });
+            }
+        }
+        out
     }
 }

@@ -9,7 +9,7 @@
 pub mod docs;
 mod worker;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -19,15 +19,49 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::config::PluginSettings;
+use crate::config::{
+    now_ts, Account, BalanceConfig, BalanceMode, ModelRoute, PluginSettings, Protocol, Provider,
+    ProviderKind, RouteMode,
+};
 use crate::snapshot::NoticeLevel;
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_LOGS: usize = 200;
+pub const MAX_LOGS: usize = 500;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+/// A provider a plugin offers to the relay. The relay creates a temporary
+/// provider, a virtual account and one route per advertised model.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct PluginProviderSpec {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// `openai-chat` (default), `anthropic-messages` or `openai-responses`.
+    pub protocol: String,
+    /// Client model names served by this provider.
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub priority: i32,
+    /// Whether `onProviderRequest` emits SSE frames for streaming clients.
+    pub streaming: bool,
+}
+
+impl Default for PluginProviderSpec {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            protocol: "openai-chat".to_string(),
+            models: Vec::new(),
+            priority: 0,
+            streaming: true,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -94,8 +128,12 @@ pub struct PluginInfo {
     pub enabled: bool,
     /// Event names the module actually exported.
     pub events: Vec<String>,
+    /// Providers advertised by the module's `providers` export.
+    pub providers: Vec<PluginProviderSpec>,
     pub last_error: Option<String>,
-    pub logs: VecDeque<PluginLog>,
+    /// Number of buffered log lines; the lines themselves live in
+    /// `Shared::logs` and are only copied when a console is open.
+    pub log_count: usize,
     pub calls: u64,
     pub loaded_at: i64,
 }
@@ -128,8 +166,9 @@ impl PluginInfo {
             status: PluginStatus::Stopped,
             enabled: true,
             events: manifest.events.clone(),
+            providers: Vec::new(),
             last_error: None,
-            logs: VecDeque::new(),
+            log_count: 0,
             calls: 0,
             loaded_at: 0,
         }
@@ -140,6 +179,14 @@ impl PluginInfo {
 pub enum PluginUiKind {
     Confirm,
     Prompt,
+    Alert,
+}
+
+#[derive(Clone, Debug)]
+pub struct PluginConsoleView {
+    pub id: String,
+    pub name: String,
+    pub logs: Vec<PluginLog>,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +226,19 @@ pub(crate) struct WorkerMeta {
     pub version: String,
     pub description: String,
     pub events: Vec<String>,
+    pub providers: Vec<PluginProviderSpec>,
+}
+
+/// Runtime-only providers contributed by running plugins. They are merged into
+/// the gateway's effective config and never written to the user's config file.
+#[derive(Clone, Debug, Default)]
+pub struct DynamicEntries {
+    pub providers: Vec<Provider>,
+    pub accounts: Vec<Account>,
+    pub routes: Vec<ModelRoute>,
+    pub provider_plugins: HashMap<String, String>,
+    /// Provider ids whose plugin handler emits SSE frames.
+    pub streaming: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -202,6 +262,17 @@ pub(crate) enum WorkerCommand {
         payload: Value,
         reply: Option<oneshot::Sender<Result<Option<Value>, String>>>,
     },
+    /// Deliver one model request to the plugin's `onProviderRequest` handler.
+    ProviderRequest {
+        payload: Value,
+        stream: bool,
+        /// Present for streaming requests; the worker forwards raw SSE bytes.
+        chunks: Option<mpsc::UnboundedSender<Result<bytes::Bytes, String>>>,
+        /// Fires as soon as the worker confirms the handler exists.
+        start: Option<oneshot::Sender<bool>>,
+        /// Present for non-streaming requests.
+        reply: Option<oneshot::Sender<Result<Option<Value>, String>>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -214,8 +285,14 @@ struct WorkerHandle {
 
 pub(crate) struct Shared {
     infos: Mutex<BTreeMap<String, PluginInfo>>,
+    /// Per-plugin log ring buffers (newest `MAX_LOGS` lines).
+    logs: Mutex<BTreeMap<String, VecDeque<PluginLog>>>,
+    /// Plugin whose console is currently open; only then are logs copied into
+    /// the snapshot.
+    console_target: Mutex<Option<String>>,
     ui: Mutex<UiQueue>,
     notices: Mutex<VecDeque<(NoticeLevel, String)>>,
+    dynamic_version: AtomicU64,
 }
 
 struct UiQueue {
@@ -227,28 +304,62 @@ impl Shared {
     fn new() -> Self {
         Self {
             infos: Mutex::new(BTreeMap::new()),
+            logs: Mutex::new(BTreeMap::new()),
+            console_target: Mutex::new(None),
             ui: Mutex::new(UiQueue {
                 next_id: AtomicU64::new(1),
                 pending: BTreeMap::new(),
             }),
             notices: Mutex::new(VecDeque::new()),
+            dynamic_version: AtomicU64::new(1),
         }
     }
 
+    fn bump_dynamic(&self) {
+        self.dynamic_version.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub(crate) fn log(&self, plugin_id: &str, level: &str, message: impl Into<String>) {
-        let mut infos = self.infos.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(info) = infos.get_mut(plugin_id) {
-            info.logs.push_back(PluginLog {
+        let message = message.into();
+        let (count, last) = {
+            let mut logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = logs.entry(plugin_id.to_string()).or_default();
+            entry.push_back(PluginLog {
                 at: crate::config::now_ts(),
                 level: level.to_string(),
-                message: message.into(),
+                message: message.clone(),
             });
-            while info.logs.len() > MAX_LOGS {
-                info.logs.pop_front();
+            while entry.len() > MAX_LOGS {
+                entry.pop_front();
             }
+            (entry.len(), entry.back().map(|log| log.message.clone()))
+        };
+        let mut infos = self.infos.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(info) = infos.get_mut(plugin_id) {
+            info.log_count = count;
             if level == "error" {
-                info.last_error = info.logs.back().map(|log| log.message.clone());
+                info.last_error = last;
             }
+        }
+    }
+
+    fn log_snapshot(&self, plugin_id: &str) -> Vec<PluginLog> {
+        self.logs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(plugin_id)
+            .map(|logs| logs.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn clear_logs(&self, plugin_id: &str) {
+        self.logs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(plugin_id);
+        let mut infos = self.infos.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(info) = infos.get_mut(plugin_id) {
+            info.log_count = 0;
         }
     }
 
@@ -369,6 +480,8 @@ impl PluginHost {
                 info.status = PluginStatus::Stopped;
             }
         }
+        drop(infos);
+        self.shared.bump_dynamic();
     }
 
     pub fn settings(&self) -> PluginSettings {
@@ -383,6 +496,136 @@ impl PluginHost {
         let mut views: Vec<_> = infos.values().cloned().collect();
         views.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         views
+    }
+
+    /// Build temporary providers/accounts/routes for every running plugin.
+    pub fn dynamic_version(&self) -> u64 {
+        self.shared.dynamic_version.load(Ordering::SeqCst)
+    }
+
+    pub fn dynamic_entries(&self) -> DynamicEntries {
+        let infos = self.shared.infos.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = DynamicEntries::default();
+        for info in infos.values() {
+            if info.status != PluginStatus::Running {
+                continue;
+            }
+            for (index, spec) in info.providers.iter().enumerate() {
+                let models: Vec<String> = spec
+                    .models
+                    .iter()
+                    .map(|model| model.trim().to_string())
+                    .filter(|model| !model.is_empty())
+                    .collect();
+                if models.is_empty() {
+                    continue;
+                }
+                let protocol = match spec.protocol.as_str() {
+                    "anthropic" | "anthropic-messages" => Protocol::AnthropicMessages,
+                    "responses" | "openai-responses" => Protocol::OpenAiResponses,
+                    _ => Protocol::OpenAiChat,
+                };
+                let provider_id = format!("plugin:{}:{index}", info.id);
+                let account_id = format!("plugin:{}:{index}:account", info.id);
+                let name = if spec.name.trim().is_empty() {
+                    format!("{} · 插件供应商", info.name)
+                } else {
+                    spec.name.trim().to_string()
+                };
+                entries
+                    .provider_plugins
+                    .insert(provider_id.clone(), info.id.clone());
+                if spec.streaming {
+                    entries.streaming.insert(provider_id.clone());
+                }
+                entries.providers.push(Provider {
+                    id: provider_id.clone(),
+                    name: name.clone(),
+                    kind: ProviderKind::Custom,
+                    base_url: format!("plugin://{}", info.id),
+                    auth: crate::config::AuthConfig {
+                        mode: crate::config::AuthMode::None,
+                        ..crate::config::AuthConfig::default()
+                    },
+                    static_protocol: protocol,
+                    test_model: models.first().cloned(),
+                    created_at: now_ts(),
+                    ..Provider::default()
+                });
+                entries.accounts.push(Account {
+                    id: account_id,
+                    provider_id: provider_id.clone(),
+                    name: format!("{name} · 虚拟账号"),
+                    priority: 0,
+                    enabled: true,
+                    // 0 = unlimited concurrency for the virtual account.
+                    max_concurrency: 0,
+                    quota: None,
+                    cooldown_override_secs: None,
+                    api_key: String::new(),
+                    balance: BalanceConfig {
+                        mode: BalanceMode::Unavailable,
+                        ..BalanceConfig::default()
+                    },
+                    created_at: now_ts(),
+                });
+                for (model_index, model) in models.iter().enumerate() {
+                    entries.routes.push(ModelRoute {
+                        id: format!("plugin:{}:{index}:route:{model_index}", info.id),
+                        client_model: model.clone(),
+                        provider_id: provider_id.clone(),
+                        upstream_model: model.clone(),
+                        protocol: Some(protocol),
+                        mode: RouteMode::Adapt,
+                        priority: spec.priority,
+                        capabilities: vec!["chat".to_string()],
+                        max_context_tokens: None,
+                        fallback_client_model: None,
+                        input_price_per_mtok: 0.0,
+                        output_price_per_mtok: 0.0,
+                        pricing: Default::default(),
+                        enabled: true,
+                        created_at: now_ts(),
+                    });
+                }
+            }
+        }
+        entries
+    }
+
+    pub fn set_console_target(&self, id: Option<String>) {
+        let mut target = self
+            .shared
+            .console_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *target = id;
+    }
+
+    /// Logs for the plugin whose console is open, if any.
+    pub fn console_view(&self) -> Option<PluginConsoleView> {
+        let id = self
+            .shared
+            .console_target
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        let name = self
+            .shared
+            .infos
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .map(|info| info.name.clone())?;
+        Some(PluginConsoleView {
+            logs: self.shared.log_snapshot(&id),
+            id,
+            name,
+        })
+    }
+
+    pub fn clear_logs(&self, id: &str) {
+        self.shared.clear_logs(id);
     }
 
     pub fn ui_request(&self) -> Option<PluginUiRequest> {
@@ -504,7 +747,6 @@ impl PluginHost {
                     } else {
                         PluginStatus::Disabled
                     };
-                    info.logs = old.logs.clone();
                     info.last_error = old.last_error.clone();
                     info.calls = old.calls;
                     info.loaded_at = old.loaded_at;
@@ -513,6 +755,7 @@ impl PluginHost {
                     } else {
                         old.events.clone()
                     };
+                    info.providers = old.providers.clone();
                 }
                 discovered.insert(id, info);
             } else if path.extension().and_then(|ext| ext.to_str()) == Some("js") {
@@ -533,11 +776,11 @@ impl PluginHost {
                 let mut info = PluginInfo::new(id.clone(), root, path.clone(), data_dir, &manifest);
                 if let Some(old) = previous.get(&id) {
                     info.status = old.status;
-                    info.logs = old.logs.clone();
                     info.last_error = old.last_error.clone();
                     info.calls = old.calls;
                     info.loaded_at = old.loaded_at;
                     info.events = old.events.clone();
+                    info.providers = old.providers.clone();
                 }
                 discovered.insert(id, info);
             }
@@ -558,6 +801,21 @@ impl PluginHost {
             let _ = std::fs::create_dir_all(&info.data_dir);
         }
         *infos = discovered;
+        drop(infos);
+        // Lock order is logs -> infos everywhere; never hold `infos` while
+        // waiting for `logs` or a plugin logging concurrently could deadlock.
+        let counts: BTreeMap<String, usize> = {
+            let logs = self.shared.logs.lock().unwrap_or_else(|e| e.into_inner());
+            logs.iter()
+                .map(|(id, entries)| (id.clone(), entries.len()))
+                .collect()
+        };
+        let mut infos = self.shared.infos.lock().unwrap_or_else(|e| e.into_inner());
+        for info in infos.values_mut() {
+            info.log_count = counts.get(&info.id).copied().unwrap_or(0);
+        }
+        drop(infos);
+        self.shared.bump_dynamic();
     }
 
     pub async fn load_all_enabled(&self) {
@@ -626,12 +884,13 @@ impl PluginHost {
             shared: self.shared.clone(),
         };
         let (tx, rx) = mpsc::unbounded_channel();
+        let events = tx.clone();
         let (init_tx, init_rx) = oneshot::channel();
         let shared = self.shared.clone();
         let join = std::thread::Builder::new()
             .name(format!("yoyo-plugin-{}", info.id))
             .spawn(move || {
-                worker::run(env, rx, init_tx);
+                worker::run(env, rx, init_tx, events);
             })
             .map_err(|err| format!("无法创建插件线程：{err}"))?;
 
@@ -686,6 +945,7 @@ impl PluginHost {
                     slot.description = meta.description;
                 }
                 slot.events = meta.events;
+                slot.providers = meta.providers;
                 slot.status = PluginStatus::Running;
                 slot.last_error = None;
                 slot.loaded_at = crate::config::now_ts();
@@ -693,6 +953,7 @@ impl PluginHost {
         }
         tracing::info!("plugin {} loaded", id);
         self.shared.log(id, "info", "插件已加载");
+        self.shared.bump_dynamic();
         Ok(())
     }
 
@@ -723,6 +984,51 @@ impl PluginHost {
         }
         self.mark_stopped(id);
         self.shared.log(id, "info", "插件已卸载");
+        self.shared.bump_dynamic();
+    }
+
+    /// Stop a plugin and delete its files. `keep_data` keeps
+    /// `plugin-data/<id>`; otherwise that directory is removed as well.
+    pub async fn uninstall(&self, id: &str, keep_data: bool) -> Result<Vec<PathBuf>, String> {
+        let info = {
+            let infos = self.shared.infos.lock().unwrap_or_else(|e| e.into_inner());
+            infos.get(id).cloned()
+        }
+        .ok_or_else(|| format!("插件 {id} 不存在"))?;
+        self.unload(id).await;
+
+        let mut removed = Vec::new();
+        if info.dir != self.plugins_dir && info.dir.starts_with(&self.plugins_dir) {
+            std::fs::remove_dir_all(&info.dir)
+                .map_err(|err| format!("删除插件目录 {} 失败：{err}", info.dir.display()))?;
+            removed.push(info.dir.clone());
+        } else if info.entry.starts_with(&self.plugins_dir) {
+            std::fs::remove_file(&info.entry)
+                .map_err(|err| format!("删除插件文件 {} 失败：{err}", info.entry.display()))?;
+            removed.push(info.entry.clone());
+        } else {
+            return Err("插件路径不在插件目录内，已停止但未删除文件".into());
+        }
+
+        if !keep_data && info.data_dir.starts_with(&self.data_dir) && info.data_dir.exists() {
+            std::fs::remove_dir_all(&info.data_dir)
+                .map_err(|err| format!("删除插件数据 {} 失败：{err}", info.data_dir.display()))?;
+            removed.push(info.data_dir.clone());
+        }
+
+        self.shared
+            .logs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        self.shared
+            .infos
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        self.scan();
+        self.shared.bump_dynamic();
+        Ok(removed)
     }
 
     fn mark_stopped(&self, id: &str) {
@@ -860,6 +1166,87 @@ impl PluginHost {
         changed.then_some(current)
     }
 
+    /// Call `onProviderRequest` for a non-streaming virtual provider request.
+    /// The plugin returns either a response body or `{ status, body }`.
+    pub async fn call_provider(
+        &self,
+        plugin_id: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<(u16, Value), String> {
+        let tx = self
+            .senders()
+            .into_iter()
+            .find(|(id, _)| id == plugin_id)
+            .map(|(_, tx)| tx)
+            .ok_or_else(|| "插件未运行".to_string())?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(WorkerCommand::ProviderRequest {
+            payload,
+            stream: false,
+            chunks: None,
+            start: None,
+            reply: Some(reply_tx),
+        })
+        .map_err(|_| "插件线程已退出".to_string())?;
+        let result = match tokio::time::timeout(timeout, reply_rx).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(_)) => return Err("插件线程没有返回响应".into()),
+            Err(_) => return Err(format!("插件响应超时（{}s）", timeout.as_secs())),
+        };
+        let Some(result) = result else {
+            return Err("onProviderRequest 没有返回响应".into());
+        };
+        let status = result
+            .get("status")
+            .and_then(Value::as_u64)
+            .unwrap_or(200)
+            .clamp(100, 599) as u16;
+        if let Some(body) = result.get("body") {
+            return Ok((status, body.clone()));
+        }
+        if result.get("choices").is_some()
+            || result.get("output").is_some()
+            || result.get("content").is_some()
+            || result.get("error").is_some()
+        {
+            return Ok((status, result));
+        }
+        Err("onProviderRequest 返回值缺少 body 或响应对象".into())
+    }
+
+    /// Open a streaming virtual-provider response. The plugin emits raw SSE
+    /// frames for its declared protocol; the gateway feeds them through the
+    /// normal protocol translator.
+    pub async fn call_provider_stream(
+        &self,
+        plugin_id: &str,
+        payload: Value,
+    ) -> Result<mpsc::UnboundedReceiver<Result<bytes::Bytes, String>>, String> {
+        let tx = self
+            .senders()
+            .into_iter()
+            .find(|(id, _)| id == plugin_id)
+            .map(|(_, tx)| tx)
+            .ok_or_else(|| "插件未运行".to_string())?;
+        let (chunk_tx, chunk_rx) = mpsc::unbounded_channel();
+        let (start_tx, start_rx) = oneshot::channel();
+        tx.send(WorkerCommand::ProviderRequest {
+            payload,
+            stream: true,
+            chunks: Some(chunk_tx),
+            start: Some(start_tx),
+            reply: None,
+        })
+        .map_err(|_| "插件线程已退出".to_string())?;
+        match tokio::time::timeout(Duration::from_secs(5), start_rx).await {
+            Ok(Ok(true)) => Ok(chunk_rx),
+            Ok(Ok(false)) => Err("插件没有导出 onProviderRequest".into()),
+            Ok(Err(_)) => Err("插件线程没有确认请求".into()),
+            Err(_) => Err("插件确认请求超时".into()),
+        }
+    }
+
     /// Fire-and-forget notification.
     pub fn notify(&self, event: &str, payload: Value) {
         for (id, tx) in self.senders() {
@@ -899,10 +1286,101 @@ impl PluginHost {
         }
     }
 
+    /// Ask a running plugin for its current model catalogue. The plugin can
+    /// implement `onListModels()` and return a provider array, a
+    /// `{ providers: [...] }` object, or a plain string array for its first
+    /// provider. The result replaces the provider specs and refreshes the
+    /// temporary providers/routes.
+    pub async fn refresh_models(&self, id: &str) -> Result<usize, String> {
+        let current = {
+            let infos = self.shared.infos.lock().unwrap_or_else(|e| e.into_inner());
+            infos
+                .get(id)
+                .map(|info| info.providers.clone())
+                .unwrap_or_default()
+        };
+        let value = self
+            .invoke(
+                id,
+                "onListModels",
+                serde_json::json!({"event": "onListModels"}),
+            )
+            .await?
+            .ok_or_else(|| "插件未实现 onListModels，或没有返回模型".to_string())?;
+        let specs = worker::normalize_provider_specs(parse_model_specs(value, current)?);
+        if specs.is_empty() {
+            return Err("onListModels 没有返回可用的模型".into());
+        }
+        let count: usize = specs.iter().map(|spec| spec.models.len()).sum();
+        {
+            let mut infos = self.shared.infos.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(info) = infos.get_mut(id) {
+                info.providers = specs;
+            }
+        }
+        self.shared
+            .log(id, "info", format!("模型列表已刷新：{count} 个模型"));
+        self.shared.bump_dynamic();
+        Ok(count)
+    }
+
     /// Write the bundled sample plugins into the plugins directory.
     pub fn install_samples(&self) -> Result<Vec<String>, String> {
         docs::install_samples(&self.plugins_dir)
     }
+}
+
+fn parse_model_specs(
+    value: Value,
+    current: Vec<PluginProviderSpec>,
+) -> Result<Vec<PluginProviderSpec>, String> {
+    let array = match &value {
+        Value::Array(items) => Some(items.clone()),
+        Value::Object(map) => map.get("providers").and_then(Value::as_array).cloned(),
+        _ => None,
+    };
+    if let Some(items) = array {
+        if items.iter().all(Value::is_string) {
+            let models: Vec<String> = items
+                .into_iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect();
+            if current.is_empty() {
+                return Ok(vec![PluginProviderSpec {
+                    name: "插件供应商".into(),
+                    models,
+                    ..PluginProviderSpec::default()
+                }]);
+            }
+            let mut specs = current;
+            specs[0].models = models;
+            return Ok(specs);
+        }
+        let mut specs: Vec<PluginProviderSpec> = serde_json::from_value(Value::Array(items))
+            .map_err(|err| format!("onListModels 返回的供应商格式无效：{err}"))?;
+        for (index, spec) in specs.iter_mut().enumerate() {
+            if let Some(previous) = current.get(index) {
+                if spec.name.trim().is_empty() {
+                    spec.name = previous.name.clone();
+                }
+                if spec.description.trim().is_empty() {
+                    spec.description = previous.description.clone();
+                }
+            }
+        }
+        return Ok(specs);
+    }
+    if value.get("models").is_some() {
+        let mut spec: PluginProviderSpec = serde_json::from_value(value)
+            .map_err(|err| format!("onListModels 返回的供应商格式无效：{err}"))?;
+        if let Some(previous) = current.first() {
+            if spec.name.trim().is_empty() {
+                spec.name = previous.name.clone();
+            }
+        }
+        return Ok(vec![spec]);
+    }
+    Err("onListModels 需要返回字符串数组、供应商数组或 { providers } 对象".into())
 }
 
 // Keep the UI-side instant import alive in non-test builds.
@@ -954,9 +1432,10 @@ export async function selfTest() {
         let dir = tempfile::tempdir().unwrap();
         let plugins = dir.path().join("plugins");
         let first = docs::install_samples(&plugins).unwrap();
-        assert_eq!(first.len(), 3);
+        assert_eq!(first.len(), 4);
         assert!(plugins.join("request-guard/main.js").is_file());
         assert!(plugins.join("hello-plugin/plugin.json").is_file());
+        assert!(plugins.join("echo-provider/main.js").is_file());
         // Keep an existing file untouched.
         std::fs::write(plugins.join("toolkit/main.js"), "// custom").unwrap();
         docs::install_samples(&plugins).unwrap();
@@ -964,6 +1443,15 @@ export async function selfTest() {
             std::fs::read_to_string(plugins.join("toolkit/main.js")).unwrap(),
             "// custom"
         );
+
+        let exports = dir.path().join("exports");
+        std::fs::create_dir_all(&exports).unwrap();
+        let skill = docs::export_skill(&exports).unwrap();
+        assert!(skill.join("SKILL.md").is_file());
+        assert!(skill.join("API.md").is_file());
+        assert!(skill.join("examples/echo-provider/main.js").is_file());
+        let skill_text = std::fs::read_to_string(skill.join("SKILL.md")).unwrap();
+        assert!(skill_text.contains("onProviderRequest"));
     }
 
     #[test]
@@ -972,12 +1460,17 @@ export async function selfTest() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buffer = [0u8; 2048];
-                let _ = stream.read(&mut buffer);
-                let response =
-                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-                let _ = stream.write_all(response.as_bytes());
+            for index in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buffer = [0u8; 2048];
+                    let _ = stream.read(&mut buffer);
+                    let response: &[u8] = if index == 0 {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 15\r\nConnection: close\r\n\r\ndata: {\"x\":1}\n\n"
+                    };
+                    let _ = stream.write_all(response);
+                }
             }
         });
 
@@ -995,6 +1488,27 @@ export async function netTest() {{
 }}
 export async function procTest() {{
   return await host.process.run({{ command: "{command}", args: {args}, timeoutSecs: 10 }});
+}}
+export async function sseTest() {{
+  let seen = 0;
+  const result = await host.net.sse(
+    {{ url: "http://127.0.0.1:{port}/" }},
+    (event) => {{ seen += 1; }}
+  );
+  return {{ status: result.status, events: result.events, seen }};
+}}
+export function storageTest() {{
+  host.storage.set("k", {{ a: 1 }});
+  host.fs.writeBase64("b.bin", "aGk=");
+  return {{
+    value: host.storage.get("k"),
+    keys: host.storage.keys(),
+    now: host.time.now(),
+    iso: host.time.nowIso(),
+    uuid: host.util.uuid(),
+    equal: host.crypto.constantTimeEqual("a", "a"),
+    base64: host.fs.readBase64("b.bin"),
+  }};
 }}
 "#
         );
@@ -1034,6 +1548,15 @@ export async function procTest() {{
             assert_eq!(net.get("status").and_then(Value::as_u64), Some(200));
             assert_eq!(net.get("body").and_then(Value::as_str), Some("ok"));
 
+            let sse = host
+                .invoke("io", "sseTest", serde_json::json!({}))
+                .await
+                .expect("sseTest")
+                .expect("value");
+            assert_eq!(sse.get("status").and_then(Value::as_u64), Some(200));
+            assert_eq!(sse.get("events").and_then(Value::as_u64), Some(1));
+            assert_eq!(sse.get("seen").and_then(Value::as_u64), Some(1));
+
             let process = host
                 .invoke("io", "procTest", serde_json::json!({}))
                 .await
@@ -1045,6 +1568,342 @@ export async function procTest() {{
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .contains("hi"));
+
+            let extra = host
+                .invoke("io", "storageTest", serde_json::json!({}))
+                .await
+                .expect("storageTest")
+                .expect("value");
+            assert_eq!(extra.pointer("/value/a").and_then(Value::as_u64), Some(1));
+            assert_eq!(extra.pointer("/keys/0").and_then(Value::as_str), Some("k"));
+            assert!(extra.get("now").and_then(Value::as_f64).unwrap_or(0.0) > 0.0);
+            assert!(extra
+                .get("iso")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains('T'));
+            assert_eq!(
+                extra.get("uuid").and_then(Value::as_str).map(str::len),
+                Some(36)
+            );
+            assert_eq!(extra.get("equal").and_then(Value::as_bool), Some(true));
+            assert_eq!(extra.get("base64").and_then(Value::as_str), Some("aGk="));
+
+            host.unload_all().await;
+        });
+    }
+
+    #[test]
+    fn websocket_client_and_server_apis_work() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            // Plain echo server for the client half of the test.
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let echo_port = echo.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = echo.accept().await {
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                        while let Some(Ok(message)) = ws.next().await {
+                            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                                let reply = format!("echo:{text}");
+                                let _ = ws
+                                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                                        reply.into(),
+                                    ))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let code = format!(
+                r#"
+export const name = "WS Test";
+export const version = "1.0.0";
+
+export async function clientTest() {{
+  const conn = await host.ws.connect({{ url: "ws://127.0.0.1:{echo_port}/echo" }});
+  host.ws.send(conn.id, "hello");
+  const reply = await host.ws.recv(conn.id, 5);
+  host.ws.close(conn.id);
+  return reply;
+}}
+
+export async function startServer() {{
+  return await host.ws.serve({{ host: "127.0.0.1", port: 0, path: "/ws" }});
+}}
+
+export function onWebSocketMessage(event) {{
+  if (event.type === "text") {{
+    host.ws.send(event.connectionId, "echo:" + event.text);
+  }}
+}}
+
+export function stopServer(event) {{
+  return host.ws.stop(event.id);
+}}
+"#
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let plugin_dir = dir.path().join("plugins").join("ws");
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(plugin_dir.join("main.js"), code).unwrap();
+
+            let host = PluginHost::new(dir.path(), tokio::runtime::Handle::current());
+            host.apply_settings(PluginSettings {
+                allow_network: true,
+                allow_process: false,
+                disabled: Vec::new(),
+            });
+            host.load_all_enabled().await;
+            assert_eq!(host.views()[0].status, PluginStatus::Running);
+
+            let reply = host
+                .invoke("ws", "clientTest", serde_json::json!({}))
+                .await
+                .expect("clientTest")
+                .expect("value");
+            assert_eq!(reply.get("type").and_then(Value::as_str), Some("text"));
+            assert_eq!(
+                reply.get("text").and_then(Value::as_str),
+                Some("echo:hello")
+            );
+
+            let server = host
+                .invoke("ws", "startServer", serde_json::json!({}))
+                .await
+                .expect("startServer")
+                .expect("value");
+            let server_id = server.get("id").and_then(Value::as_u64).unwrap();
+            let port = server.get("port").and_then(Value::as_u64).unwrap();
+            assert_eq!(port > 0, true);
+
+            let (mut client, _) =
+                tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+                    .await
+                    .expect("connect to plugin server");
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text("hi".into()))
+                .await
+                .unwrap();
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                .await
+                .expect("server reply timeout")
+                .expect("server reply")
+                .expect("valid frame");
+            match message {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    assert_eq!(text.as_str(), "echo:hi")
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+            let _ = client.close(None).await;
+            let stopped = host
+                .invoke("ws", "stopServer", serde_json::json!({ "id": server_id }))
+                .await
+                .expect("stopServer")
+                .expect("value");
+            assert_eq!(stopped.as_bool(), Some(true));
+
+            host.unload_all().await;
+        });
+    }
+
+    #[test]
+    fn on_list_models_refreshes_dynamic_providers() {
+        let code = r#"
+export const name = "Dynamic Models";
+export const version = "1.0.0";
+export const providers = [
+  { name: "Dyn", protocol: "openai-chat", models: ["m1"] }
+];
+export function onListModels() {
+  return {
+    providers: [
+      { name: "Dyn", protocol: "openai-chat", models: ["m2", "m3"], streaming: true }
+    ]
+  };
+}
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("dyn");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("main.js"), code).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let host = PluginHost::new(dir.path(), tokio::runtime::Handle::current());
+            host.load_all_enabled().await;
+            let views = host.views();
+            assert_eq!(views[0].providers[0].models, vec!["m1".to_string()]);
+            assert!(host
+                .dynamic_entries()
+                .routes
+                .iter()
+                .any(|route| route.client_model == "m1"));
+
+            let count = host.refresh_models("dyn").await.expect("refresh");
+            assert_eq!(count, 2);
+            let views = host.views();
+            assert_eq!(
+                views[0].providers[0].models,
+                vec!["m2".to_string(), "m3".to_string()]
+            );
+            assert!(host
+                .dynamic_entries()
+                .routes
+                .iter()
+                .any(|route| route.client_model == "m2"));
+            host.unload_all().await;
+        });
+    }
+
+    #[test]
+    fn uninstall_removes_files_and_optionally_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = dir.path().join("plugins");
+        let folder = plugins.join("demo");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("main.js"), "export const name = 'Demo';").unwrap();
+        let data = dir.path().join("plugin-data").join("demo");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("state.json"), "{}").unwrap();
+
+        let single = plugins.join("single.js");
+        std::fs::write(&single, "export const name = 'Single';").unwrap();
+        let single_data = dir.path().join("plugin-data").join("single");
+        std::fs::create_dir_all(&single_data).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let host = PluginHost::new(dir.path(), tokio::runtime::Handle::current());
+            let removed = host.uninstall("demo", true).await.expect("uninstall");
+            assert_eq!(removed.len(), 1);
+            assert!(!folder.exists());
+            assert!(data.join("state.json").is_file());
+            assert!(host.views().iter().all(|plugin| plugin.id != "demo"));
+
+            let removed = host.uninstall("single", false).await.expect("uninstall");
+            assert_eq!(removed.len(), 2);
+            assert!(!single.exists());
+            assert!(!single_data.exists());
+        });
+    }
+
+    const PROVIDER_PLUGIN: &str = r#"
+export const name = "Bridge";
+export const version = "1.0.0";
+export const providers = [
+  { name: "Echo Bridge", protocol: "openai-chat", models: ["echo-plugin"], priority: 5 }
+];
+
+export function onProviderRequest(event) {
+  if (event.request.stream) {
+    host.upstream.emitRaw('data: {"choices":[{"delta":{"content":"plugin-stream"}}]}\n\n');
+    host.upstream.emitRaw('data: [DONE]\n\n');
+    return;
+  }
+  return {
+    status: 200,
+    body: {
+      id: "chatcmpl-plugin",
+      object: "chat.completion",
+      model: event.request.model,
+      choices: [{ index: 0, message: { role: "assistant", content: "plugin-ok" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+    }
+  };
+}
+"#;
+
+    #[test]
+    fn plugins_can_provide_virtual_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("bridge");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("main.js"), PROVIDER_PLUGIN).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let host = PluginHost::new(dir.path(), tokio::runtime::Handle::current());
+            host.apply_settings(PluginSettings::default());
+            host.load_all_enabled().await;
+            let views = host.views();
+            assert_eq!(views.len(), 1, "{:?}", views[0].last_error);
+            assert_eq!(views[0].status, PluginStatus::Running);
+            assert_eq!(views[0].providers.len(), 1);
+
+            let entries = host.dynamic_entries();
+            assert_eq!(entries.providers.len(), 1);
+            assert_eq!(entries.accounts.len(), 1);
+            assert_eq!(entries.routes.len(), 1);
+            assert_eq!(entries.routes[0].client_model, "echo-plugin");
+            assert_eq!(entries.routes[0].upstream_model, "echo-plugin");
+            assert_eq!(entries.providers[0].base_url, "plugin://bridge");
+            assert!(entries.streaming.contains(&entries.providers[0].id));
+
+            let mut merged = crate::config::AppConfig::default();
+            merged.providers.extend(entries.providers.clone());
+            merged.accounts.extend(entries.accounts.clone());
+            merged.routes.extend(entries.routes.clone());
+            assert!(merged
+                .servable_models()
+                .iter()
+                .any(|model| model == "echo-plugin"));
+
+            let (status, body) = host
+                .call_provider(
+                    &views[0].id,
+                    serde_json::json!({
+                        "event": "onProviderRequest",
+                        "request": {"model": "echo-plugin", "stream": false, "payload": {}}
+                    }),
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect("non-stream provider reply");
+            assert_eq!(status, 200);
+            assert_eq!(
+                body.pointer("/choices/0/message/content")
+                    .and_then(Value::as_str),
+                Some("plugin-ok")
+            );
+
+            let mut chunks = host
+                .call_provider_stream(
+                    &views[0].id,
+                    serde_json::json!({
+                        "event": "onProviderRequest",
+                        "request": {"model": "echo-plugin", "stream": true, "payload": {}}
+                    }),
+                )
+                .await
+                .expect("stream provider reply");
+            let mut text = String::new();
+            while let Some(item) = chunks.recv().await {
+                let bytes = item.expect("stream chunk");
+                text.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            assert!(text.contains("plugin-stream"), "{text:?}");
 
             host.unload_all().await;
         });
@@ -1136,6 +1995,19 @@ export async function procTest() {{
                 Some("2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881")
             );
             assert_eq!(result.get("random").and_then(Value::as_u64), Some(8));
+
+            for index in 0..600 {
+                host.log("test", "info", format!("line {index}"));
+            }
+            host.set_console_target(Some("test".into()));
+            let console = host.console_view().expect("console view");
+            assert_eq!(console.logs.len(), MAX_LOGS);
+            assert_eq!(console.logs.first().unwrap().message, "line 100");
+            assert_eq!(console.logs.last().unwrap().message, "line 599");
+            assert_eq!(host.views()[0].log_count, MAX_LOGS);
+            host.clear_logs("test");
+            assert!(host.console_view().expect("console view").logs.is_empty());
+            assert_eq!(host.views()[0].log_count, 0);
 
             host.unload("test").await;
             let views = host.views();

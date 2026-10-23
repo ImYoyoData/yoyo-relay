@@ -715,19 +715,14 @@ impl App {
             title,
             subtitle,
             760.0,
-            |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("editor_form")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match &mut editor {
-                        Editor::Provider(draft) => provider_form(self, ui, draft),
-                        Editor::Account(draft) => account_form(self, ui, draft),
-                        Editor::Route(draft) => route_form(self, ui, draft),
-                        Editor::RouteModel(draft) => route_model_form(self, ui, draft),
-                        Editor::LocalKey(draft) => local_key_form(ui, draft),
-                        Editor::ManualBalance(draft) => manual_balance_form(self, ui, draft),
-                        Editor::BalanceSetup(draft) => balance_setup_form(self, ui, draft),
-                    });
+            |ui| match &mut editor {
+                Editor::Provider(draft) => provider_form(self, ui, draft),
+                Editor::Account(draft) => account_form(self, ui, draft),
+                Editor::Route(draft) => route_form(self, ui, draft),
+                Editor::RouteModel(draft) => route_model_form(self, ui, draft),
+                Editor::LocalKey(draft) => local_key_form(ui, draft),
+                Editor::ManualBalance(draft) => manual_balance_form(self, ui, draft),
+                Editor::BalanceSetup(draft) => balance_setup_form(self, ui, draft),
             },
             |ui| {
                 match kind {
@@ -830,6 +825,27 @@ impl App {
                             ui.add(egui::Label::new(RichText::new(&description).size(12.0)).wrap());
                         });
                     });
+                if let ConfirmAction::UninstallPlugin(id) = &action {
+                    ui.add_space(10.0);
+                    ui.checkbox(
+                        &mut self.plugin_uninstall_keep_data,
+                        "保留插件数据（plugin-data 目录）",
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "数据目录：{}",
+                            self.store
+                                .paths
+                                .config_dir
+                                .join("plugin-data")
+                                .join(id)
+                                .display()
+                        ))
+                        .monospace()
+                        .size(9.5)
+                        .color(super::theme::muted(ui)),
+                    );
+                }
             },
             |ui| {
                 let clicked = if danger {
@@ -966,6 +982,23 @@ impl App {
                 true,
                 "退出",
             ),
+            ConfirmAction::UninstallPlugin(id) => {
+                let name = self
+                    .snapshot
+                    .plugins
+                    .iter()
+                    .find(|plugin| plugin.id == *id)
+                    .map(|plugin| plugin.name.clone())
+                    .unwrap_or_else(|| id.clone());
+                (
+                    "卸载插件",
+                    format!(
+                        "将停止「{name}」并删除插件文件与插件目录。插件提供的临时供应商、虚拟账号和路由（包括手动选用的路由）会同时移除。若取消勾选「保留插件数据」，plugin-data 中的数据也会删除。"
+                    ),
+                    true,
+                    "卸载并删除",
+                )
+            }
         }
     }
 
@@ -1075,6 +1108,33 @@ impl App {
             }
             ConfirmAction::Quit => {
                 self.quit(ctx);
+            }
+            ConfirmAction::UninstallPlugin(id) => {
+                let keep_data = self.plugin_uninstall_keep_data;
+                self.plugin_overrides.remove(&id);
+                if self.plugin_console.as_deref() == Some(id.as_str()) {
+                    self.plugin_console = None;
+                    let _ = self
+                        .cmd_tx
+                        .send(crate::runtime::UiCommand::SetPluginConsole(None));
+                }
+                let _ = self
+                    .cmd_tx
+                    .send(crate::runtime::UiCommand::UninstallPlugin {
+                        id: id.clone(),
+                        keep_data,
+                    });
+                self.toast(
+                    NoticeLevel::Info,
+                    format!(
+                        "正在卸载插件「{id}」{}…",
+                        if keep_data {
+                            "并保留数据"
+                        } else {
+                            "并删除数据"
+                        }
+                    ),
+                );
             }
         }
     }
@@ -1255,6 +1315,7 @@ impl App {
                 ui.label(RichText::new("方案名称").size(11.0).color(theme::muted(ui)));
                 ui.add(
                     TextEdit::singleline(&mut plan.name)
+                        .id(Id::new("price_plan_name"))
                         .desired_width(f32::INFINITY)
                         .hint_text("例如：GLM-4 峰谷价"),
                 );
@@ -1266,6 +1327,7 @@ impl App {
                 );
                 ui.add(
                     TextEdit::singleline(&mut plan.note)
+                        .id(Id::new("price_plan_note"))
                         .desired_width(f32::INFINITY)
                         .hint_text("价格来源、生效日期等"),
                 );
@@ -1278,7 +1340,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new(format!(
-                                "{} · 输入 {symbol}{:.4} · 命中 {symbol}{:.4} · 输出 {symbol}{:.4}",
+                                "{} · 默认输入 {symbol}{:.4} · 默认命中 {symbol}{:.4} · 默认输出 {symbol}{:.4}",
                                 plan.currency.label(),
                                 plan.base.input_per_mtok,
                                 plan.base.cached_input_per_mtok,
@@ -1290,7 +1352,7 @@ impl App {
                         if !plan.periods.is_empty() {
                             ui.label(
                                 RichText::new(format!(
-                                    "{} 个峰谷时段：{}",
+                                    "{} 个高峰时段：{}",
                                     plan.periods.len(),
                                     plan.periods
                                         .iter()
@@ -1344,8 +1406,212 @@ impl App {
                         "价格方案已保存"
                     },
                 );
+                self.saving_price_plan = None;
+            } else {
+                self.saving_price_plan = Some(plan);
             }
-            self.saving_price_plan = None;
+            return;
+        }
+        // The modal is rebuilt from `saving_price_plan` every frame; without
+        // writing the local edits back, each keystroke is discarded.
+        self.saving_price_plan = Some(plan);
+    }
+
+    /// Natural-language pricing assistant. The plan is only a preview until
+    /// the user applies it and saves the route.
+    pub(crate) fn show_ai_pricing_modal(&mut self, ctx: &egui::Context) {
+        if !self.ai_pricing_open {
+            return;
+        }
+        let view = self.snapshot.ai_pricing.clone().filter(|view| {
+            view.route_id == self.ai_pricing_route && view.token == self.ai_pricing_token
+        });
+        if view.as_ref().map(|view| !view.running).unwrap_or(false) {
+            self.ai_pricing_generating = false;
+        }
+        let running =
+            self.ai_pricing_generating || view.as_ref().map(|view| view.running).unwrap_or(false);
+        let plan = view.as_ref().and_then(|view| view.plan.clone());
+        let error = view.as_ref().and_then(|view| view.error.clone());
+        let mut generate = false;
+        let mut apply = false;
+        let mut cancel = false;
+        let prompt_ready = !self.ai_pricing_prompt.trim().is_empty();
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_ai_pricing"),
+            "AI 生成价格方案",
+            "用中文描述高峰/低谷价格，AI 会填入默认价与高峰时段",
+            560.0,
+            |ui| {
+                egui::Frame::new()
+                    .fill(theme::subtle_fill(ui))
+                    .corner_radius(9)
+                    .inner_margin(egui::Margin::symmetric(12, 9))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    self.ai_pricing_provider_name, self.ai_pricing_model
+                                ))
+                                .size(10.5)
+                                .color(theme::text(ui)),
+                            );
+                            kit::plain_badge(ui, "仅预览，保存路由后生效");
+                        });
+                        ui.label(
+                            RichText::new(
+                                "需求会发送到该上游模型；费用计入当前账号，但不会写入调用明细。",
+                            )
+                            .size(9.5)
+                            .color(theme::muted(ui)),
+                        );
+                    });
+                ui.add_space(8.0);
+                ui.label(RichText::new("你的需求").size(11.0).color(theme::muted(ui)));
+                ui.add(
+                    TextEdit::multiline(&mut self.ai_pricing_prompt)
+                        .id(Id::new("ai_pricing_prompt"))
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(4)
+                        .hint_text(
+                            "例如：工作日 9:00–18:00 是高峰，输入 4 元/百万 tokens、输出 16 元；其他时间为低谷，输入 1 元、输出 4 元，命中缓存 0.5 元。",
+                        ),
+                );
+                ui.label(
+                    RichText::new(
+                        "提示：默认价就是低谷价；只说高峰时段即可，不需要为低谷时间添加时段。",
+                    )
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+                );
+                if running {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("AI 正在生成，请稍候…")
+                                .size(10.5)
+                                .color(theme::muted(ui)),
+                        );
+                    });
+                }
+                if let Some(error) = &error {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(error).size(10.5).color(theme::RED));
+                }
+                if let Some(plan) = &plan {
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(theme::subtle_fill(ui))
+                        .corner_radius(9)
+                        .inner_margin(egui::Margin::symmetric(12, 9))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(&plan.name).size(12.5).strong());
+                                kit::badge(ui, plan.currency.code(), theme::ACCENT);
+                            });
+                            ui.label(
+                                RichText::new(format!(
+                                    "默认价：输入 {} · 命中 {} · 输出 {}（每百万 tokens）",
+                                    money(plan.currency, plan.base.input_per_mtok),
+                                    money(plan.currency, plan.base.cached_input_per_mtok),
+                                    money(plan.currency, plan.base.output_per_mtok),
+                                ))
+                                .size(10.0)
+                                .color(theme::text(ui)),
+                            );
+                            if plan.base.is_zero() {
+                                ui.label(
+                                    RichText::new(
+                                        "默认价为 0：未命中高峰时段的时间会按 0 计费，请确认或在需求中补充低谷价。",
+                                    )
+                                    .size(9.5)
+                                    .color(theme::ORANGE),
+                                );
+                            }
+                            if plan.periods.is_empty() {
+                                ui.label(
+                                    RichText::new("没有高峰时段，全天使用默认价。")
+                                        .size(10.0)
+                                        .color(theme::muted(ui)),
+                                );
+                            } else {
+                                for period in &plan.periods {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · {} · 输入 {} / 输出 {}",
+                                            period.name,
+                                            period.schedule_label(),
+                                            money(plan.currency, period.tier.input_per_mtok),
+                                            money(plan.currency, period.tier.output_per_mtok),
+                                        ))
+                                        .size(10.0)
+                                        .color(theme::text(ui)),
+                                    );
+                                }
+                            }
+                            if !plan.note.trim().is_empty() {
+                                ui.add_space(3.0);
+                                ui.label(
+                                    RichText::new(&plan.note)
+                                        .size(9.5)
+                                        .color(theme::muted(ui)),
+                                );
+                            }
+                        });
+                }
+            },
+            |ui| {
+                if plan.is_some() {
+                    if kit::primary_button(ui, icons::CHECK, "应用方案").clicked() {
+                        apply = true;
+                    }
+                    if kit::secondary_button(ui, icons::SPARKLE, "重新生成").clicked() {
+                        generate = true;
+                    }
+                } else if kit::primary_button(ui, icons::SPARKLE, "生成").clicked()
+                    && !running
+                    && prompt_ready
+                {
+                    generate = true;
+                }
+                if kit::secondary_button(ui, "", "取消").clicked() {
+                    cancel = true;
+                }
+            },
+        );
+        if apply {
+            if let Some(plan) = plan {
+                self.ai_pricing_apply = Some((self.ai_pricing_route.clone(), plan));
+                self.ai_pricing_open = false;
+                self.ai_pricing_generating = false;
+                self.ai_pricing_token = 0;
+                let _ = self.cmd_tx.send(crate::runtime::UiCommand::ClearAiPricing);
+            }
+            return;
+        }
+        if generate && !running && !self.ai_pricing_prompt.trim().is_empty() {
+            self.ai_pricing_seq = self.ai_pricing_seq.wrapping_add(1).max(1);
+            self.ai_pricing_token = self.ai_pricing_seq;
+            self.ai_pricing_generating = true;
+            let _ = self
+                .cmd_tx
+                .send(crate::runtime::UiCommand::GenerateAiPricing {
+                    route_id: self.ai_pricing_route.clone(),
+                    provider_id: self.ai_pricing_provider.clone(),
+                    model: self.ai_pricing_model.clone(),
+                    prompt: self.ai_pricing_prompt.clone(),
+                    token: self.ai_pricing_token,
+                });
+            self.toast(NoticeLevel::Info, "正在让 AI 生成价格方案…");
+        }
+        if closed || cancel {
+            self.ai_pricing_open = false;
+            self.ai_pricing_generating = false;
+            self.ai_pricing_token = 0;
+            let _ = self.cmd_tx.send(crate::runtime::UiCommand::ClearAiPricing);
         }
     }
 
@@ -1719,7 +1985,8 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
                             ui.selectable_value(&mut rule.protocol, protocol, protocol.label());
                         }
                     });
-                if ui.small_button("删除").clicked() {
+                if kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除该前缀规则").clicked()
+                {
                     remove = Some(index);
                 }
             });
@@ -1727,7 +1994,7 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
         if let Some(index) = remove {
             provider.protocol_strategy.prefix_rules.remove(index);
         }
-        if ui.button("+ 添加前缀规则").clicked() {
+        if kit::secondary_button(ui, icons::PLUS, "添加前缀规则").clicked() {
             provider.protocol_strategy.prefix_rules.push(PrefixRule {
                 prefix: String::new(),
                 protocol: Protocol::OpenAiChat,
@@ -1749,7 +2016,7 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
                     .desired_width(250.0)
                     .hint_text("值"),
             );
-            if ui.small_button("删除").clicked() {
+            if kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除该 Header").clicked() {
                 remove = Some(index);
             }
         });
@@ -1757,7 +2024,7 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
     if let Some(index) = remove {
         provider.extra_headers.remove(index);
     }
-    if ui.button("+ 添加 Header").clicked() {
+    if kit::secondary_button(ui, icons::PLUS, "添加 Header").clicked() {
         provider.extra_headers.push(Default::default());
     }
     ui.label(
@@ -2077,23 +2344,23 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("快捷换算").size(10.0).color(theme::muted(ui)));
-            if ui.small_button("原始值").clicked() {
+            if kit::ghost_button(ui, "", "原始值").clicked() {
                 balance.formula.clear();
                 balance.scale = 1.0;
             }
-            if ui.small_button("除以 100").clicked() {
+            if kit::ghost_button(ui, "", "除以 100").clicked() {
                 balance.formula = format!("{path} / 100");
                 balance.scale = 1.0;
             }
-            if ui.small_button("除以 1000").clicked() {
+            if kit::ghost_button(ui, "", "除以 1000").clicked() {
                 balance.formula = format!("{path} / 1000");
                 balance.scale = 1.0;
             }
-            if ui.small_button("除以 10000").clicked() {
+            if kit::ghost_button(ui, "", "除以 10000").clicked() {
                 balance.formula = format!("{path} / 10000");
                 balance.scale = 1.0;
             }
-            if ui.small_button("乘以 100").clicked() {
+            if kit::ghost_button(ui, "", "乘以 100").clicked() {
                 balance.formula = format!("{path} * 100");
                 balance.scale = 1.0;
             }
@@ -2119,6 +2386,7 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
 }
 
 fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
+    let temporary_providers = app.snapshot.temporary_providers();
     let route = &mut draft.route;
     section(ui, "所属路由模型");
     ui.horizontal_wrapped(|ui| {
@@ -2146,6 +2414,12 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
                 .config
                 .provider(&route.provider_id)
                 .map(|p| p.name.clone())
+                .or_else(|| {
+                    temporary_providers
+                        .iter()
+                        .find(|p| p.id == route.provider_id)
+                        .map(|p| format!("{}（临时）", p.name))
+                })
                 .unwrap_or_else(|| "请选择".into());
             ComboBox::from_id_salt("route_provider")
                 .selected_text(provider_name)
@@ -2157,15 +2431,54 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
                             &provider.name,
                         );
                     }
+                    if !temporary_providers.is_empty() {
+                        ui.separator();
+                        ui.label(
+                            RichText::new("临时供应商（插件）")
+                                .size(9.5)
+                                .color(theme::muted(ui)),
+                        );
+                        for provider in &temporary_providers {
+                            ui.selectable_value(
+                                &mut route.provider_id,
+                                provider.id.clone(),
+                                format!(
+                                    "{}（临时 · {}）",
+                                    provider.name,
+                                    if provider.running {
+                                        "运行中"
+                                    } else {
+                                        "已停止"
+                                    }
+                                ),
+                            );
+                        }
+                    }
                 });
             ui.end_row();
-            let fetching = app.snapshot.models_fetching.contains(&route.provider_id);
+            let temporary = temporary_providers
+                .iter()
+                .find(|provider| provider.id == route.provider_id);
+            let is_temporary = temporary.is_some();
+            let fetching =
+                !is_temporary && app.snapshot.models_fetching.contains(&route.provider_id);
             let catalog = app
                 .snapshot
                 .provider_models
                 .get(&route.provider_id)
-                .cloned();
+                .cloned()
+                .or_else(|| {
+                    temporary.map(|provider| crate::snapshot::ProviderModelsView {
+                        provider_id: provider.id.clone(),
+                        provider_name: provider.name.clone(),
+                        models: provider.models.clone(),
+                        ok: true,
+                        message: "插件提供的模型列表".into(),
+                        at: crate::config::now_ts(),
+                    })
+                });
             if !route.provider_id.is_empty()
+                && !is_temporary
                 && catalog.is_none()
                 && !fetching
                 && app.models_requested.insert(route.provider_id.clone())
@@ -2183,7 +2496,9 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
                         .desired_width(280.0)
                         .hint_text("发给该供应商的真实模型名"),
                 );
-                if ui
+                if is_temporary {
+                    ui.label(RichText::new("插件提供").size(10.0).color(theme::muted(ui)));
+                } else if ui
                     .add_enabled(
                         !fetching,
                         egui::Button::new(if fetching {
@@ -2350,9 +2665,37 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
 /// Price editor for one upstream. Handles currency, the base tier and
 /// peak/off-peak windows. Kept separate from the route form because it is the
 /// most detail-heavy part of the configuration.
+fn money(currency: PriceCurrency, value: f64) -> String {
+    format!("{}{:.4}", currency.symbol(), value)
+}
+
+fn ai_route_key(route: &ModelRoute) -> String {
+    if route.id.is_empty() {
+        format!("draft:{}", route.client_model)
+    } else {
+        route.id.clone()
+    }
+}
+
 fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
     let mut pricing = route.effective_pricing();
     let mut changed = false;
+    let route_key = ai_route_key(route);
+    if let Some((pending, plan)) = app.ai_pricing_apply.clone() {
+        if pending == route_key {
+            app.ai_pricing_apply = None;
+            pricing = crate::config::RoutePricing {
+                currency: plan.currency,
+                base: plan.base,
+                periods: plan.periods.clone(),
+            };
+            changed = true;
+            app.toast(
+                NoticeLevel::Success,
+                format!("已填入 AI 方案「{}」，请检查后保存路由。", plan.name),
+            );
+        }
+    }
 
     section(ui, "计费价格");
     ui.horizontal_wrapped(|ui| {
@@ -2401,7 +2744,7 @@ fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
         .show(ui, |ui| {
             ui.label(RichText::new("计费项").size(10.5).color(theme::muted(ui)));
             ui.label(
-                RichText::new(format!("基础价（{symbol}/百万 tokens）"))
+                RichText::new(format!("默认价（未命中时段，{symbol}/百万 tokens）"))
                     .size(10.5)
                     .color(theme::muted(ui)),
             );
@@ -2413,7 +2756,7 @@ fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
                 changed = true;
             }
             ui.label(
-                RichText::new("常规输入单价")
+                RichText::new("未命中高峰时段时的默认输入价")
                     .size(10.0)
                     .color(theme::muted(ui)),
             );
@@ -2424,7 +2767,7 @@ fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
                 changed = true;
             }
             ui.label(
-                RichText::new("留空或 0 表示按常规输入价计费")
+                RichText::new("默认缓存价；留空或 0 表示按默认输入价计费")
                     .size(10.0)
                     .color(theme::muted(ui)),
             );
@@ -2435,18 +2778,24 @@ fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
                 changed = true;
             }
             ui.label(
-                RichText::new("生成 token 单价")
+                RichText::new("未命中高峰时段时的默认输出价")
                     .size(10.0)
                     .color(theme::muted(ui)),
             );
             ui.end_row();
         });
 
+    ui.add_space(4.0);
+    kit::info_row(
+        ui,
+        icons::INFO,
+        "只需要配置高峰时段；未命中任何高峰时段的时间自动使用上方默认价（低谷/空闲价）。",
+    );
     ui.add_space(8.0);
-    kit::section_label(ui, "峰谷时段（可选）");
+    kit::section_label(ui, "高峰时段（可选）");
     ui.label(
         RichText::new(
-            "为不同时间段设置独立价格。未落入任何时段时使用上面的基础价；跨午夜的时段把结束小时设得比开始小时小即可。",
+            "只需要添加高峰时段；所有未命中时段的时间自动使用上方「默认价」（低谷/空闲价）。例如工作日 09:00–18:00 设一个高峰，其余时间不必再配置。跨午夜的时段把结束小时设得比开始小时小即可。",
         )
         .size(10.0)
         .color(theme::muted(ui)),
@@ -2461,11 +2810,17 @@ fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
             .inner_margin(egui::Margin::symmetric(11, 9))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut period.name)
-                            .desired_width(120.0)
-                            .hint_text("时段名称"),
-                    );
+                    if ui
+                        .add(
+                            TextEdit::singleline(&mut period.name)
+                                .id(Id::new(("price_period_name", index)))
+                                .desired_width(120.0)
+                                .hint_text("高峰名称"),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
                     ui.label(RichText::new("时间").size(10.0).color(theme::muted(ui)));
                     if hour_input(ui, &mut period.start_hour) {
                         changed = true;
@@ -2562,10 +2917,30 @@ fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
     }
 
     ui.horizontal_wrapped(|ui| {
-        if kit::secondary_labeled(ui, icons::PLUS, "添加时段").clicked() {
+        if kit::secondary_labeled(ui, icons::PLUS, "添加高峰时段").clicked() {
             let mut period = crate::config::PricePeriod::default();
             // Start new windows from the base tier so the user only edits the
             // numbers that differ between peak and off-peak.
+            period.tier = pricing.base;
+            pricing.periods.push(period);
+            changed = true;
+        }
+        if kit::ghost_button(ui, icons::BRIEFCASE, "工作日 9–18 点").clicked() {
+            let mut period = crate::config::PricePeriod::default();
+            period.name = "工作日高峰".into();
+            period.start_hour = 9;
+            period.end_hour = 18;
+            period.days = vec![0, 1, 2, 3, 4];
+            period.tier = pricing.base;
+            pricing.periods.push(period);
+            changed = true;
+        }
+        if kit::ghost_button(ui, icons::MOON, "每天 22–次日 8 点").clicked() {
+            let mut period = crate::config::PricePeriod::default();
+            period.name = "夜间高峰".into();
+            period.start_hour = 22;
+            period.end_hour = 8;
+            period.days = Vec::new();
             period.tier = pricing.base;
             pricing.periods.push(period);
             changed = true;
@@ -2600,6 +2975,38 @@ fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
                 periods: pricing.periods.clone(),
             });
         }
+        if kit::secondary_labeled(ui, icons::SPARKLE, "AI 生成").clicked() {
+            let has_account = app
+                .config
+                .accounts
+                .iter()
+                .any(|account| account.provider_id == route.provider_id && account.enabled);
+            if route.provider_id.is_empty() || route.upstream_model.trim().is_empty() {
+                app.toast(
+                    NoticeLevel::Warning,
+                    "请先选择供应商并填写上游模型名，再使用 AI 生成。",
+                );
+            } else if route.provider_id.starts_with("plugin:") || !has_account {
+                app.toast(
+                    NoticeLevel::Warning,
+                    "当前供应商没有可直接调用的启用账号，无法使用 AI 生成。",
+                );
+            } else {
+                app.ai_pricing_open = true;
+                app.ai_pricing_generating = false;
+                app.ai_pricing_token = 0;
+                app.ai_pricing_route = route_key.clone();
+                app.ai_pricing_provider = route.provider_id.clone();
+                app.ai_pricing_provider_name = app
+                    .config
+                    .provider(&route.provider_id)
+                    .map(|provider| provider.name.clone())
+                    .unwrap_or_else(|| route.provider_id.clone());
+                app.ai_pricing_model = route.upstream_model.clone();
+                app.ai_pricing_prompt.clear();
+                let _ = app.cmd_tx.send(crate::runtime::UiCommand::ClearAiPricing);
+            }
+        }
     });
 
     if changed {
@@ -2618,10 +3025,10 @@ fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
 
     ui.add_space(4.0);
     let period_summary = if pricing.periods.is_empty() {
-        "全天使用基础价".to_string()
+        "全天使用默认价".to_string()
     } else {
         format!(
-            "{} 个时段：{}",
+            "{} 个高峰时段；其余时间使用默认价：{}",
             pricing.periods.len(),
             pricing
                 .periods

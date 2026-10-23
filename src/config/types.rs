@@ -1051,7 +1051,7 @@ pub struct PricePeriod {
 impl Default for PricePeriod {
     fn default() -> Self {
         Self {
-            name: "峰时".to_string(),
+            name: "高峰".to_string(),
             start_hour: 9,
             end_hour: 18,
             days: Vec::new(),

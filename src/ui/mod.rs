@@ -5,6 +5,7 @@ pub mod calls;
 pub mod editors;
 pub mod keys;
 pub mod kit;
+mod markdown;
 pub mod overview;
 pub mod plugins;
 pub mod providers;
@@ -25,7 +26,7 @@ use egui_phosphor::regular as icons;
 use tokio::sync::mpsc;
 
 use crate::config::{
-    now_ts, Account, AppConfig, ClientModelProfile, ConfigStore, ModelRoute, Provider,
+    now_ts, Account, AppConfig, ClientModelProfile, ConfigStore, ModelRoute, PricePlan, Provider,
 };
 use crate::runtime::UiCommand;
 use crate::snapshot::{NoticeLevel, ProxyStatus, UiSnapshot, UsageDimension};
@@ -173,13 +174,6 @@ impl Page {
             _ => None,
         }
     }
-
-    pub fn needs_search(self) -> bool {
-        matches!(
-            self,
-            Page::Providers | Page::Accounts | Page::Routes | Page::Plugins | Page::LocalKeys
-        )
-    }
 }
 
 #[allow(dead_code)]
@@ -265,6 +259,7 @@ pub(crate) enum ConfirmAction {
     ImportConfig(String),
     ClearCalls,
     Quit,
+    UninstallPlugin(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,7 +289,6 @@ pub struct App {
     pub(crate) toast_seq: u64,
     pub(crate) last_notice_id: u64,
     pub(crate) search: String,
-    pub(crate) search_focus: bool,
     pub(crate) usage_days: u32,
     pub(crate) usage_dim: UsageDimension,
     pub(crate) usage_metric: UsageMetric,
@@ -311,6 +305,17 @@ pub struct App {
     pub(crate) taskbar_badge: Option<crate::taskbar::TaskbarBadge>,
     /// Draft price plan awaiting a name in the "save as plan" modal.
     pub(crate) saving_price_plan: Option<crate::config::PricePlan>,
+    /// Natural-language price-plan generator opened from the route editor.
+    pub(crate) ai_pricing_open: bool,
+    pub(crate) ai_pricing_route: String,
+    pub(crate) ai_pricing_provider: String,
+    pub(crate) ai_pricing_provider_name: String,
+    pub(crate) ai_pricing_model: String,
+    pub(crate) ai_pricing_prompt: String,
+    pub(crate) ai_pricing_generating: bool,
+    pub(crate) ai_pricing_token: u64,
+    pub(crate) ai_pricing_seq: u64,
+    pub(crate) ai_pricing_apply: Option<(String, PricePlan)>,
     pub(crate) price_plan_import_path: String,
     pub(crate) update_modal: bool,
     pub(crate) update_waiting: bool,
@@ -318,6 +323,15 @@ pub struct App {
     pub(crate) plugin_docs_open: bool,
     pub(crate) plugin_ui_id: u64,
     pub(crate) plugin_ui_text: String,
+    /// Optimistic enable state while the runtime loads/unloads a plugin.
+    pub(crate) plugin_overrides: std::collections::HashMap<String, (bool, std::time::Instant)>,
+    /// Keep `plugin-data/<id>` while uninstalling the plugin.
+    pub(crate) plugin_uninstall_keep_data: bool,
+    pub(crate) contributors_requested: bool,
+    pub(crate) contributor_textures: std::collections::HashMap<String, egui::TextureHandle>,
+    pub(crate) plugin_console: Option<String>,
+    pub(crate) plugin_console_level: u8,
+    pub(crate) plugin_console_auto_scroll: bool,
     pub(crate) closing: bool,
     pub(crate) last_zoom: f32,
     pub(crate) signals: Arc<crate::instance::Signals>,
@@ -370,7 +384,6 @@ impl App {
             toast_seq: 1,
             last_notice_id: 0,
             search: String::new(),
-            search_focus: false,
             usage_days: 7,
             usage_dim: UsageDimension::Global,
             usage_metric: UsageMetric::Tokens,
@@ -386,6 +399,16 @@ impl App {
             models_requested: HashSet::new(),
             taskbar_badge: None,
             saving_price_plan: None,
+            ai_pricing_open: false,
+            ai_pricing_route: String::new(),
+            ai_pricing_provider: String::new(),
+            ai_pricing_provider_name: String::new(),
+            ai_pricing_model: String::new(),
+            ai_pricing_prompt: String::new(),
+            ai_pricing_generating: false,
+            ai_pricing_token: 0,
+            ai_pricing_seq: 0,
+            ai_pricing_apply: None,
             price_plan_import_path: String::new(),
             update_modal: false,
             update_waiting: false,
@@ -393,6 +416,13 @@ impl App {
             plugin_docs_open: false,
             plugin_ui_id: 0,
             plugin_ui_text: String::new(),
+            plugin_overrides: std::collections::HashMap::new(),
+            plugin_uninstall_keep_data: true,
+            contributors_requested: false,
+            contributor_textures: std::collections::HashMap::new(),
+            plugin_console: None,
+            plugin_console_level: 0,
+            plugin_console_auto_scroll: true,
             closing: false,
             last_zoom: 1.0,
             signals,
@@ -663,6 +693,10 @@ impl App {
             self.snapshot = snapshot;
             ctx.request_repaint();
         }
+        if self.snapshot.update.restart_pending && !self.closing {
+            self.toast(NoticeLevel::Info, "更新完成，正在重启…");
+            self.quit(ctx);
+        }
     }
 
     fn handle_close(&mut self, ctx: &egui::Context) {
@@ -702,10 +736,6 @@ impl App {
                 _ => {}
             }
         }
-        let find = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
-        if find {
-            self.search_focus = true;
-        }
     }
 
     fn sync_autostart(&mut self) {
@@ -722,6 +752,17 @@ impl App {
     /// The runtime owns live-rate refreshes and persists them itself. Adopt its
     /// newer table so an unrelated "save settings" cannot overwrite it with a
     /// stale copy.
+    fn reconcile_plugin_overrides(&mut self) {
+        self.plugin_overrides.retain(|id, (wanted, at)| {
+            self.snapshot
+                .plugins
+                .iter()
+                .find(|plugin| &plugin.id == id)
+                .map(|plugin| plugin.enabled != *wanted && at.elapsed() < Duration::from_secs(30))
+                .unwrap_or(false)
+        });
+    }
+
     fn sync_plugin_settings(&mut self) {
         if self.snapshot.plugin_settings.disabled != self.config.plugins.disabled
             || self.snapshot.plugin_settings.allow_network != self.config.plugins.allow_network
@@ -774,6 +815,7 @@ impl App {
         let mut close = false;
         let mut dismiss = false;
         let mut update_now = false;
+        let mut open_page = false;
         let closed = kit::modal_shell(
             ctx,
             Id::new("yoyo_update"),
@@ -806,49 +848,98 @@ impl App {
                     .corner_radius(10)
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("update_notes")
-                            .max_height(260.0)
-                            .show(ui, |ui| {
-                                if update.notes.trim().is_empty() {
-                                    ui.label(
-                                        RichText::new("该版本没有提供发布说明。")
-                                            .size(11.0)
-                                            .color(theme::muted(ui)),
-                                    );
-                                } else {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(update.notes.trim()).size(11.0),
-                                        )
-                                        .wrap(),
-                                    );
-                                }
-                            });
+                        if update.notes.trim().is_empty() {
+                            ui.label(
+                                RichText::new("该版本没有提供发布说明。")
+                                    .size(11.0)
+                                    .color(theme::muted(ui)),
+                            );
+                        } else {
+                            ui.add(
+                                egui::Label::new(RichText::new(update.notes.trim()).size(11.0))
+                                    .wrap(),
+                            );
+                        }
                     });
-                ui.add_space(8.0);
-                kit::info_row(
-                    ui,
-                    icons::INFO,
-                    "「立即更新」会在浏览器中打开 Release 页面，由你确认下载与安装。",
-                );
+                if update.installing {
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::ProgressBar::new(update.progress)
+                            .show_percentage()
+                            .animate(true),
+                    );
+                    if !update.install_message.trim().is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(&update.install_message)
+                                .size(10.5)
+                                .color(theme::muted(ui)),
+                        );
+                    }
+                    kit::info_row(
+                        ui,
+                        icons::INFO,
+                        "正在自动下载并准备替换程序；完成后应用会自动退出并重启，请勿手动结束进程。",
+                    );
+                } else if let Some(error) = &update.install_error {
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(theme::soft_for(ui, theme::RED))
+                        .corner_radius(9)
+                        .inner_margin(egui::Margin::symmetric(11, 8))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(error).size(10.5).color(theme::RED));
+                        });
+                    ui.add_space(4.0);
+                    kit::info_row(
+                        ui,
+                        icons::INFO,
+                        "自动替换失败时不会破坏原程序；可以重试，或打开 Release 页面手动下载。",
+                    );
+                } else {
+                    ui.add_space(8.0);
+                    kit::info_row(
+                        ui,
+                        icons::INFO,
+                        "「立即更新」会自动下载并替换当前程序，完成后自动重启。",
+                    );
+                }
             },
             |ui| {
-                if kit::primary_button(ui, icons::DOWNLOAD_SIMPLE, "立即更新").clicked() {
-                    update_now = true;
-                }
-                if kit::secondary_button(ui, icons::BELL_SLASH, "不再提示").clicked() {
-                    dismiss = true;
-                }
-                if kit::secondary_button(ui, "", "稍后").clicked() {
-                    close = true;
+                if update.installing {
+                    if kit::secondary_button(ui, "", "隐藏").clicked() {
+                        close = true;
+                    }
+                } else if update.install_error.is_some() {
+                    if kit::primary_button(ui, icons::ARROWS_CLOCKWISE, "重试").clicked() {
+                        update_now = true;
+                    }
+                    if kit::secondary_button(ui, icons::GLOBE, "打开 Release 页面").clicked() {
+                        open_page = true;
+                    }
+                    if kit::secondary_button(ui, "", "稍后").clicked() {
+                        close = true;
+                    }
+                } else {
+                    if kit::primary_button(ui, icons::DOWNLOAD_SIMPLE, "立即更新").clicked() {
+                        update_now = true;
+                    }
+                    if kit::secondary_button(ui, icons::BELL_SLASH, "不再提示").clicked() {
+                        dismiss = true;
+                    }
+                    if kit::secondary_button(ui, "", "稍后").clicked() {
+                        close = true;
+                    }
                 }
             },
         );
         if update_now {
+            let _ = self.cmd_tx.send(UiCommand::InstallUpdate);
+            self.toast(NoticeLevel::Info, "开始下载更新，完成后会自动重启…");
+            return;
+        }
+        if open_page {
             open_url(&update.url);
-            self.update_modal = false;
-            self.toast(NoticeLevel::Info, "已在浏览器中打开 Release 页面");
             return;
         }
         if dismiss {
@@ -1171,37 +1262,6 @@ impl App {
                                         self.toast(NoticeLevel::Info, "正在检查更新…");
                                     }
                                 }
-                                if self.page.needs_search() {
-                                    let search_width = if content_rect.width() > 760.0 {
-                                        180.0
-                                    } else {
-                                        120.0
-                                    };
-                                    egui::Frame::new()
-                                        .fill(t.card)
-                                        .stroke(Stroke::new(1.0_f32, t.card_border))
-                                        .corner_radius(8)
-                                        .inner_margin(egui::Margin::symmetric(8, 3))
-                                        .show(ui, |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(
-                                                    RichText::new(icons::MAGNIFYING_GLASS)
-                                                        .size(12.0)
-                                                        .color(t.muted),
-                                                );
-                                                let response = ui.add(
-                                                    egui::TextEdit::singleline(&mut self.search)
-                                                        .frame(false)
-                                                        .hint_text("搜索")
-                                                        .desired_width(search_width),
-                                                );
-                                                if self.search_focus {
-                                                    response.request_focus();
-                                                    self.search_focus = false;
-                                                }
-                                            });
-                                        });
-                                }
                                 if content_rect.width() > 900.0 {
                                     ui.label(
                                         RichText::new(
@@ -1522,16 +1582,22 @@ impl App {
                             .trim_start_matches("https://")
                             .to_string();
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(if endpoint.is_empty() {
-                                    "—".to_string()
-                                } else {
-                                    endpoint.clone()
-                                })
-                                .monospace()
-                                .size(9.0)
-                                .color(t.muted),
-                            );
+                            let width = (ui.available_width() - 20.0).max(60.0);
+                            ui.add_sized(
+                                [width, 14.0],
+                                egui::Label::new(
+                                    RichText::new(if endpoint.is_empty() {
+                                        "—".to_string()
+                                    } else {
+                                        endpoint.clone()
+                                    })
+                                    .monospace()
+                                    .size(9.0)
+                                    .color(t.muted),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(endpoint.clone());
                             if ui
                                 .add(
                                     egui::Button::new(
@@ -1552,17 +1618,33 @@ impl App {
                             .endpoints
                             .iter()
                             .filter(|endpoint| endpoint.lan)
-                            .take(2)
                             .cloned()
                             .collect();
-                        for view in &lan_endpoints {
+                        if !lan_endpoints.is_empty() {
+                            let hover = lan_endpoints
+                                .iter()
+                                .map(|view| view.url.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let label = if lan_endpoints.len() == 1 {
+                                lan_endpoints[0]
+                                    .url
+                                    .trim_start_matches("http://")
+                                    .trim_start_matches("https://")
+                                    .to_string()
+                            } else {
+                                format!("局域网 {} 个地址", lan_endpoints.len())
+                            };
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(&view.url)
-                                        .monospace()
-                                        .size(8.5)
-                                        .color(t.muted),
-                                );
+                                let width = (ui.available_width() - 20.0).max(60.0);
+                                ui.add_sized(
+                                    [width, 14.0],
+                                    egui::Label::new(
+                                        RichText::new(label).monospace().size(8.5).color(t.muted),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(hover.clone());
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -1571,10 +1653,10 @@ impl App {
                                         .frame(false)
                                         .min_size(Vec2::splat(14.0)),
                                     )
-                                    .on_hover_text("复制局域网端点")
+                                    .on_hover_text("复制全部局域网端点")
                                     .clicked()
                                 {
-                                    ui.ctx().copy_text(view.url.clone());
+                                    ui.ctx().copy_text(hover.clone());
                                     self.toast(NoticeLevel::Success, "局域网端点已复制");
                                 }
                             });
@@ -1693,6 +1775,7 @@ impl App {
                 egui::ScrollArea::vertical()
                     .id_salt("central_content")
                     .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
                         let max_w = 1260.0_f32;
                         let avail = ui.available_width();
@@ -1803,6 +1886,7 @@ impl eframe::App for App {
         }
         self.poll_snapshot(ctx);
         self.prompt_update_if_needed();
+        self.reconcile_plugin_overrides();
         self.sync_plugin_settings();
         self.sync_live_fx();
         self.apply_theme(ctx);
@@ -1856,6 +1940,10 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar_scroll")
+                    .auto_shrink([false, false])
+                    // A visible track next to the content divider reads as a
+                    // thick black line; keep wheel scrolling, hide the rail.
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| self.sidebar(ui));
             });
 
@@ -1864,8 +1952,10 @@ impl eframe::App for App {
 
         self.show_editor(ctx);
         self.show_price_plan_modal(ctx);
+        self.show_ai_pricing_modal(ctx);
         self.show_update_modal(ctx);
         self.show_plugin_ui(ctx);
+        self.show_plugin_console(ctx);
         self.show_plugin_docs(ctx);
         self.show_confirm(ctx);
         self.show_test_modal(ctx);

@@ -18,6 +18,7 @@ use crate::config::{
     now_ts, AppConfig, AuthConfig, AuthMode, LocalKey, ModelRoute, Protocol, Provider,
 };
 use crate::db::{Db, UsageRecord};
+use crate::plugins::DynamicEntries;
 use crate::plugins::PluginHost;
 use crate::protocol::{
     self, build_upstream_body, convert_nonstream_response, extract_nonstream_usage, is_stream,
@@ -236,7 +237,13 @@ impl SpeedMeter {
 // ---------------------------------------------------------------------------
 
 pub struct Gateway {
+    /// Merged config (user config + runtime plugin providers). This is what
+    /// every scheduler, UI snapshot and request path reads.
     config: RwLock<Arc<AppConfig>>,
+    /// User configuration without dynamic plugin entries, used for saving.
+    base_config: RwLock<Arc<AppConfig>>,
+    /// Temporary providers/accounts/routes contributed by running plugins.
+    dynamic: RwLock<crate::plugins::DynamicEntries>,
     pub(crate) master: Arc<crate::config::secret::MasterKey>,
     pub db: Arc<Db>,
     pub scheduler: Arc<Scheduler>,
@@ -281,7 +288,9 @@ impl Gateway {
             .unwrap_or_else(|_| reqwest::Client::new());
         let gate = ConcurrencyGate::new(config.server.max_global_concurrency);
         Arc::new(Self {
-            config: RwLock::new(config),
+            config: RwLock::new(config.clone()),
+            base_config: RwLock::new(config),
+            dynamic: RwLock::new(crate::plugins::DynamicEntries::default()),
             master,
             db,
             scheduler,
@@ -304,13 +313,73 @@ impl Gateway {
 
     pub fn update_config(&self, config: Arc<AppConfig>) {
         self.gate.set_limit(config.server.max_global_concurrency);
-        if let Ok(mut guard) = self.config.write() {
+        if let Ok(mut guard) = self.base_config.write() {
             *guard = config;
         }
+        self.rebuild_config();
         self.key_quota_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// User configuration without runtime plugin entries.
+    pub fn base_config(&self) -> Arc<AppConfig> {
+        self.base_config
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|e| Arc::clone(&e.into_inner()))
+    }
+
+    /// Install the plugin-provided providers/accounts/routes.
+    pub fn set_dynamic(&self, entries: DynamicEntries) {
+        if let Ok(mut guard) = self.dynamic.write() {
+            *guard = entries;
+        }
+        self.rebuild_config();
+        self.key_quota_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    fn rebuild_config(&self) {
+        let base = self.base_config();
+        let dynamic = self
+            .dynamic
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let merged = if dynamic.providers.is_empty()
+            && dynamic.accounts.is_empty()
+            && dynamic.routes.is_empty()
+        {
+            base
+        } else {
+            let mut cfg = (*base).clone();
+            cfg.providers.extend(dynamic.providers);
+            cfg.accounts.extend(dynamic.accounts);
+            cfg.routes.extend(dynamic.routes);
+            Arc::new(cfg)
+        };
+        if let Ok(mut guard) = self.config.write() {
+            *guard = merged;
+        }
+    }
+
+    pub fn plugin_for_provider(&self, provider_id: &str) -> Option<String> {
+        self.dynamic
+            .read()
+            .ok()
+            .and_then(|dynamic| dynamic.provider_plugins.get(provider_id).cloned())
+    }
+
+    pub fn plugin_provider_streams(&self, provider_id: &str) -> bool {
+        self.dynamic
+            .read()
+            .ok()
+            .map(|dynamic| dynamic.streaming.contains(provider_id))
+            .unwrap_or(true)
     }
 
     pub fn queue_depth(&self) -> (usize, usize) {
@@ -1012,6 +1081,19 @@ async fn chat_handler(
             continue;
         }
         attempts_made += 1;
+        gw.plugins.notify(
+            "onRouteSelected",
+            serde_json::json!({
+                "event": "onRouteSelected",
+                "model": client_model,
+                "account": attempt.account.name,
+                "accountId": attempt.account.id,
+                "provider": attempt.provider.name,
+                "providerId": attempt.provider.id,
+                "upstreamModel": attempt.route.upstream_model,
+                "protocol": attempt.upstream_protocol.label(),
+            }),
+        );
         // The chain is built before the first request. If an earlier attempt
         // in this same request cooled the account, do not try it again for a
         // second route — move on to the next account/provider.
@@ -1031,6 +1113,233 @@ async fn chat_handler(
             errors.push(format!("账号「{}」并发已满", attempt.account.name));
             continue;
         };
+        if let Some(plugin_id) = gw.plugin_for_provider(&attempt.provider.id) {
+            let upstream_body = match build_upstream_body(
+                ingress,
+                attempt.upstream_protocol,
+                &payload,
+                &attempt.route.upstream_model,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    errors.push(format!("插件供应商协议转换失败：{err}"));
+                    continue;
+                }
+            };
+            let supports_streaming = gw.plugin_provider_streams(&attempt.provider.id);
+            let wants_stream = stream_requested && supports_streaming;
+            let timeout_secs = attempt
+                .provider
+                .timeout_secs
+                .unwrap_or(cfg.server.upstream_timeout_secs)
+                .max(10);
+            let event = serde_json::json!({
+                "event": "onProviderRequest",
+                "provider": {
+                    "id": attempt.provider.id,
+                    "name": attempt.provider.name,
+                    "model": attempt.route.upstream_model,
+                    "streaming": supports_streaming,
+                },
+                "request": {
+                    "payload": upstream_body,
+                    "model": attempt.route.upstream_model,
+                    "clientModel": client_model,
+                    "stream": stream_requested,
+                    "protocol": attempt.upstream_protocol.label(),
+                }
+            });
+
+            if wants_stream {
+                match gw.plugins.call_provider_stream(&plugin_id, event).await {
+                    Ok(chunks) => {
+                        let upstream = async_stream::stream! {
+                            let mut rx = chunks;
+                            while let Some(item) = rx.recv().await {
+                                yield item;
+                            }
+                        };
+                        let translator = StreamTranslator::new(
+                            ingress.protocol().unwrap_or(Protocol::OpenAiChat),
+                            attempt.upstream_protocol,
+                            &client_model,
+                        );
+                        let usage_cell = Arc::new(Mutex::new(Usage::default()));
+                        let finalizer = StreamFinalizer {
+                            db: gw.db.clone(),
+                            scheduler: gw.scheduler.clone(),
+                            account: attempt.account.clone(),
+                            route: attempt.route.clone(),
+                            provider: attempt.provider.clone(),
+                            client_model: client_model.clone(),
+                            local_key_id: auth.key.as_ref().map(|k| k.id.clone()),
+                            request_id: request_id.clone(),
+                            usage: usage_cell.clone(),
+                            plugins: gw.plugins.clone(),
+                            account_name: attempt.account.name.clone(),
+                            provider_name: attempt.provider.name.clone(),
+                            fx_units_per_usd: cfg
+                                .ui
+                                .fx_rate(attempt.route.effective_pricing().currency.code()),
+                            _slot: Some(slot),
+                            _permit: Some(permit),
+                            started,
+                            done: false,
+                            completed: false,
+                            failed: false,
+                        };
+                        let body = build_sse_body(
+                            upstream,
+                            translator,
+                            finalizer,
+                            usage_cell,
+                            gw.speed.clone(),
+                            Duration::from_secs(cfg.server.stream_idle_timeout_secs.max(5)),
+                        );
+                        let mut response = Response::new(body);
+                        *response.status_mut() = StatusCode::OK;
+                        let h = response.headers_mut();
+                        h.insert(
+                            header::CONTENT_TYPE,
+                            "text/event-stream; charset=utf-8".parse().unwrap(),
+                        );
+                        h.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+                        h.insert(
+                            "x-yoyo-attempts",
+                            attempts_made.to_string().parse().unwrap(),
+                        );
+                        gw.scheduler.on_success(&attempt.account.id);
+                        gw.scheduler.breaker.record_success();
+                        return response;
+                    }
+                    Err(err) => {
+                        errors.push(format!("插件供应商流式失败：{err}"));
+                        last_failure =
+                            Some((attempt.account.id.clone(), attempt.provider.id.clone()));
+                        last_status = StatusCode::BAD_GATEWAY;
+                        continue;
+                    }
+                }
+            }
+
+            match gw
+                .plugins
+                .call_provider(&plugin_id, event, Duration::from_secs(timeout_secs))
+                .await
+            {
+                Ok((status, body)) => {
+                    if !(200..300).contains(&status) {
+                        last_status =
+                            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                        last_failure =
+                            Some((attempt.account.id.clone(), attempt.provider.id.clone()));
+                        errors.push(format!(
+                            "插件供应商返回 HTTP {status}：{}",
+                            upstream_error_message(&body.to_string())
+                        ));
+                        continue;
+                    }
+                    let usage = extract_nonstream_usage(attempt.upstream_protocol, &body);
+                    let converted = convert_nonstream_response(
+                        ingress,
+                        attempt.upstream_protocol,
+                        body,
+                        &client_model,
+                    );
+                    let latency = started.elapsed().as_millis() as u64;
+                    match converted {
+                        Ok(mut value) => {
+                            if let Some(model) = value.get_mut("model") {
+                                *model = Value::String(client_model.clone());
+                            }
+                            gw.scheduler.on_success(&attempt.account.id);
+                            gw.scheduler.breaker.record_success();
+                            let cost_micros = attempt.route.cost_micros_with_fx(
+                                usage.input_tokens,
+                                usage.cached_tokens,
+                                usage.output_tokens,
+                                chrono::Local::now(),
+                                cfg.ui
+                                    .fx_rate(attempt.route.effective_pricing().currency.code()),
+                            );
+                            gw.record_usage(UsageRecord {
+                                ts: now_ts(),
+                                request_id: request_id.clone(),
+                                account_id: attempt.account.id.clone(),
+                                provider_id: attempt.provider.id.clone(),
+                                local_key_id: auth.key.as_ref().map(|k| k.id.clone()),
+                                client_model: client_model.clone(),
+                                upstream_model: attempt.route.upstream_model.clone(),
+                                protocol: attempt.upstream_protocol.label().to_string(),
+                                status: 200,
+                                ok: true,
+                                stream: false,
+                                cancelled: false,
+                                prompt_tokens: usage.input_tokens,
+                                cached_tokens: usage.cached_tokens,
+                                completion_tokens: usage.output_tokens,
+                                total_tokens: usage.total(),
+                                cost_micros,
+                                latency_ms: latency,
+                                kind: "chat".into(),
+                            });
+                            gw.plugins.notify(
+                                "onRequestCompleted",
+                                serde_json::json!({
+                                    "event": "onRequestCompleted",
+                                    "request": {
+                                        "id": request_id,
+                                        "model": client_model,
+                                        "upstreamModel": attempt.route.upstream_model,
+                                        "account": attempt.account.name,
+                                        "provider": attempt.provider.name,
+                                        "protocol": attempt.upstream_protocol.label(),
+                                        "status": 200,
+                                        "ok": true,
+                                        "stream": false,
+                                    },
+                                    "usage": {
+                                        "promptTokens": usage.input_tokens,
+                                        "cachedTokens": usage.cached_tokens,
+                                        "completionTokens": usage.output_tokens,
+                                        "totalTokens": usage.total(),
+                                        "costMicros": cost_micros,
+                                        "latencyMs": latency,
+                                    }
+                                }),
+                            );
+                            if let Some(modified) = gw
+                                .plugins
+                                .after_response(plugin_meta.clone(), value.clone())
+                                .await
+                            {
+                                value = modified;
+                            }
+                            let mut response = Json(value).into_response();
+                            let h = response.headers_mut();
+                            h.insert(
+                                "x-yoyo-attempts",
+                                attempts_made.to_string().parse().unwrap(),
+                            );
+                            h.insert("x-yoyo-plugin-provider", plugin_id.parse().unwrap());
+                            gw.speed.record_span(usage.output_tokens, started.elapsed());
+                            return response;
+                        }
+                        Err(err) => {
+                            errors.push(format!("插件供应商响应协议转换失败：{err}"));
+                            last_status = StatusCode::BAD_GATEWAY;
+                            continue;
+                        }
+                    }
+                }
+                Err(err) => {
+                    errors.push(format!("插件供应商失败：{err}"));
+                    last_failure = Some((attempt.account.id.clone(), attempt.provider.id.clone()));
+                    last_status = StatusCode::BAD_GATEWAY;
+                    continue;
+                }
+            }
+        }
         let api_key = match gw.master.decrypt(&attempt.account.api_key) {
             Ok(k) => k,
             Err(err) => {
@@ -1221,14 +1530,14 @@ async fn chat_handler(
                 // Re-attach the already-read chunk so the translator sees the
                 // complete stream without dropping the first SSE event.
                 let upstream = async_stream::stream! {
-                    yield Ok::<Bytes, reqwest::Error>(first);
+                    yield Ok::<Bytes, String>(first);
                     let mut resp = resp;
                     loop {
                         match resp.chunk().await {
                             Ok(Some(chunk)) => yield Ok(chunk),
                             Ok(None) => break,
                             Err(err) => {
-                                yield Err(err);
+                                yield Err(err.to_string());
                                 break;
                             }
                         }
@@ -1628,6 +1937,16 @@ async fn chat_handler(
     } else {
         StatusCode::BAD_GATEWAY
     };
+    gw.plugins.notify(
+        "onError",
+        serde_json::json!({
+            "event": "onError",
+            "model": client_model,
+            "status": status.as_u16(),
+            "attempts": attempts_made,
+            "message": truncate_text(&message, 1200),
+        }),
+    );
     let mut resp = gw.error_response(
         ingress,
         status,
@@ -1772,7 +2091,7 @@ fn build_sse_body<S>(
     idle_timeout: Duration,
 ) -> Body
 where
-    S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, String>> + Send + 'static,
 {
     let stream = async_stream::stream! {
         futures_util::pin_mut!(upstream);
