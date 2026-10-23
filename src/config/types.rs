@@ -385,6 +385,11 @@ pub struct UiConfig {
     /// Optional temporary display override set by the cost-card toggle. Empty
     /// means "follow home_currency".
     pub display_currency: String,
+    /// Cached caller selection for the AI provider/price generators. If the
+    /// provider or account disappears, the generator asks the user to reselect.
+    pub ai_provider_id: String,
+    pub ai_account_id: String,
+    pub ai_model: String,
     /// Windows taskbar badge composition and placement.
     pub taskbar: TaskbarBadgeConfig,
     /// Check GitHub for a newer release in the background.
@@ -501,6 +506,9 @@ impl Default for UiConfig {
             fx_source: String::new(),
             home_currency: "CNY".to_string(),
             display_currency: String::new(),
+            ai_provider_id: String::new(),
+            ai_account_id: String::new(),
+            ai_model: String::new(),
             taskbar: TaskbarBadgeConfig::default(),
             auto_update_check: true,
             update_check_hours: 12,

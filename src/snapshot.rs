@@ -328,6 +328,16 @@ pub struct AiPricingView {
     pub error: Option<String>,
 }
 
+/// Result of a natural-language provider generation.
+#[derive(Clone, Debug, Default)]
+pub struct AiProviderView {
+    /// Monotonic request id; stale background results are ignored.
+    pub token: u64,
+    pub running: bool,
+    pub provider: Option<crate::config::Provider>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FetchedModelView {
     pub id: u64,
@@ -390,6 +400,8 @@ pub struct UiSnapshot {
     pub model_fetch_running: bool,
     /// Background natural-language pricing generation.
     pub ai_pricing: Option<AiPricingView>,
+    /// Background natural-language provider creation.
+    pub ai_provider: Option<AiProviderView>,
     /// Latest `/models` catalogue per provider id.
     pub provider_models: HashMap<String, ProviderModelsView>,
     pub models_fetching: HashSet<String>,
@@ -445,6 +457,7 @@ impl Default for UiSnapshot {
             fetched_model: None,
             model_fetch_running: false,
             ai_pricing: None,
+            ai_provider: None,
             provider_models: HashMap::new(),
             models_fetching: HashSet::new(),
             fx_rates: BTreeMap::new(),

@@ -1,4 +1,3 @@
-use armas::ext::ArmasContextExt;
 use egui::{RichText, Vec2};
 use egui_phosphor::regular as icons;
 
@@ -6,6 +5,43 @@ use crate::config::now_ts;
 use crate::snapshot::{AlertLevel, ProxyStatus};
 
 use super::{theme, widgets, App};
+
+fn inspection_row(
+    ui: &mut egui::Ui,
+    dot: egui::Color32,
+    label: &str,
+    value: &str,
+    value_color: egui::Color32,
+    pill: bool,
+) {
+    let t = theme::tokens(ui);
+    egui::Frame::new()
+        .fill(if t.dark_mode {
+            t.hover
+        } else {
+            egui::Color32::from_rgb(248, 250, 253)
+        })
+        .stroke(egui::Stroke::new(1.0_f32, t.card_border))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(11, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(7.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, dot);
+                ui.add_space(2.0);
+                ui.label(RichText::new(label).size(10.8).color(t.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if pill {
+                        super::kit::status_badge(ui, value, value_color);
+                    } else {
+                        ui.label(RichText::new(value).size(10.5).strong().color(value_color));
+                    }
+                });
+            });
+        });
+    ui.add_space(5.0);
+}
 
 impl App {
     pub(crate) fn page_overview(&mut self, ui: &mut egui::Ui) {
@@ -32,9 +68,28 @@ impl App {
             ui.add_space(10.0);
             self.alert_card(ui);
         } else {
-            ui.columns(2, |cols| {
-                self.proxy_card(&mut cols[0]);
-                self.alert_card(&mut cols[1]);
+            let total = ui.available_width();
+            let gap = 12.0;
+            let left = (total * 0.58).max(430.0);
+            let right = (total - left - gap).max(320.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(left);
+                        self.proxy_card(ui);
+                    },
+                );
+                ui.add_space(gap);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(right, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(right);
+                        self.alert_card(ui);
+                    },
+                );
             });
         }
         ui.add_space(12.0);
@@ -348,24 +403,44 @@ impl App {
     }
 
     fn proxy_card(&mut self, ui: &mut egui::Ui) {
-        let theme = ui.ctx().armas_theme();
         let (proxy_color, proxy_label) = match &self.snapshot.proxy {
             ProxyStatus::Running => (theme::GREEN, "运行中"),
             ProxyStatus::Starting => (theme::ORANGE, "启动中"),
             ProxyStatus::Stopped => (theme::MUTED, "已停止"),
             ProxyStatus::Error(_) => (theme::RED, "异常"),
         };
+        let port = self.config.server.port;
+        let lan_enabled = self.snapshot.lan_enabled;
+        let endpoint = self.snapshot.endpoint.clone();
+        let lan_endpoints: Vec<_> = self
+            .snapshot
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.lan)
+            .cloned()
+            .collect();
+        let uptime = crate::config::fmt_duration_secs(self.snapshot.uptime_secs);
+        let active = self.snapshot.active_requests.to_string();
+        let queued = self.snapshot.queued_requests.to_string();
+        let max_concurrency = self.config.server.max_global_concurrency.to_string();
+        let queue_capacity = self.config.server.queue_capacity.to_string();
+        let mut stop = false;
+        let mut restart = false;
+        let mut start = false;
         super::kit::section_card(
             ui,
-            icons::DESKTOP_TOWER,
-            "代理状态",
-            "本地端点与运行控制",
+            icons::HARD_DRIVES,
+            "代理服务与本地端点",
+            "本地端点分流、请求映射与运行控制器",
             |ui| {
-                super::kit::status_badge(ui, proxy_label, proxy_color);
+                super::kit::status_badge(ui, &format!("{proxy_label} (Port: {port})"), proxy_color);
+                if lan_enabled {
+                    super::kit::badge(ui, "局域网", theme::BLUE_INFO);
+                }
             },
             |ui| {
+                let t = theme::tokens(ui);
                 if let ProxyStatus::Error(err) = &self.snapshot.proxy {
-                    let t = theme::tokens(ui);
                     egui::Frame::new()
                         .fill(theme::soft_for(ui, theme::RED))
                         .stroke(egui::Stroke::new(1.0_f32, theme::RED.gamma_multiply(0.28)))
@@ -387,32 +462,56 @@ impl App {
                         });
                     ui.add_space(8.0);
                 }
-                let endpoint = self.snapshot.endpoint.clone();
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("基础请求端点 (Base URL)")
+                            .size(10.5)
+                            .strong()
+                            .color(t.muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("兼容 OpenAI / Claude API 规范")
+                                .size(9.5)
+                                .color(t.muted),
+                        );
+                    });
+                });
+                ui.add_space(4.0);
                 egui::Frame::new()
-                    .fill(theme.muted())
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::symmetric(10, 7))
+                    .fill(if t.dark_mode {
+                        t.hover
+                    } else {
+                        egui::Color32::from_rgb(248, 250, 253)
+                    })
+                    .stroke(egui::Stroke::new(1.0_f32, t.card_border))
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(icons::PLUGS_CONNECTED)
-                                    .size(14.0)
-                                    .color(theme.primary()),
+                                RichText::new(icons::LIGHTNING)
+                                    .size(16.0)
+                                    .color(theme::ACCENT),
                             );
                             ui.label(
                                 RichText::new(if endpoint.is_empty() {
-                                    "—".to_string()
+                                    "—"
                                 } else {
-                                    endpoint.clone()
+                                    endpoint.as_str()
                                 })
                                 .monospace()
-                                .size(11.0),
+                                .size(12.5)
+                                .strong(),
                             );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if super::kit::icon_button(ui, icons::COPY, "复制端点")
+                                    if super::kit::secondary_button(ui, icons::COPY, "复制")
                                         .clicked()
+                                        && !endpoint.is_empty()
                                     {
                                         ui.ctx().copy_text(endpoint.clone());
                                         self.toast(
@@ -420,122 +519,199 @@ impl App {
                                             "端点已复制",
                                         );
                                     }
+                                    if super::kit::secondary_button(ui, "", "cURL 示例")
+                                        .clicked()
+                                        && !endpoint.is_empty()
+                                    {
+                                        let curl = format!(
+                                            "curl -N {endpoint}/chat/completions -H 'Authorization: Bearer yr-REPLACE_WITH_YOUR_KEY' -H 'Content-Type: application/json' -d '{{\"model\":\"your-model\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"stream\":true}}'"
+                                        );
+                                        ui.ctx().copy_text(curl);
+                                        self.toast(
+                                            crate::snapshot::NoticeLevel::Success,
+                                            "cURL 示例已复制",
+                                        );
+                                    }
                                 },
                             );
                         });
                     });
-                let lan_endpoints: Vec<_> = self
-                    .snapshot
-                    .endpoints
-                    .iter()
-                    .filter(|endpoint| endpoint.lan)
-                    .cloned()
-                    .collect();
-                for view in &lan_endpoints {
-                    ui.add_space(3.0);
-                    ui.horizontal(|ui| {
-                        super::kit::badge(ui, &view.label, theme::BLUE_INFO);
-                        ui.label(
-                            RichText::new(&view.url)
-                                .monospace()
-                                .size(10.0)
-                                .color(theme::text(ui)),
-                        );
-                        if super::kit::icon_button(ui, icons::COPY, "复制局域网端点").clicked()
-                        {
-                            ui.ctx().copy_text(view.url.clone());
-                            self.toast(crate::snapshot::NoticeLevel::Success, "局域网端点已复制");
+                if !lan_endpoints.is_empty() {
+                    ui.add_space(5.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("局域网").size(9.5).color(t.muted));
+                        for view in &lan_endpoints {
+                            if super::kit::path_pill(ui, &view.url)
+                                .on_hover_text("点击复制局域网端点")
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(view.url.clone());
+                                self.toast(
+                                    crate::snapshot::NoticeLevel::Success,
+                                    "局域网端点已复制",
+                                );
+                            }
                         }
                     });
                 }
-                ui.add_space(6.0);
+
+                ui.add_space(9.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        RichText::new("三协议入口")
+                        RichText::new("标准协议入口快捷测试与映射:")
                             .size(10.0)
-                            .color(theme::muted(ui)),
+                            .color(t.muted),
                     );
-                    super::kit::plain_badge(ui, "/chat/completions");
-                    super::kit::plain_badge(ui, "/messages");
-                    super::kit::plain_badge(ui, "/responses");
-                    super::kit::plain_badge(ui, "/models");
+                    for path in [
+                        "/chat/completions",
+                        "/messages",
+                        "/responses",
+                        "/models",
+                        "/embeddings",
+                    ] {
+                        if super::kit::path_pill(ui, path)
+                            .on_hover_text("点击复制完整入口")
+                            .clicked()
+                            && !endpoint.is_empty()
+                        {
+                            ui.ctx().copy_text(format!("{endpoint}{path}"));
+                            self.toast(
+                                crate::snapshot::NoticeLevel::Success,
+                                format!("已复制 {path}"),
+                            );
+                        }
+                    }
                 });
-                ui.add_space(8.0);
-                ui.columns(3, |cols| {
-                    super::kit::info_line(
-                        &mut cols[0],
-                        "运行时长",
-                        &crate::config::fmt_duration_secs(self.snapshot.uptime_secs),
-                    );
-                    super::kit::info_line(
-                        &mut cols[1],
-                        "活跃请求",
-                        &self.snapshot.active_requests.to_string(),
-                    );
-                    super::kit::info_line(
-                        &mut cols[2],
-                        "排队",
-                        &self.snapshot.queued_requests.to_string(),
-                    );
+
+                ui.add_space(10.0);
+                ui.columns(5, |cols| {
+                    super::kit::mini_stat(&mut cols[0], "持续时长", &uptime);
+                    super::kit::mini_stat(&mut cols[1], "活跃请求", &active);
+                    super::kit::mini_stat(&mut cols[2], "排队中", &queued);
+                    super::kit::mini_stat(&mut cols[3], "并发上限", &max_concurrency);
+                    super::kit::mini_stat(&mut cols[4], "队列容量", &queue_capacity);
                 });
-                ui.add_space(8.0);
+
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let running = self.snapshot.proxy.is_running();
                     if running {
-                        if super::kit::secondary_labeled(ui, icons::STOP, "停止").clicked() {
-                            let _ = self.cmd_tx.send(crate::runtime::UiCommand::StopProxy);
+                        if super::kit::danger_button(ui, icons::STOP, "停止代理").clicked() {
+                            stop = true;
                         }
-                        if super::kit::ghost_labeled(ui, icons::ARROWS_CLOCKWISE, "重启").clicked()
+                        if super::kit::secondary_button(ui, icons::ARROWS_CLOCKWISE, "重启网关")
+                            .clicked()
                         {
-                            let _ = self.cmd_tx.send(crate::runtime::UiCommand::RestartProxy);
+                            restart = true;
                         }
-                    } else if super::kit::primary_labeled(ui, icons::PLAY, "启动代理").clicked()
+                    } else if super::kit::primary_button(ui, icons::PLAY, "启动代理").clicked()
                     {
-                        let _ = self.cmd_tx.send(crate::runtime::UiCommand::StartProxy);
+                        start = true;
                     }
-                    ui.label(
-                        RichText::new(format!(
-                            "并发上限 {} · 队列 {}",
-                            self.config.server.max_global_concurrency,
-                            self.config.server.queue_capacity
-                        ))
-                        .size(9.5)
-                        .color(theme::muted(ui)),
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("并发保护策略：动态自适应排队")
+                                .size(9.5)
+                                .color(t.muted),
+                        );
+                    });
                 });
             },
         );
+        if stop {
+            let _ = self.cmd_tx.send(crate::runtime::UiCommand::StopProxy);
+        }
+        if restart {
+            let _ = self.cmd_tx.send(crate::runtime::UiCommand::RestartProxy);
+        }
+        if start {
+            let _ = self.cmd_tx.send(crate::runtime::UiCommand::StartProxy);
+        }
     }
 
     fn alert_card(&mut self, ui: &mut egui::Ui) {
         let alert_count = self.snapshot.alerts.len();
-        let rows: Vec<_> = self.snapshot.alerts.iter().take(5).cloned().collect();
+        let rows: Vec<_> = self.snapshot.alerts.iter().take(4).cloned().collect();
+        let healthy: usize = self
+            .snapshot
+            .providers
+            .iter()
+            .map(|provider| provider.healthy + provider.half_open)
+            .sum();
+        let total: usize = self
+            .snapshot
+            .providers
+            .iter()
+            .map(|provider| provider.account_count)
+            .sum();
+        let low_balances = self
+            .snapshot
+            .balances
+            .iter()
+            .filter(|balance| {
+                balance
+                    .amount
+                    .is_some_and(|amount| amount < self.config.ui.threshold_for(&balance.currency))
+            })
+            .count();
+        let breaker_open = self.snapshot.breaker.open;
+        let breaker_secs = (self.snapshot.breaker.open_until - now_ts()).max(0);
+        let last_diagnostic = self.last_diagnostic_at.map(|at| at.elapsed().as_secs());
+        let provider_ids: Vec<String> = self
+            .snapshot
+            .providers
+            .iter()
+            .map(|provider| provider.id.clone())
+            .collect();
+        let mut diagnose = false;
+        let t = theme::tokens(ui);
         super::kit::section_card(
             ui,
             icons::WARNING_CIRCLE,
-            "告警",
-            "供应商、余额与配置检查",
+            "系统告警与巡检",
+            "供应商连通性、余额健康度与配置检查",
             |ui| {
                 if alert_count > 0 {
-                    super::kit::badge(ui, &format!("{alert_count} 项"), theme::ORANGE);
+                    super::kit::status_badge(ui, &format!("{alert_count} 项告警"), theme::ORANGE);
                 } else {
-                    super::kit::status_badge(ui, "正常", theme::GREEN);
+                    super::kit::status_badge(ui, "正常 (0 告警)", theme::GREEN);
                 }
             },
             |ui| {
                 if rows.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(icons::CHECK_CIRCLE)
-                                .size(14.0)
-                                .color(theme::GREEN),
-                        );
-                        ui.label(
-                            RichText::new("当前没有需要处理的告警。")
-                                .size(11.5)
-                                .color(theme::muted(ui)),
-                        );
-                    });
+                    egui::Frame::new()
+                        .fill(theme::soft_for(ui, theme::GREEN))
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            theme::GREEN.gamma_multiply(0.25),
+                        ))
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal_top(|ui| {
+                                ui.label(
+                                    RichText::new(icons::CHECK_CIRCLE)
+                                        .size(16.0)
+                                        .color(theme::GREEN),
+                                );
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("当前没有需要处理的告警")
+                                            .size(11.5)
+                                            .strong()
+                                            .color(t.text),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "已检测所有上游 API 节点，均能顺畅握手响应。",
+                                        )
+                                        .size(9.5)
+                                        .color(t.muted),
+                                    );
+                                });
+                            });
+                        });
                 } else {
                     for alert in &rows {
                         let (color, icon) = match alert.level {
@@ -543,7 +719,6 @@ impl App {
                             AlertLevel::Warning => (theme::ORANGE, icons::WARNING),
                             AlertLevel::Critical => (theme::RED, icons::WARNING_OCTAGON),
                         };
-                        let t = theme::tokens(ui);
                         egui::Frame::new()
                             .fill(theme::soft_for(ui, color))
                             .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.28)))
@@ -551,7 +726,7 @@ impl App {
                             .inner_margin(egui::Margin::symmetric(11, 9))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                ui.set_min_height(36.0);
+                                ui.set_min_height(34.0);
                                 ui.horizontal_top(|ui| {
                                     ui.label(RichText::new(icon).size(14.0).color(color));
                                     ui.add_space(2.0);
@@ -569,23 +744,105 @@ impl App {
                         ui.label(
                             RichText::new(format!("另有 {} 项见设置页", alert_count - rows.len()))
                                 .size(10.0)
-                                .color(theme::muted(ui)),
+                                .color(t.muted),
                         );
                     }
                 }
-                if self.snapshot.breaker.open {
-                    ui.add_space(4.0);
-                    super::kit::tooltip_text(
-                        ui,
-                        icons::SHIELD_WARNING,
-                        &format!(
-                            "全局熔断中，剩余 {} 秒",
-                            (self.snapshot.breaker.open_until - now_ts()).max(0)
-                        ),
-                    );
-                }
+
+                ui.add_space(6.0);
+                inspection_row(
+                    ui,
+                    theme::GREEN,
+                    "上游供应商心跳检测",
+                    &if total == 0 {
+                        "未配置".to_string()
+                    } else {
+                        format!("{healthy}/{total} 可用")
+                    },
+                    if total == 0 {
+                        t.muted
+                    } else if healthy == total {
+                        theme::GREEN
+                    } else if healthy > 0 {
+                        theme::ORANGE
+                    } else {
+                        theme::RED
+                    },
+                    false,
+                );
+                let balance_text = if low_balances == 0 {
+                    "充足".to_string()
+                } else {
+                    format!("{low_balances} 个低余额")
+                };
+                inspection_row(
+                    ui,
+                    if low_balances == 0 {
+                        theme::GREEN
+                    } else {
+                        theme::ORANGE
+                    },
+                    "账号余额与配额状态",
+                    &balance_text,
+                    if low_balances == 0 {
+                        theme::GREEN
+                    } else {
+                        theme::ORANGE
+                    },
+                    true,
+                );
+                let breaker_text = if breaker_open {
+                    format!("熔断中 · 剩余 {breaker_secs} 秒")
+                } else {
+                    "待命 · 0 熔断".to_string()
+                };
+                inspection_row(
+                    ui,
+                    if breaker_open {
+                        theme::RED
+                    } else {
+                        theme::BLUE_INFO
+                    },
+                    "动态熔断器 (Circuit Breaker)",
+                    &breaker_text,
+                    if breaker_open {
+                        theme::RED
+                    } else {
+                        theme::BLUE_INFO
+                    },
+                    false,
+                );
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let text = match last_diagnostic {
+                        Some(secs) => format!("最近巡检: {secs} 秒前"),
+                        None => "最近巡检: 尚未执行".to_string(),
+                    };
+                    ui.label(RichText::new(text).size(9.5).color(t.muted));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if super::kit::ghost_labeled(ui, icons::ARROW_RIGHT, "立即执行诊断")
+                            .clicked()
+                            && !provider_ids.is_empty()
+                        {
+                            diagnose = true;
+                        }
+                    });
+                });
             },
         );
+        if diagnose {
+            for provider_id in &provider_ids {
+                let _ = self
+                    .cmd_tx
+                    .send(crate::runtime::UiCommand::TestProvider(provider_id.clone()));
+            }
+            self.last_diagnostic_at = Some(std::time::Instant::now());
+            self.toast(
+                crate::snapshot::NoticeLevel::Info,
+                format!("已开始诊断 {} 个供应商", provider_ids.len()),
+            );
+        }
     }
 
     fn curl_for(&self, request: &crate::db::RecentRequest) -> String {

@@ -301,6 +301,7 @@ pub struct App {
     pub(crate) import_path: String,
     pub(crate) last_export_path: Option<String>,
     pub(crate) last_dark: Option<bool>,
+    pub(crate) last_diagnostic_at: Option<Instant>,
     pub(crate) last_applied_fetch: Option<u64>,
     pub(crate) models_requested: HashSet<String>,
     pub(crate) taskbar_badge: Option<crate::taskbar::TaskbarBadge>,
@@ -317,6 +318,14 @@ pub struct App {
     pub(crate) ai_pricing_token: u64,
     pub(crate) ai_pricing_seq: u64,
     pub(crate) ai_pricing_apply: Option<(String, PricePlan)>,
+    /// Natural-language provider creation.
+    pub(crate) ai_provider_open: bool,
+    pub(crate) ai_provider_prompt: String,
+    pub(crate) ai_provider_account_key: String,
+    pub(crate) ai_provider_generating: bool,
+    pub(crate) ai_provider_token: u64,
+    pub(crate) ai_provider_seq: u64,
+    pub(crate) ai_provider_error: Option<String>,
     pub(crate) price_plan_import_path: String,
     /// Validation message shown in a modal when the currency cannot be used.
     pub(crate) currency_error: Option<String>,
@@ -398,6 +407,7 @@ impl App {
             import_path: String::new(),
             last_export_path: None,
             last_dark: None,
+            last_diagnostic_at: None,
             last_applied_fetch: None,
             models_requested: HashSet::new(),
             taskbar_badge: None,
@@ -412,6 +422,13 @@ impl App {
             ai_pricing_token: 0,
             ai_pricing_seq: 0,
             ai_pricing_apply: None,
+            ai_provider_open: false,
+            ai_provider_prompt: String::new(),
+            ai_provider_account_key: String::new(),
+            ai_provider_generating: false,
+            ai_provider_token: 0,
+            ai_provider_seq: 0,
+            ai_provider_error: None,
             price_plan_import_path: String::new(),
             currency_error: None,
             update_modal: false,
@@ -2015,6 +2032,7 @@ impl eframe::App for App {
         self.show_editor(ctx);
         self.show_price_plan_modal(ctx);
         self.show_ai_pricing_modal(ctx);
+        self.show_ai_provider_modal(ctx);
         self.show_update_modal(ctx);
         self.show_plugin_ui(ctx);
         self.show_plugin_console(ctx);

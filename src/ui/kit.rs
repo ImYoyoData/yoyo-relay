@@ -90,6 +90,44 @@ pub fn soft_panel(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
         });
 }
 
+/// Compact metric tile used by the overview proxy card.
+pub fn mini_stat(ui: &mut Ui, label: &str, value: &str) {
+    let t = theme::tokens(ui);
+    egui::Frame::new()
+        .fill(if t.dark_mode {
+            t.hover
+        } else {
+            Color32::from_rgb(248, 250, 253)
+        })
+        .stroke(Stroke::new(1.0_f32, t.card_border))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(label).size(9.5).color(t.muted));
+                ui.add_space(1.0);
+                ui.label(RichText::new(value).size(13.0).strong().color(t.text));
+            });
+        });
+}
+
+/// Clickable endpoint-path pill.
+pub fn path_pill(ui: &mut Ui, text: &str) -> Response {
+    let t = theme::tokens(ui);
+    ui.add(
+        egui::Button::new(RichText::new(text).monospace().size(9.5).color(t.text))
+            .fill(if t.dark_mode {
+                t.hover
+            } else {
+                Color32::from_rgb(244, 247, 252)
+            })
+            .stroke(Stroke::new(1.0_f32, t.card_border))
+            .corner_radius(8)
+            .min_size(Vec2::new(0.0, 24.0)),
+    )
+}
+
 pub fn divider(ui: &mut Ui) {
     let t = theme::tokens(ui);
     let rect = ui.available_rect_before_wrap();
@@ -107,7 +145,10 @@ pub fn divider(ui: &mut Ui) {
 // Scroll areas
 // ---------------------------------------------------------------------------
 
-const RAIL_WIDTH: f32 = 11.0;
+const RAIL_WIDTH: f32 = 12.0;
+/// Reserved column to the right of scrollable content. The custom rail lives
+/// here so it never floats on top of cards or text.
+const SCROLL_COLUMN: i8 = 24;
 
 /// Fade a colour to transparent without passing through black. Interpolating
 /// RGB toward transparent black makes hover states look like a dirty shadow.
@@ -141,23 +182,34 @@ fn paint_scroll_rail<R>(ui: &mut Ui, out: &egui::scroll_area::ScrollAreaOutput<R
         return;
     }
     let t = theme::tokens(ui);
-    let rail = Rect::from_min_size(
-        Pos2::new(viewport.right() + 4.0, viewport.top() + 2.0),
-        Vec2::new(RAIL_WIDTH, (viewport.height() - 4.0).max(20.0)),
+    let column = Rect::from_min_max(
+        Pos2::new(viewport.right() + 6.0, viewport.top()),
+        Pos2::new(viewport.right() + 6.0 + RAIL_WIDTH, viewport.bottom()),
     );
-    let (track, handle_top, handle_bottom) = if t.dark_mode {
+    let (column_fill, track, handle_top, handle_bottom) = if t.dark_mode {
         (
+            Color32::from_rgb(30, 36, 46),
             Color32::from_rgb(24, 30, 39),
             Color32::from_rgb(116, 127, 144),
             Color32::from_rgb(74, 84, 99),
         )
     } else {
         (
+            Color32::from_rgb(238, 242, 248),
             Color32::from_rgb(232, 236, 244),
             Color32::WHITE,
             Color32::from_rgb(199, 208, 222),
         )
     };
+    // Dedicated scrollbar column: a visible strip with a hairline separator,
+    // rather than a handle floating over the content.
+    ui.painter().rect_filled(column, 6, column_fill);
+    ui.painter().vline(
+        column.left() - 4.0,
+        viewport.y_range(),
+        Stroke::new(1.0_f32, t.card_border.gamma_multiply(0.7)),
+    );
+    let rail = column.shrink2(Vec2::new(2.0, 4.0));
     ui.painter().rect_filled(rail, 5, track);
     let handle_h = (viewport.height() / out.content_size.y.max(1.0) * rail.height())
         .clamp(36.0_f32.min(rail.height()), rail.height());
@@ -294,7 +346,7 @@ pub fn scroll_fill<R>(
     let out = egui::Frame::new()
         .inner_margin(egui::Margin {
             left: 0,
-            right: 18,
+            right: SCROLL_COLUMN,
             top: 0,
             bottom: 0,
         })
@@ -343,7 +395,7 @@ pub fn scroll_capped<R>(
     let out = egui::Frame::new()
         .inner_margin(egui::Margin {
             left: 0,
-            right: 18,
+            right: SCROLL_COLUMN,
             top: 0,
             bottom: 0,
         })
@@ -384,7 +436,7 @@ pub fn scroll_rows(
     let out = egui::Frame::new()
         .inner_margin(egui::Margin {
             left: 0,
-            right: 18,
+            right: SCROLL_COLUMN,
             top: 0,
             bottom: 0,
         })
@@ -531,14 +583,6 @@ pub fn info_row(ui: &mut Ui, icon: &str, text: &str) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(icon).size(12.0).color(t.muted));
         ui.label(RichText::new(text).size(10.5).color(t.muted));
-    });
-}
-
-pub fn kv(ui: &mut Ui, key: &str, value: &str) {
-    let t = theme::tokens(ui);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(key).size(10.0).color(t.muted));
-        ui.label(RichText::new(value).size(11.0).strong().color(t.text));
     });
 }
 
@@ -842,6 +886,123 @@ fn fitted_value_label(ui: &mut Ui, text: &str, base: f32, min: f32, color: Color
     ui.add(egui::Label::new(RichText::new(text).size(size).strong().color(color)).truncate());
 }
 
+pub struct KpiSpec {
+    pub icon: &'static str,
+    pub label: String,
+    pub value: String,
+    pub pill: Option<(String, Color32)>,
+    pub sub: String,
+    pub color: Color32,
+    /// Cost cards show a clickable currency chip instead of a static pill.
+    pub cost: bool,
+}
+
+fn overview_kpi_card(ui: &mut Ui, spec: &KpiSpec, cfg: &mut crate::config::UiConfig) -> bool {
+    let t = theme::tokens(ui);
+    let mut toggled = false;
+    egui::Frame::new()
+        .fill(t.card)
+        .stroke(Stroke::new(1.0_f32, t.card_border))
+        .corner_radius(16)
+        .shadow(t.card_shadow)
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Fixed content height keeps every KPI card the same size even when
+            // one card has no pill or a shorter value.
+            ui.set_min_height(94.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&spec.label).size(11.0).color(t.muted));
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    icon_chip(ui, spec.icon, spec.color, 32.0);
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.set_height(36.0);
+                let pill_w = spec
+                    .pill
+                    .as_ref()
+                    .map(|(text, _)| (text.chars().count() as f32 * 6.2 + 26.0).min(92.0))
+                    .unwrap_or(0.0);
+                let value_w = (ui.available_width() - pill_w - 8.0).max(56.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(value_w, 36.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.set_width(value_w);
+                        fitted_value_label(ui, &spec.value, 26.0, 11.0, t.text);
+                    },
+                );
+                if spec.cost {
+                    let home = cfg.home_currency();
+                    let active = cfg.active_currency();
+                    let next = if active == "USD" {
+                        if home == "USD" {
+                            "CNY".to_string()
+                        } else {
+                            home.clone()
+                        }
+                    } else {
+                        "USD".to_string()
+                    };
+                    if currency_chip(ui, &active)
+                        .on_hover_text("切换花费显示币种")
+                        .clicked()
+                    {
+                        cfg.display_currency = if next == home { String::new() } else { next };
+                        toggled = true;
+                        ui.ctx().request_repaint();
+                    }
+                } else if let Some((text, color)) = &spec.pill {
+                    status_badge(ui, text, *color);
+                }
+            });
+            ui.add_space(3.0);
+            ui.add(egui::Label::new(RichText::new(&spec.sub).size(9.5).color(t.muted)).truncate());
+        });
+    toggled
+}
+
+pub fn overview_kpi_grid(
+    ui: &mut Ui,
+    cards: &[KpiSpec],
+    cfg: &mut crate::config::UiConfig,
+) -> bool {
+    let avail = ui.available_width();
+    let min_card = 180.0;
+    let gap = 12.0;
+    let per_row: usize = if avail >= min_card * 4.0 + gap * 3.0 {
+        4
+    } else if avail >= min_card * 2.0 + gap {
+        2
+    } else {
+        1
+    };
+    let width = ((avail - gap * (per_row.saturating_sub(1)) as f32) / per_row as f32).max(140.0);
+    let total_rows = cards.len().div_ceil(per_row);
+    let mut changed = false;
+    for (row_index, chunk) in cards.chunks(per_row).enumerate() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for spec in chunk {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(width, 122.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(width);
+                        changed |= overview_kpi_card(ui, spec, cfg);
+                    },
+                );
+            }
+        });
+        if row_index + 1 < total_rows {
+            ui.add_space(10.0);
+        }
+    }
+    changed
+}
+
 pub fn kpi_cards_from_snapshot(
     ui: &mut Ui,
     snapshot: &crate::snapshot::UiSnapshot,
@@ -859,48 +1020,72 @@ pub fn kpi_cards_from_snapshot(
         "—".to_string()
     };
     let t = theme::tokens(ui);
-    let cards: Vec<(&str, &str, String, String, Color32)> = vec![
-        (
-            icons::PAPER_PLANE_TILT,
-            "今日请求",
-            widgets::format_count(today.requests),
-            format!("成功 {}", widgets::format_count(today.ok)),
-            t.primary,
-        ),
-        (
-            icons::COINS,
-            "今日 Token",
-            widgets::format_count(today.total_tokens),
-            format!(
+    let success_pill = if today.requests == 0 {
+        ("—".to_string(), t.muted)
+    } else if today.success_rate() >= 0.95 {
+        ("优".to_string(), t.green)
+    } else if today.success_rate() >= 0.8 {
+        ("良".to_string(), t.amber)
+    } else {
+        ("注意".to_string(), t.red)
+    };
+    let cards = vec![
+        KpiSpec {
+            icon: icons::PAPER_PLANE_TILT,
+            label: "今日请求 (Total)".into(),
+            value: widgets::format_count(today.requests),
+            pill: Some((format!("成功 {}", widgets::format_count(today.ok)), t.green)),
+            sub: format!(
+                "成功比率 {}",
+                if today.requests == 0 {
+                    "—".to_string()
+                } else {
+                    format!("{:.1}%", today.success_rate() * 100.0)
+                }
+            ),
+            color: t.primary,
+            cost: false,
+        },
+        KpiSpec {
+            icon: icons::COINS,
+            label: "今日消耗 (Tokens)".into(),
+            value: widgets::format_count(today.total_tokens),
+            pill: Some(("Tokens".to_string(), t.blue)),
+            sub: format!(
                 "输入 {} · 输出 {}",
                 widgets::format_count(today.prompt_tokens),
                 widgets::format_count(today.completion_tokens)
             ),
-            t.blue,
-        ),
-        (
-            icons::CHECK_CIRCLE,
-            "成功率",
-            success,
-            format!(
+            color: t.blue,
+            cost: false,
+        },
+        KpiSpec {
+            icon: icons::CHECK_CIRCLE,
+            label: "服务成功率".into(),
+            value: success,
+            pill: Some(success_pill),
+            sub: format!(
                 "首字 {ttft} · 总耗时 {}",
                 widgets::format_duration_ms(today.avg_latency_ms)
             ),
-            if today.requests > 0 && today.success_rate() >= 0.95 {
+            color: if today.requests > 0 && today.success_rate() >= 0.95 {
                 t.green
             } else {
                 t.amber
             },
-        ),
-        (
-            icons::CURRENCY_DOLLAR,
-            "今日预估花费",
-            widgets::format_cost_with(today.cost_micros, cfg),
-            "按路由价格估算".to_string(),
-            t.amber,
-        ),
+            cost: false,
+        },
+        KpiSpec {
+            icon: icons::CURRENCY_DOLLAR,
+            label: "今日预估花费".into(),
+            value: widgets::format_cost_with(today.cost_micros, cfg),
+            pill: Some((cfg.active_currency(), t.green)),
+            sub: "按各模型与供应商路由价格估算".into(),
+            color: t.amber,
+            cost: true,
+        },
     ];
-    kpi_grid_with_toggle(ui, &cards, cfg)
+    overview_kpi_grid(ui, &cards, cfg)
 }
 
 pub fn empty_state(
@@ -1495,10 +1680,6 @@ pub fn icon_tile(ui: &mut Ui, icon: &str, color: Color32, size: f32) {
 
 pub fn field_label(ui: &mut Ui, text: &str) {
     label(ui, text);
-}
-
-pub fn info_line(ui: &mut Ui, key: &str, value: &str) {
-    kv(ui, key, value);
 }
 
 pub fn section_label(ui: &mut Ui, text: &str) {
