@@ -302,13 +302,6 @@ impl Db {
                 rec.kind,
             ],
         )?;
-        // Keep the history bounded: only the newest 1000 rows are retained.
-        conn.execute(
-            "DELETE FROM usage_requests WHERE id <= (
-                 SELECT id FROM usage_requests ORDER BY id DESC LIMIT 1 OFFSET 1000
-             )",
-            [],
-        )?;
         Ok(())
     }
 
@@ -930,13 +923,13 @@ mod tests {
     }
 
     #[test]
-    fn keeps_only_newest_thousand_records() {
+    fn keeps_all_records_without_a_hard_row_cap() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("t.db")).unwrap();
         for _ in 0..1005 {
             db.record_usage(&sample("a1", 1, true)).unwrap();
         }
-        assert_eq!(db.usage_count(&UsageFilter::default()).unwrap(), 1000);
+        assert_eq!(db.usage_count(&UsageFilter::default()).unwrap(), 1005);
     }
 
     #[test]

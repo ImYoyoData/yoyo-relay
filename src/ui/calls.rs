@@ -15,7 +15,7 @@ impl App {
             ui,
             Page::Calls.eyebrow(),
             "调用明细",
-            "最近 1000 条请求 · 每页 20 条 · 可按模型、账号与结果筛选",
+            "按设置中的保留天数清理 · 每页 20 条 · 可按模型、账号与结果筛选",
             |ui| {
                 if kit::danger_button(ui, icons::TRASH_SIMPLE, "清空明细").clicked() {
                     clear = true;
@@ -138,128 +138,250 @@ impl App {
         }
 
         let mut delete: Option<i64> = None;
-        for row in &calls.rows {
-            let status_color = if row.cancelled {
-                theme::ORANGE
-            } else if row.ok {
-                theme::GREEN
-            } else {
-                theme::RED
-            };
-            let status_text = if row.cancelled {
-                "已取消"
-            } else if row.ok {
-                "成功"
-            } else {
-                "失败"
-            };
-            let provider = self
-                .config
-                .provider(&row.provider_id)
-                .map(|p| p.name.as_str())
-                .unwrap_or("—");
-            let account = self
-                .config
-                .account(&row.account_id)
-                .map(|a| a.name.as_str())
-                .unwrap_or("—");
-            egui::Frame::new()
-                .fill(theme::subtle_fill(ui))
-                .corner_radius(9)
-                .inner_margin(egui::Margin::symmetric(11, 8))
+        let t = theme::tokens(ui);
+        kit::surface(ui, |ui| {
+            // Fixed column widths scaled to the available width keep every
+            // header and value on the same vertical line.
+            let base: [f32; 11] = [
+                64.0, 98.0, 180.0, 150.0, 112.0, 76.0, 76.0, 86.0, 122.0, 92.0, 72.0,
+            ];
+            let base_total: f32 = base.iter().sum::<f32>() + 10.0 * 10.0;
+            let scale = (ui.available_width() / base_total).clamp(0.72, 1.35);
+            let widths: Vec<f32> = base.iter().map(|w| w * scale).collect();
+            egui::Grid::new("calls_table")
+                .num_columns(11)
+                .striped(true)
+                .spacing([10.0 * scale, 6.0])
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        kit::status_badge(ui, status_text, status_color);
-                        ui.label(
-                            RichText::new(widgets::format_call_time(row.ts))
-                                .monospace()
-                                .size(9.5)
-                                .color(theme::muted(ui)),
+                    for (label, width) in [
+                        ("状态", widths[0]),
+                        ("时间", widths[1]),
+                        ("客户端模型 / 上游", widths[2]),
+                        ("供应商 / 账号", widths[3]),
+                        ("协议", widths[4]),
+                        ("输入", widths[5]),
+                        ("输出", widths[6]),
+                        ("总 Tokens", widths[7]),
+                        ("首字 / 总耗时", widths[8]),
+                        ("花费", widths[9]),
+                        ("操作", widths[10]),
+                    ] {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width, 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_width(width);
+                                ui.label(RichText::new(label).size(9.0).strong().color(t.muted));
+                            },
                         );
-                        ui.label(
-                            RichText::new(&row.client_model)
-                                .monospace()
-                                .size(11.5)
-                                .strong(),
+                    }
+                    ui.end_row();
+
+                    for row in &calls.rows {
+                        let status_color = if row.cancelled {
+                            theme::ORANGE
+                        } else if row.ok {
+                            theme::GREEN
+                        } else {
+                            theme::RED
+                        };
+                        let status_text = if row.cancelled {
+                            "已取消"
+                        } else if row.ok {
+                            "成功"
+                        } else {
+                            "失败"
+                        };
+                        let provider = self
+                            .config
+                            .provider(&row.provider_id)
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("—");
+                        let account = self
+                            .config
+                            .account(&row.account_id)
+                            .map(|a| a.name.as_str())
+                            .unwrap_or("—");
+
+                        // 状态
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(widths[0], 34.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_width(widths[0]);
+                                kit::status_badge(ui, status_text, status_color);
+                            },
                         );
-                        if row.upstream_model != row.client_model {
-                            ui.label(
-                                RichText::new(icons::ARROW_RIGHT)
-                                    .size(10.0)
-                                    .color(theme::muted(ui)),
+                        // 时间
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(widths[1], 34.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_width(widths[1]);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(widgets::format_call_time(row.ts))
+                                            .monospace()
+                                            .size(9.0)
+                                            .color(t.muted),
+                                    )
+                                    .truncate(),
+                                );
+                            },
+                        );
+                        // 模型
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(widths[2], 34.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(widths[2]);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&row.client_model)
+                                            .monospace()
+                                            .size(10.5)
+                                            .strong()
+                                            .color(t.text),
+                                    )
+                                    .truncate(),
+                                );
+                                if row.upstream_model != row.client_model {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!("→ {}", row.upstream_model))
+                                                .monospace()
+                                                .size(8.5)
+                                                .color(t.muted),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                            },
+                        );
+                        // 供应商 / 账号
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(widths[3], 34.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(widths[3]);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(provider).size(9.5).color(t.text),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(account).size(8.5).color(t.muted),
+                                    )
+                                    .truncate(),
+                                );
+                            },
+                        );
+                        // 协议
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(widths[4], 34.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_width(widths[4]);
+                                ui.horizontal_wrapped(|ui| {
+                                    kit::plain_badge(ui, &row.protocol);
+                                    if row.stream {
+                                        kit::plain_badge(ui, "流式");
+                                    }
+                                    if row.kind != "chat" {
+                                        kit::plain_badge(ui, &row.kind);
+                                    }
+                                });
+                            },
+                        );
+                        // 输入 / 输出 / 总
+                        for (width, value) in [
+                            (widths[5], row.prompt_tokens),
+                            (widths[6], row.completion_tokens),
+                            (widths[7], row.total_tokens),
+                        ] {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(width, 34.0),
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.set_width(width);
+                                    ui.label(
+                                        RichText::new(widgets::format_count(value))
+                                            .monospace()
+                                            .size(10.0)
+                                            .color(t.text),
+                                    );
+                                },
                             );
-                            ui.label(
-                                RichText::new(&row.upstream_model)
+                        }
+                        // 首字 / 总耗时
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(widths[8], 34.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_width(widths[8]);
+                                if row.first_token_ms > 0 {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "首字 {}",
+                                            widgets::format_duration_ms(row.first_token_ms)
+                                        ))
+                                        .monospace()
+                                        .size(8.5)
+                                        .color(t.muted),
+                                    );
+                                }
+                                ui.label(
+                                    RichText::new(format!(
+                                        "总 {}",
+                                        widgets::format_duration_ms(row.latency_ms)
+                                    ))
                                     .monospace()
+                                    .size(9.0)
+                                    .color(t.muted),
+                                );
+                            },
+                        );
+                        // 花费
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(widths[9], 34.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_width(widths[9]);
+                                ui.label(
+                                    RichText::new(widgets::format_cost_with(
+                                        row.cost_micros,
+                                        &self.config.ui,
+                                    ))
                                     .size(10.0)
-                                    .color(theme::muted(ui)),
-                            );
-                        }
-                        if row.stream {
-                            kit::plain_badge(ui, "流式");
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除该记录")
-                                .clicked()
-                            {
-                                delete = Some(row.id);
-                            }
-                            ui.label(
-                                RichText::new(widgets::format_cost_with(
-                                    row.cost_micros,
-                                    &self.config.ui,
-                                ))
-                                .size(10.5)
-                                .color(theme::ORANGE),
-                            );
-                            let duration = if row.first_token_ms > 0 {
-                                format!(
-                                    "首字 {} · 总 {}",
-                                    widgets::format_duration_ms(row.first_token_ms),
-                                    widgets::format_duration_ms(row.latency_ms)
-                                )
-                            } else {
-                                format!("总 {}", widgets::format_duration_ms(row.latency_ms))
-                            };
-                            ui.label(
-                                RichText::new(duration)
-                                    .monospace()
-                                    .size(9.5)
-                                    .color(theme::muted(ui)),
-                            );
-                        });
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!("{provider} / {account}"))
-                                .size(9.5)
-                                .color(theme::muted(ui)),
+                                    .color(theme::ORANGE),
+                                );
+                            },
                         );
-                        kit::plain_badge(ui, &row.protocol);
-                        ui.label(
-                            RichText::new(format!(
-                                "入 {}（命中 {}） · 出 {} · 总 {}",
-                                widgets::format_count(row.prompt_tokens),
-                                widgets::format_count(row.cached_tokens),
-                                widgets::format_count(row.completion_tokens),
-                                widgets::format_count(row.total_tokens)
-                            ))
-                            .size(9.5)
-                            .color(theme::muted(ui)),
+                        // HTTP + 操作
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(widths[10], 34.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_width(widths[10]);
+                                ui.label(
+                                    RichText::new(row.status.to_string())
+                                        .monospace()
+                                        .size(8.5)
+                                        .color(if row.ok { t.muted } else { theme::RED }),
+                                );
+                                if kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除该记录")
+                                    .clicked()
+                                {
+                                    delete = Some(row.id);
+                                }
+                            },
                         );
-                        ui.label(
-                            RichText::new(format!("HTTP {}", row.status))
-                                .monospace()
-                                .size(9.0)
-                                .color(if row.ok { theme::muted(ui) } else { theme::RED }),
-                        );
-                        if row.kind != "chat" {
-                            kit::plain_badge(ui, &row.kind);
-                        }
-                    });
+                        ui.end_row();
+                    }
                 });
-            ui.add_space(5.0);
-        }
+        });
         if let Some(id) = delete {
             let _ = self.cmd_tx.send(UiCommand::DeleteUsage(id));
             self.toast(NoticeLevel::Info, "正在删除记录…");
@@ -285,7 +407,7 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(format!("每页 {} 条 · 仅保留最近 1000 条", calls.page_size))
+                    RichText::new(format!("每页 {} 条 · 历史按保留天数清理", calls.page_size))
                         .size(9.5)
                         .color(theme::muted(ui)),
                 );

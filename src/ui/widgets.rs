@@ -195,7 +195,7 @@ pub fn format_count(value: u64) -> String {
     } else if value >= 1_000_000 {
         format!("{:.2}M", value as f64 / 1_000_000.0)
     } else if value >= 1_000 {
-        format!("{:.1}K", value as f64 / 1_000.0)
+        format!("{:.2}K", value as f64 / 1_000.0)
     } else {
         value.to_string()
     }
