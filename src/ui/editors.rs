@@ -1,4 +1,4 @@
-use egui::{ComboBox, Id, RichText, TextEdit};
+use egui::{ComboBox, Id, RichText};
 use egui_phosphor::regular as icons;
 
 use crate::config::{
@@ -195,7 +195,7 @@ impl App {
     pub(crate) fn open_new_local_key(&mut self) {
         self.editor = Some(Editor::LocalKey(LocalKeyDraft {
             name: "新 Key".into(),
-            allowed_models_text: String::new(),
+            allowed_models: Vec::new(),
             max_tokens: 0,
             max_requests: 0,
             enabled: true,
@@ -565,10 +565,10 @@ impl App {
             }
         };
         key.allowed_models = draft
-            .allowed_models_text
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .allowed_models
+            .iter()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
             .map(str::to_string)
             .collect();
         key.max_tokens = (draft.max_tokens > 0).then_some(draft.max_tokens);
@@ -709,18 +709,24 @@ impl App {
             ),
         };
         let mut action = None;
+        let width = match kind {
+            EditorKind::Provider => 920.0,
+            EditorKind::Route => 880.0,
+            EditorKind::RouteModel => 820.0,
+            _ => 760.0,
+        };
         let closed = super::kit::modal_shell(
             ctx,
             Id::new("yoyo_editor"),
             title,
             subtitle,
-            760.0,
+            width,
             |ui| match &mut editor {
                 Editor::Provider(draft) => provider_form(self, ui, draft),
                 Editor::Account(draft) => account_form(self, ui, draft),
                 Editor::Route(draft) => route_form(self, ui, draft),
                 Editor::RouteModel(draft) => route_model_form(self, ui, draft),
-                Editor::LocalKey(draft) => local_key_form(ui, draft),
+                Editor::LocalKey(draft) => local_key_form(self, ui, draft),
                 Editor::ManualBalance(draft) => manual_balance_form(self, ui, draft),
                 Editor::BalanceSetup(draft) => balance_setup_form(self, ui, draft),
             },
@@ -868,6 +874,37 @@ impl App {
             self.execute_confirm(action, ctx);
         } else {
             self.confirm = Some(action);
+        }
+    }
+
+    pub(crate) fn show_currency_error(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.currency_error.clone() else {
+            return;
+        };
+        let mut close = false;
+        let closed = super::kit::modal_shell(
+            ctx,
+            Id::new("yoyo_currency_error"),
+            "无法使用该货币",
+            "请选择一个汇率表中存在的币种",
+            520.0,
+            |ui| {
+                ui.label(RichText::new(message).size(12.0));
+                ui.add_space(8.0);
+                super::kit::info_row(
+                    ui,
+                    icons::INFO,
+                    "花费以 USD 存储；只有 USD 或汇率表中存在正汇率（1 USD = ? 目标币种）的币种才能用于显示。",
+                );
+            },
+            |ui| {
+                if super::kit::primary_button(ui, icons::CHECK, "知道了").clicked() {
+                    close = true;
+                }
+            },
+        );
+        if closed || close {
+            self.currency_error = None;
         }
     }
 
@@ -1329,7 +1366,7 @@ impl App {
             |ui| {
                 ui.label(RichText::new("方案名称").size(11.0).color(theme::muted(ui)));
                 ui.add(
-                    TextEdit::singleline(&mut plan.name)
+                    kit::text_input(&mut plan.name)
                         .id(Id::new("price_plan_name"))
                         .desired_width(f32::INFINITY)
                         .hint_text("例如：GLM-4 峰谷价"),
@@ -1341,7 +1378,7 @@ impl App {
                         .color(theme::muted(ui)),
                 );
                 ui.add(
-                    TextEdit::singleline(&mut plan.note)
+                    kit::text_input(&mut plan.note)
                         .id(Id::new("price_plan_note"))
                         .desired_width(f32::INFINITY)
                         .hint_text("价格来源、生效日期等"),
@@ -1486,7 +1523,7 @@ impl App {
                 ui.add_space(8.0);
                 ui.label(RichText::new("你的需求").size(11.0).color(theme::muted(ui)));
                 ui.add(
-                    TextEdit::multiline(&mut self.ai_pricing_prompt)
+                    kit::text_area(&mut self.ai_pricing_prompt)
                         .id(Id::new("ai_pricing_prompt"))
                         .desired_width(f32::INFINITY)
                         .desired_rows(4)
@@ -1797,6 +1834,32 @@ fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(2.0);
 }
 
+/// Currency picker shared by balance and pricing editors. Costs are always
+/// stored in USD, so every entry here must have a usable FX rate.
+fn currency_combo(ui: &mut egui::Ui, id: &str, value: &mut String, app: &App) {
+    let mut currencies: Vec<String> = app.config.ui.fx_rates.keys().cloned().collect();
+    currencies.push("USD".into());
+    currencies.push("CNY".into());
+    currencies.push(app.config.ui.home_currency());
+    let current = crate::config::normalize_currency(value);
+    if !current.is_empty() {
+        currencies.push(current.clone());
+    }
+    currencies.sort();
+    currencies.dedup();
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(if current.is_empty() {
+            "USD".to_string()
+        } else {
+            current
+        })
+        .show_ui(ui, |ui| {
+            for currency in &currencies {
+                ui.selectable_value(value, currency.clone(), currency);
+            }
+        });
+}
+
 fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
     let provider = &mut draft.provider;
     if draft.is_new {
@@ -1821,28 +1884,53 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
 
     section(ui, "基本信息");
     let brand = brands::for_preset(Some(&draft.preset));
-    ui.horizontal(|ui| {
-        brands::tile(ui, &brand, 36.0);
-        ui.add_space(2.0);
-        ui.vertical(|ui| {
-            ui.label(RichText::new(&provider.name).size(13.0).strong());
-            ui.label(
-                RichText::new(&provider.base_url)
-                    .monospace()
-                    .size(9.5)
-                    .color(theme::muted(ui)),
-            );
+    let t = theme::tokens(ui);
+    egui::Frame::new()
+        .fill(if t.dark_mode {
+            t.hover
+        } else {
+            egui::Color32::from_rgb(247, 249, 253)
+        })
+        .stroke(egui::Stroke::new(1.0_f32, t.card_border))
+        .corner_radius(14)
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                brands::tile(ui, &brand, 52.0);
+                ui.add_space(4.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&provider.name).size(17.0).strong());
+                        kit::badge(ui, provider.kind.label(), theme::BLUE_INFO);
+                        if draft.is_new {
+                            kit::badge(ui, "预设", theme::ACCENT);
+                        }
+                    });
+                    let desc = crate::config::presets::preset(&draft.preset)
+                        .map(|preset| preset.description)
+                        .unwrap_or("自定义 OpenAI / Anthropic 兼容服务");
+                    ui.label(RichText::new(desc).size(10.5).color(theme::muted(ui)));
+                    ui.label(
+                        RichText::new(&provider.base_url)
+                            .monospace()
+                            .size(9.5)
+                            .color(theme::muted(ui)),
+                    );
+                });
+            });
         });
-    });
-    ui.add_space(4.0);
+    ui.add_space(8.0);
+    let field_w = (ui.available_width() - 130.0).clamp(240.0, 560.0);
     egui::Grid::new("provider_basic")
         .num_columns(2)
-        .spacing([14.0, 8.0])
+        .spacing([14.0, 9.0])
         .show(ui, |ui| {
             ui.label("名称");
             ui.add(
-                TextEdit::singleline(&mut provider.name)
-                    .desired_width(380.0)
+                kit::text_input(&mut provider.name)
+                    .desired_width(field_w)
+                    .margin(egui::Margin::symmetric(9, 6))
                     .hint_text("例如：OpenAI 官方"),
             );
             ui.end_row();
@@ -1861,19 +1949,21 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
             ui.end_row();
             ui.label("Base URL");
             ui.add(
-                TextEdit::singleline(&mut provider.base_url)
-                    .desired_width(380.0)
+                kit::text_input(&mut provider.base_url)
+                    .desired_width(field_w)
+                    .margin(egui::Margin::symmetric(9, 6))
                     .hint_text("https://api.openai.com/v1"),
             );
             ui.end_row();
             ui.label("测试模型");
             ui.add(
-                TextEdit::singleline(
+                kit::text_input(
                     provider
                         .test_model
                         .get_or_insert_with(|| "gpt-4o-mini".into()),
                 )
-                .desired_width(380.0)
+                .desired_width(field_w)
+                .margin(egui::Margin::symmetric(9, 6))
                 .hint_text("用于供应商测试与兜底探测"),
             );
             ui.end_row();
@@ -1891,6 +1981,105 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
             }
             ui.end_row();
         });
+
+    section(ui, "实际请求端点");
+    kit::soft_panel(ui, |ui| {
+        for protocol in [
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+        ] {
+            ui.horizontal_wrapped(|ui| {
+                kit::badge(ui, protocol.label(), theme::BLUE_INFO);
+                ui.label(
+                    RichText::new(provider.join_url_for(
+                        protocol,
+                        match protocol {
+                            Protocol::OpenAiChat => "chat/completions",
+                            Protocol::AnthropicMessages => "messages",
+                            Protocol::OpenAiResponses => "responses",
+                        },
+                    ))
+                    .monospace()
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+                );
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            kit::badge(ui, "models", theme::MUTED);
+            ui.label(
+                RichText::new(provider.models_url())
+                    .monospace()
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+            );
+        });
+    });
+    egui::CollapsingHeader::new(
+        RichText::new("高级：按协议覆盖 Base URL")
+            .size(11.5)
+            .strong(),
+    )
+    .id_salt("provider_protocol_urls")
+    .show(ui, |ui| {
+        let base = provider.base_url.clone();
+        for protocol in [
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+        ] {
+            let label = protocol.label().to_string();
+            let mut enabled = provider.protocol_base_urls.contains_key(&label);
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut enabled, protocol.label()).changed() {
+                    if enabled {
+                        provider
+                            .protocol_base_urls
+                            .insert(label.clone(), base.clone());
+                    } else {
+                        provider.protocol_base_urls.remove(&label);
+                    }
+                }
+                if enabled {
+                    if let Some(url) = provider.protocol_base_urls.get_mut(&label) {
+                        ui.add(
+                            kit::text_input(url)
+                                .desired_width(field_w)
+                                .margin(egui::Margin::symmetric(9, 6))
+                                .hint_text("https://..."),
+                        );
+                    }
+                }
+            });
+        }
+        let mut custom_models = provider.models_base_url.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut custom_models, "自定义 /models 端点")
+                .changed()
+            {
+                provider.models_base_url = custom_models.then(|| base.clone());
+            }
+            if custom_models {
+                if let Some(url) = provider.models_base_url.as_mut() {
+                    ui.add(
+                        kit::text_input(url)
+                            .desired_width(field_w)
+                            .margin(egui::Margin::symmetric(9, 6))
+                            .hint_text("https://.../v1"),
+                    );
+                }
+            }
+        });
+        ui.label(
+            RichText::new(
+                "仅当同一网关为不同协议提供不同路径时需要覆盖；留空则使用上方 Base URL。",
+            )
+            .size(10.0)
+            .color(theme::muted(ui)),
+        );
+    });
 
     section(ui, "鉴权方式");
     egui::Grid::new("provider_auth")
@@ -1914,14 +2103,14 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
             if provider.auth.mode == AuthMode::Custom {
                 ui.label("Header 名称");
                 ui.add(
-                    TextEdit::singleline(&mut provider.auth.header_name)
+                    kit::text_input(&mut provider.auth.header_name)
                         .desired_width(380.0)
                         .hint_text("x-api-key"),
                 );
                 ui.end_row();
                 ui.label("Scheme 前缀");
                 ui.add(
-                    TextEdit::singleline(&mut provider.auth.scheme)
+                    kit::text_input(&mut provider.auth.scheme)
                         .desired_width(380.0)
                         .hint_text("例如 Bearer（可留空）"),
                 );
@@ -1985,7 +2174,7 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
         {
             ui.horizontal(|ui| {
                 ui.add(
-                    TextEdit::singleline(&mut rule.prefix)
+                    kit::text_input(&mut rule.prefix)
                         .desired_width(170.0)
                         .hint_text("模型前缀"),
                 );
@@ -2022,12 +2211,12 @@ fn provider_form(app: &mut App, ui: &mut egui::Ui, draft: &mut ProviderDraft) {
     for (index, header) in provider.extra_headers.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             ui.add(
-                TextEdit::singleline(&mut header.name)
+                kit::text_input(&mut header.name)
                     .desired_width(190.0)
                     .hint_text("Header 名称"),
             );
             ui.add(
-                TextEdit::singleline(&mut header.value)
+                kit::text_input(&mut header.value)
                     .desired_width(250.0)
                     .hint_text("值"),
             );
@@ -2075,14 +2264,14 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
             ui.end_row();
             ui.label("名称");
             ui.add(
-                TextEdit::singleline(&mut draft.account.name)
+                kit::text_input(&mut draft.account.name)
                     .desired_width(380.0)
                     .hint_text("例如：主账号 5h"),
             );
             ui.end_row();
             ui.label("API Key");
             ui.add(
-                TextEdit::singleline(&mut draft.api_key_input)
+                kit::text_input(&mut draft.api_key_input)
                     .password(true)
                     .desired_width(380.0)
                     .hint_text(if draft.is_new {
@@ -2293,31 +2482,27 @@ fn account_form(app: &mut App, ui: &mut egui::Ui, draft: &mut AccountDraft) {
                 });
             ui.end_row();
             ui.label("币种");
-            ui.add(
-                TextEdit::singleline(&mut balance.currency)
-                    .desired_width(90.0)
-                    .hint_text("USD"),
-            );
+            currency_combo(ui, "balance_currency", &mut balance.currency, app);
             ui.end_row();
             match balance.mode {
                 BalanceMode::Auto => {
                     ui.label("查询 URL");
                     ui.add(
-                        TextEdit::singleline(balance.url.get_or_insert_with(String::new))
+                        kit::text_input(balance.url.get_or_insert_with(String::new))
                             .desired_width(380.0)
                             .hint_text("GET https://provider.example.com/api/balance"),
                     );
                     ui.end_row();
                     ui.label("JSON 路径");
                     ui.add(
-                        TextEdit::singleline(&mut balance.json_path)
+                        kit::text_input(&mut balance.json_path)
                             .desired_width(380.0)
                             .hint_text("data.balance 或 data[0].credits"),
                     );
                     ui.end_row();
                     ui.label("换算公式");
                     ui.add(
-                        TextEdit::singleline(&mut balance.formula)
+                        kit::text_input(&mut balance.formula)
                             .desired_width(380.0)
                             .hint_text("可留空；例如 data.balance / 100"),
                     );
@@ -2507,7 +2692,7 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
             ui.label("上游模型名");
             ui.horizontal(|ui| {
                 ui.add(
-                    TextEdit::singleline(&mut route.upstream_model)
+                    kit::text_input(&mut route.upstream_model)
                         .desired_width(280.0)
                         .hint_text("发给该供应商的真实模型名"),
                 );
@@ -2641,11 +2826,14 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
             ui.label(
                 RichText::new(format!(
                     "POST {}",
-                    provider.join_url(match resolved {
-                        Protocol::OpenAiChat => "chat/completions",
-                        Protocol::AnthropicMessages => "messages",
-                        Protocol::OpenAiResponses => "responses",
-                    })
+                    provider.join_url_for(
+                        resolved,
+                        match resolved {
+                            Protocol::OpenAiChat => "chat/completions",
+                            Protocol::AnthropicMessages => "messages",
+                            Protocol::OpenAiResponses => "responses",
+                        },
+                    )
                 ))
                 .monospace()
                 .size(10.5)
@@ -2661,7 +2849,7 @@ fn route_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteDraft) {
 
     section(ui, "能力标签");
     ui.add(
-        TextEdit::singleline(&mut draft.capabilities_text)
+        kit::text_input(&mut draft.capabilities_text)
             .desired_width(360.0)
             .hint_text("chat,tools,vision（逗号分隔）"),
     );
@@ -2827,7 +3015,7 @@ fn pricing_section(app: &mut App, ui: &mut egui::Ui, route: &mut ModelRoute) {
                 ui.horizontal(|ui| {
                     if ui
                         .add(
-                            TextEdit::singleline(&mut period.name)
+                            kit::text_input(&mut period.name)
                                 .id(Id::new(("price_period_name", index)))
                                 .desired_width(120.0)
                                 .hint_text("高峰名称"),
@@ -3178,28 +3366,28 @@ fn route_model_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteModelDraf
             .show(&mut cols[0], |ui| {
                 ui.label("客户端模型名");
                 ui.add(
-                    TextEdit::singleline(&mut draft.profile.client_model)
+                    kit::text_input(&mut draft.profile.client_model)
                         .desired_width(f32::INFINITY)
                         .hint_text("例如 gpt-5-codex"),
                 );
                 ui.end_row();
                 ui.label("显示名称");
                 ui.add(
-                    TextEdit::singleline(&mut draft.profile.display_name)
+                    kit::text_input(&mut draft.profile.display_name)
                         .desired_width(f32::INFINITY)
                         .hint_text("模型列表展示名称"),
                 );
                 ui.end_row();
                 ui.label("归属");
                 ui.add(
-                    TextEdit::singleline(&mut draft.profile.owned_by)
+                    kit::text_input(&mut draft.profile.owned_by)
                         .desired_width(f32::INFINITY)
                         .hint_text("yoyo-relay"),
                 );
                 ui.end_row();
                 ui.label("描述");
                 ui.add(
-                    TextEdit::singleline(&mut draft.profile.description)
+                    kit::text_input(&mut draft.profile.description)
                         .desired_width(f32::INFINITY)
                         .hint_text("一句话说明（可选）"),
                 );
@@ -3280,7 +3468,7 @@ fn route_model_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteModelDraf
     ui.horizontal(|ui| {
         ui.label("思考等级");
         ui.add(
-            TextEdit::singleline(&mut draft.reasoning_text)
+            kit::text_input(&mut draft.reasoning_text)
                 .desired_width(f32::INFINITY)
                 .hint_text("off,low,medium,high；留空表示不支持"),
         );
@@ -3288,7 +3476,7 @@ fn route_model_form(app: &mut App, ui: &mut egui::Ui, draft: &mut RouteModelDraf
     ui.horizontal(|ui| {
         ui.label("映射级兜底");
         ui.add(
-            TextEdit::singleline(
+            kit::text_input(
                 draft
                     .profile
                     .fallback_client_model
@@ -3428,28 +3616,77 @@ fn route_model_fetch_ui(
     }
 }
 
-fn local_key_form(ui: &mut egui::Ui, draft: &mut LocalKeyDraft) {
+fn local_key_form(app: &App, ui: &mut egui::Ui, draft: &mut LocalKeyDraft) {
     section(ui, "基本信息");
     ui.label("名称");
     ui.add(
-        TextEdit::singleline(&mut draft.name)
+        kit::text_input(&mut draft.name)
             .desired_width(f32::INFINITY)
             .hint_text("例如：Claude Code / 本地脚本"),
     );
     ui.add_space(6.0);
     ui.checkbox(&mut draft.enabled, "启用该 Key");
-    ui.add_space(6.0);
-    ui.label("模型白名单");
-    ui.add(
-        TextEdit::singleline(&mut draft.allowed_models_text)
-            .desired_width(f32::INFINITY)
-            .hint_text("留空 = 允许全部；多个模型用逗号分隔，或填 *"),
-    );
-    ui.label(
-        RichText::new("白名单匹配客户端模型名。")
-            .size(10.5)
+
+    section(ui, "模型白名单");
+    let mut models: Vec<String> = app.snapshot.client_models.clone();
+    for profile in &app.config.model_profiles {
+        models.push(profile.client_model.clone());
+    }
+    for route in &app.config.routes {
+        models.push(route.client_model.clone());
+    }
+    models.sort();
+    models.dedup();
+    let allow_all = draft.allowed_models.is_empty();
+    ui.horizontal_wrapped(|ui| {
+        if ui.radio(allow_all, "允许全部模型").clicked() && !allow_all {
+            draft.allowed_models.clear();
+        }
+        if !allow_all {
+            if kit::ghost_button(ui, icons::X, "清空白名单").clicked() {
+                draft.allowed_models.clear();
+            }
+        }
+        ui.label(
+            RichText::new(if allow_all {
+                "当前允许全部".to_string()
+            } else {
+                format!("已选择 {} 个模型", draft.allowed_models.len())
+            })
+            .size(10.0)
             .color(theme::muted(ui)),
-    );
+        );
+    });
+    ui.add_space(4.0);
+    if models.is_empty() {
+        kit::info_row(
+            ui,
+            icons::INFO,
+            "还没有可选的客户端模型。先在路由页创建模型，再回来勾选白名单；留空表示允许全部。",
+        );
+    } else {
+        kit::soft_panel(ui, |ui| {
+            kit::scroll_capped(ui, "local_key_models", 176.0, false, |ui| {
+                for model in &models {
+                    let mut checked = draft.allowed_models.iter().any(|m| m == model);
+                    if ui.checkbox(&mut checked, model).changed() {
+                        if checked {
+                            if !draft.allowed_models.iter().any(|m| m == model) {
+                                draft.allowed_models.push(model.clone());
+                            }
+                        } else {
+                            draft.allowed_models.retain(|m| m != model);
+                        }
+                    }
+                }
+            });
+        });
+        ui.label(
+            RichText::new("勾选后该 Key 只能访问所选客户端模型；不勾选任何模型表示允许全部。")
+                .size(10.0)
+                .color(theme::muted(ui)),
+        );
+    }
     section(ui, "额度");
     egui::Grid::new("local_key_quota")
         .num_columns(2)
@@ -3550,11 +3787,7 @@ fn balance_setup_form(app: &App, ui: &mut egui::Ui, draft: &mut BalanceSetupDraf
                 });
             ui.end_row();
             ui.label("币种");
-            ui.add(
-                TextEdit::singleline(&mut balance.currency)
-                    .desired_width(90.0)
-                    .hint_text("USD / CNY"),
-            );
+            currency_combo(ui, "balance_setup_currency", &mut balance.currency, app);
             ui.label(
                 RichText::new("余额、总额度与阈值都使用该币种")
                     .size(10.0)
@@ -3565,21 +3798,21 @@ fn balance_setup_form(app: &App, ui: &mut egui::Ui, draft: &mut BalanceSetupDraf
                 BalanceMode::Auto => {
                     ui.label("查询 URL");
                     ui.add(
-                        TextEdit::singleline(balance.url.get_or_insert_with(String::new))
+                        kit::text_input(balance.url.get_or_insert_with(String::new))
                             .desired_width(380.0)
                             .hint_text("GET https://provider.example.com/api/balance"),
                     );
                     ui.end_row();
                     ui.label("JSON 路径");
                     ui.add(
-                        TextEdit::singleline(&mut balance.json_path)
+                        kit::text_input(&mut balance.json_path)
                             .desired_width(380.0)
                             .hint_text("data.balance 或 data[0].credits"),
                     );
                     ui.end_row();
                     ui.label("换算公式");
                     ui.add(
-                        TextEdit::singleline(&mut balance.formula)
+                        kit::text_input(&mut balance.formula)
                             .desired_width(380.0)
                             .hint_text("可留空；例如 data.balance / 100"),
                     );

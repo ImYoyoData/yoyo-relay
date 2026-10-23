@@ -625,7 +625,7 @@ fn upstream_path(protocol: Protocol) -> &'static str {
 }
 
 fn upstream_url(provider: &Provider, protocol: Protocol) -> String {
-    provider.join_url(upstream_path(protocol))
+    provider.join_url_for(protocol, upstream_path(protocol))
 }
 
 pub(crate) fn upstream_url_public(provider: &Provider, protocol: Protocol) -> String {
@@ -1197,6 +1197,7 @@ async fn chat_handler(
                             _slot: Some(slot),
                             _permit: Some(permit),
                             started,
+                            first_token_at: None,
                             done: false,
                             completed: false,
                             failed: false,
@@ -1293,6 +1294,7 @@ async fn chat_handler(
                                 completion_tokens: usage.output_tokens,
                                 total_tokens: usage.total(),
                                 cost_micros,
+                                first_token_ms: latency,
                                 latency_ms: latency,
                                 kind: "chat".into(),
                             });
@@ -1581,6 +1583,7 @@ async fn chat_handler(
                     _slot: Some(slot),
                     _permit: Some(permit),
                     started,
+                    first_token_at: None,
                     done: false,
                     completed: false,
                     failed: false,
@@ -1747,6 +1750,7 @@ async fn chat_handler(
                         completion_tokens: usage.output_tokens,
                         total_tokens: usage.total(),
                         cost_micros,
+                        first_token_ms: latency,
                         latency_ms: latency,
                         kind: "chat".into(),
                     });
@@ -1863,6 +1867,7 @@ async fn chat_handler(
                     completion_tokens: 0,
                     total_tokens: 0,
                     cost_micros: 0,
+                    first_token_ms: latency,
                     latency_ms: latency,
                     kind: "chat".into(),
                 });
@@ -1928,6 +1933,7 @@ async fn chat_handler(
         completion_tokens: 0,
         total_tokens: 0,
         cost_micros: 0,
+        first_token_ms: latency,
         latency_ms: latency,
         kind: "chat".into(),
     });
@@ -1999,6 +2005,7 @@ struct StreamFinalizer {
     _slot: Option<AccountSlot>,
     _permit: Option<GatePermit>,
     started: Instant,
+    first_token_at: Option<Instant>,
     done: bool,
     completed: bool,
     failed: bool,
@@ -2046,6 +2053,10 @@ impl StreamFinalizer {
                 chrono::Local::now(),
                 self.fx_units_per_usd,
             ),
+            first_token_ms: self
+                .first_token_at
+                .map(|at| at.duration_since(self.started).as_millis() as u64)
+                .unwrap_or(0),
             latency_ms: latency,
             kind: "chat".into(),
         };
@@ -2147,6 +2158,9 @@ where
                         }
                         let usage = translator.usage();
                         *usage_cell.lock().unwrap_or_else(|e| e.into_inner()) = usage;
+                        if finalizer.first_token_at.is_none() && translator.produced_chars() > 0 {
+                            finalizer.first_token_at = Some(Instant::now());
+                        }
                         let produced = if usage.output_tokens > 0 {
                             usage.output_tokens
                         } else {
@@ -2359,7 +2373,14 @@ async fn generic_handler(
             }
         };
         payload["model"] = Value::String(attempt.route.upstream_model.clone());
-        let url = attempt.provider.join_url(suffix);
+        let protocol = if suffix.starts_with("messages") {
+            Protocol::AnthropicMessages
+        } else if suffix.starts_with("responses") {
+            Protocol::OpenAiResponses
+        } else {
+            Protocol::OpenAiChat
+        };
+        let url = attempt.provider.join_url_for(protocol, suffix);
         let mut req = gw
             .client_for(&url)
             .post(&url)
@@ -2488,6 +2509,7 @@ async fn generic_handler(
                     cfg.ui
                         .fx_rate(attempt.route.effective_pricing().currency.code()),
                 ),
+                first_token_ms: latency,
                 latency_ms: latency,
                 kind: "non_chat".into(),
             });

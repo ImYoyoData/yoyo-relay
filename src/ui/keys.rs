@@ -1,4 +1,4 @@
-use armas::components::{Card, CardVariant, Progress};
+use armas::components::Progress;
 use egui::{RichText, Vec2};
 use egui_phosphor::regular as icons;
 
@@ -152,169 +152,162 @@ impl App {
         let used_tokens = view.map(|v| v.used_tokens).unwrap_or(0);
         let used_requests = view.map(|v| v.used_requests).unwrap_or(0);
 
-        Card::new()
-            .variant(CardVariant::Outlined)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    super::kit::icon_tile(ui, icons::KEY, theme::ACCENT, 36.0);
-                    ui.add_space(3.0);
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&key.name).size(14.5).strong());
-                            if key.enabled {
-                                super::kit::status_badge(ui, "启用", theme::GREEN);
-                            } else {
-                                super::kit::status_badge(ui, "禁用", theme::MUTED);
-                            }
-                        });
-                        ui.label(
-                            RichText::new(format!(
-                                "创建于 {}",
-                                widgets::format_time(key.created_at)
-                            ))
+        super::kit::surface(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                super::kit::icon_tile(ui, icons::KEY, theme::ACCENT, 36.0);
+                ui.add_space(3.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&key.name).size(14.5).strong());
+                        if key.enabled {
+                            super::kit::status_badge(ui, "启用", theme::GREEN);
+                        } else {
+                            super::kit::status_badge(ui, "禁用", theme::MUTED);
+                        }
+                    });
+                    ui.label(
+                        RichText::new(format!("创建于 {}", widgets::format_time(key.created_at)))
                             .size(10.0)
                             .color(theme::muted(ui)),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if super::kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除 Key")
-                            .clicked()
-                        {
-                            *action = Some(KeyAction::Delete(key.id.clone()));
-                        }
-                        if super::kit::icon_button(ui, icons::ARROWS_CLOCKWISE, "重置 Key")
-                            .clicked()
-                        {
-                            *action = Some(KeyAction::Reset(key.id.clone()));
-                        }
-                        if super::kit::icon_button(
-                            ui,
-                            if key.enabled {
-                                icons::POWER
-                            } else {
-                                icons::PLAY
-                            },
-                            if key.enabled {
-                                "禁用 Key"
-                            } else {
-                                "启用 Key"
-                            },
-                        )
-                        .clicked()
-                        {
-                            *action = Some(KeyAction::Toggle(key.id.clone(), !key.enabled));
-                        }
-                        if super::kit::icon_button(
-                            ui,
-                            if running {
-                                icons::SPINNER
-                            } else {
-                                icons::FLASK
-                            },
-                            "测试 Key",
-                        )
-                        .clicked()
-                            && !running
-                        {
-                            *action = Some(KeyAction::Test(key.id.clone()));
-                        }
-                        if super::kit::icon_button(ui, icons::COPY, "复制 Key").clicked() {
-                            match self.store.decrypt(&key.key) {
-                                Ok(plain) if !plain.is_empty() => {
-                                    *action = Some(KeyAction::Copy(plain));
-                                }
-                                _ => *action = Some(KeyAction::CopyFailed),
-                            }
-                        }
-                    });
+                    );
                 });
-
-                ui.add_space(8.0);
-                super::kit::soft_panel(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(
-                                view.map(|v| v.masked.clone())
-                                    .unwrap_or_else(|| "••••".into()),
-                            )
-                            .monospace()
-                            .size(11.0),
-                        );
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(icons::COPY)
-                                        .size(11.0)
-                                        .color(theme::muted(ui)),
-                                )
-                                .frame(false)
-                                .min_size(Vec2::splat(18.0)),
-                            )
-                            .on_hover_text("复制完整 Key")
-                            .clicked()
-                        {
-                            match self.store.decrypt(&key.key) {
-                                Ok(plain) if !plain.is_empty() => {
-                                    *action = Some(KeyAction::Copy(plain));
-                                }
-                                _ => *action = Some(KeyAction::CopyFailed),
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if super::kit::danger_icon_button(ui, icons::TRASH_SIMPLE, "删除 Key").clicked()
+                    {
+                        *action = Some(KeyAction::Delete(key.id.clone()));
+                    }
+                    if super::kit::icon_button(ui, icons::ARROWS_CLOCKWISE, "重置 Key").clicked()
+                    {
+                        *action = Some(KeyAction::Reset(key.id.clone()));
+                    }
+                    if super::kit::icon_button(
+                        ui,
+                        if key.enabled {
+                            icons::POWER
+                        } else {
+                            icons::PLAY
+                        },
+                        if key.enabled {
+                            "禁用 Key"
+                        } else {
+                            "启用 Key"
+                        },
+                    )
+                    .clicked()
+                    {
+                        *action = Some(KeyAction::Toggle(key.id.clone(), !key.enabled));
+                    }
+                    if super::kit::icon_button(
+                        ui,
+                        if running {
+                            icons::SPINNER
+                        } else {
+                            icons::FLASK
+                        },
+                        "测试 Key",
+                    )
+                    .clicked()
+                        && !running
+                    {
+                        *action = Some(KeyAction::Test(key.id.clone()));
+                    }
+                    if super::kit::icon_button(ui, icons::COPY, "复制 Key").clicked() {
+                        match self.store.decrypt(&key.key) {
+                            Ok(plain) if !plain.is_empty() => {
+                                *action = Some(KeyAction::Copy(plain));
                             }
-                        }
-                    });
-                });
-
-                ui.add_space(7.0);
-                ui.horizontal_wrapped(|ui| {
-                    super::kit::field_label(ui, "白名单");
-                    if key.allowed_models.is_empty() {
-                        super::kit::badge(ui, "全部模型", theme::BLUE_INFO);
-                    } else {
-                        for model in key.allowed_models.iter().take(6) {
-                            super::kit::badge(ui, model, theme::MUTED);
-                        }
-                        if key.allowed_models.len() > 6 {
-                            super::kit::badge(
-                                ui,
-                                &format!("+{}", key.allowed_models.len() - 6),
-                                theme::MUTED,
-                            );
+                            _ => *action = Some(KeyAction::CopyFailed),
                         }
                     }
                 });
+            });
 
-                ui.add_space(5.0);
+            ui.add_space(8.0);
+            super::kit::soft_panel(ui, |ui| {
                 ui.horizontal(|ui| {
-                    super::kit::field_label(ui, "额度");
                     ui.label(
-                        RichText::new(format!("{} tokens", widgets::format_count(used_tokens)))
-                            .monospace()
-                            .size(11.0),
+                        RichText::new(
+                            view.map(|v| v.masked.clone())
+                                .unwrap_or_else(|| "••••".into()),
+                        )
+                        .monospace()
+                        .size(11.0),
                     );
-                    ui.label(
-                        RichText::new(format!("{used_requests} 次"))
-                            .monospace()
-                            .size(10.5)
-                            .color(theme::muted(ui)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let limit_text = match (key.max_tokens, key.max_requests) {
-                            (Some(t), _) => format!("上限 {} tokens", widgets::format_count(t)),
-                            (_, Some(r)) => format!("上限 {r} 次"),
-                            _ => "不限额度".to_string(),
-                        };
-                        ui.label(RichText::new(limit_text).size(10.0).color(theme::muted(ui)));
-                    });
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(icons::COPY)
+                                    .size(11.0)
+                                    .color(theme::muted(ui)),
+                            )
+                            .frame(false)
+                            .min_size(Vec2::splat(18.0)),
+                        )
+                        .on_hover_text("复制完整 Key")
+                        .clicked()
+                    {
+                        match self.store.decrypt(&key.key) {
+                            Ok(plain) if !plain.is_empty() => {
+                                *action = Some(KeyAction::Copy(plain));
+                            }
+                            _ => *action = Some(KeyAction::CopyFailed),
+                        }
+                    }
                 });
-                if let Some(limit) = key.max_tokens {
-                    if limit > 0 {
-                        let pct = (used_tokens as f32 / limit as f32 * 100.0).min(100.0);
-                        Progress::new(pct)
-                            .width(ui.available_width().min(260.0))
-                            .show(ui);
+            });
+
+            ui.add_space(7.0);
+            ui.horizontal_wrapped(|ui| {
+                super::kit::field_label(ui, "白名单");
+                if key.allowed_models.is_empty() {
+                    super::kit::badge(ui, "全部模型", theme::BLUE_INFO);
+                } else {
+                    for model in key.allowed_models.iter().take(6) {
+                        super::kit::badge(ui, model, theme::MUTED);
+                    }
+                    if key.allowed_models.len() > 6 {
+                        super::kit::badge(
+                            ui,
+                            &format!("+{}", key.allowed_models.len() - 6),
+                            theme::MUTED,
+                        );
                     }
                 }
             });
+
+            ui.add_space(5.0);
+            ui.horizontal(|ui| {
+                super::kit::field_label(ui, "额度");
+                ui.label(
+                    RichText::new(format!("{} tokens", widgets::format_count(used_tokens)))
+                        .monospace()
+                        .size(11.0),
+                );
+                ui.label(
+                    RichText::new(format!("{used_requests} 次"))
+                        .monospace()
+                        .size(10.5)
+                        .color(theme::muted(ui)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let limit_text = match (key.max_tokens, key.max_requests) {
+                        (Some(t), _) => format!("上限 {} tokens", widgets::format_count(t)),
+                        (_, Some(r)) => format!("上限 {r} 次"),
+                        _ => "不限额度".to_string(),
+                    };
+                    ui.label(RichText::new(limit_text).size(10.0).color(theme::muted(ui)));
+                });
+            });
+            if let Some(limit) = key.max_tokens {
+                if limit > 0 {
+                    let pct = (used_tokens as f32 / limit as f32 * 100.0).min(100.0);
+                    Progress::new(pct)
+                        .width(ui.available_width().min(260.0))
+                        .show(ui);
+                }
+            }
+        });
     }
 
     fn set_key_enabled(&mut self, id: &str, enabled: bool) {

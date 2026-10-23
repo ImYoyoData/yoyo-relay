@@ -130,7 +130,12 @@ impl App {
                     format!("{:.1}%", totals.success_rate() * 100.0)
                 },
                 format!(
-                    "平均耗时 {}",
+                    "首字 {} · 总耗时 {}",
+                    if totals.avg_first_token_ms > 0 {
+                        widgets::format_duration_ms(totals.avg_first_token_ms)
+                    } else {
+                        "—".to_string()
+                    },
                     widgets::format_duration_ms(totals.avg_latency_ms)
                 ),
                 if totals.requests > 0 && totals.success_rate() >= 0.95 {
@@ -142,7 +147,7 @@ impl App {
             (
                 icons::CURRENCY_DOLLAR,
                 "预估花费",
-                widgets::format_cost(totals.cost_micros),
+                widgets::format_cost_with(totals.cost_micros, &self.config.ui),
                 if usage.days == 1 {
                     "今日 · 按路由价格".to_string()
                 } else {
@@ -151,7 +156,9 @@ impl App {
                 theme::ORANGE,
             ),
         ];
-        super::kit::kpi_grid(ui, &cards);
+        if super::kit::kpi_grid_with_toggle(ui, &cards, &mut self.config.ui) {
+            self.persist();
+        }
         ui.add_space(12.0);
 
         super::kit::surface(ui, |ui| {
@@ -205,6 +212,7 @@ impl App {
                     .iter()
                     .rposition(|point| point.tokens > 0 || point.requests > 0);
             }
+            let currency = self.config.ui.active_currency();
             if let Some(index) = super::kit::interactive_chart(
                 ui,
                 &points,
@@ -212,6 +220,8 @@ impl App {
                 190.0,
                 metric,
                 usage.bucket_secs,
+                &currency,
+                self.config.ui.active_fx_rate(),
             ) {
                 if self.usage_pinned == Some(index) {
                     self.usage_pinned = None;
@@ -238,7 +248,7 @@ impl App {
                                     format!("{} 次请求", point.requests)
                                 }
                                 super::kit::ChartMetric::Cost => {
-                                    widgets::format_cost(point.cost_micros)
+                                    widgets::format_cost_with(point.cost_micros, &self.config.ui)
                                 }
                             };
                             ui.label(RichText::new(text).size(11.0).strong());
@@ -370,7 +380,10 @@ impl App {
                             metric_column(
                                 ui,
                                 "花费",
-                                &widgets::format_cost(group.totals.cost_micros),
+                                &widgets::format_cost_with(
+                                    group.totals.cost_micros,
+                                    &self.config.ui,
+                                ),
                                 false,
                             );
                             metric_column(
@@ -415,7 +428,10 @@ impl App {
                                             metric_column(
                                                 ui,
                                                 "花费",
-                                                &widgets::format_cost(totals.cost_micros),
+                                                &widgets::format_cost_with(
+                                                    totals.cost_micros,
+                                                    &self.config.ui,
+                                                ),
                                                 false,
                                             );
                                         });

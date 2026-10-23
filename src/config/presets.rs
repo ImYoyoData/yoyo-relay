@@ -72,13 +72,13 @@ pub const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         key: "opencode_zen",
         name: "OpenCode Zen",
-        description: "聚合平台 · 按模型前缀解析协议",
+        description: "OpenAI 兼容 · opencode.ai/inference",
         group: "聚合平台",
     },
     ProviderPreset {
         key: "opencode_go",
         name: "OpenCode Go",
-        description: "订阅套餐 · 与 Zen 共用兼容网关（可改）",
+        description: "订阅套餐 · /inference/go 双协议端点",
         group: "聚合平台",
     },
     ProviderPreset {
@@ -192,28 +192,50 @@ pub fn provider_from_preset(key: &str) -> Provider {
         "opencode_zen" => {
             p.name = "OpenCode Zen".into();
             p.kind = ProviderKind::Aggregator;
-            p.base_url = "https://opencode.ai/zen/v1".into();
+            p.base_url = "https://opencode.ai/inference/openai/v1".into();
+            p.protocol_base_urls = std::collections::BTreeMap::from([
+                (
+                    Protocol::AnthropicMessages.label().to_string(),
+                    "https://opencode.ai/inference/anthropic/v1".to_string(),
+                ),
+                (
+                    Protocol::OpenAiResponses.label().to_string(),
+                    "https://opencode.ai/inference/openai/v1".to_string(),
+                ),
+            ]);
+            p.models_base_url = Some("https://opencode.ai/inference/v1".into());
             p.auth = AuthConfig::default();
             p.static_protocol = Protocol::OpenAiChat;
             p.protocol_strategy = ProtocolStrategy {
                 mode: ProtocolStrategyMode::ModelPrefix,
                 prefix_rules: aggregator_prefix_rules(),
             };
-            p.test_model = Some("gpt-4o-mini".into());
+            p.test_model = Some("gpt-5.5".into());
         }
         "opencode_go" => {
             p.name = "OpenCode Go".into();
             p.kind = ProviderKind::Aggregator;
-            // OpenCode Go subscriptions are served through the same compatible
-            // gateway as Zen; users can override the URL in the editor.
-            p.base_url = "https://opencode.ai/zen/v1".into();
+            // Go exposes separate OpenAI and Anthropic bases under
+            // /inference/go; keep both so prefix-routed Claude models work.
+            p.base_url = "https://opencode.ai/inference/go/openai/v1".into();
+            p.protocol_base_urls = std::collections::BTreeMap::from([
+                (
+                    Protocol::AnthropicMessages.label().to_string(),
+                    "https://opencode.ai/inference/go/anthropic/v1".to_string(),
+                ),
+                (
+                    Protocol::OpenAiResponses.label().to_string(),
+                    "https://opencode.ai/inference/go/openai/v1".to_string(),
+                ),
+            ]);
+            p.models_base_url = Some("https://opencode.ai/inference/go/v1".into());
             p.auth = AuthConfig::default();
             p.static_protocol = Protocol::OpenAiChat;
             p.protocol_strategy = ProtocolStrategy {
                 mode: ProtocolStrategyMode::ModelPrefix,
                 prefix_rules: aggregator_prefix_rules(),
             };
-            p.test_model = Some("claude-sonnet-4-5".into());
+            p.test_model = Some("glm-5.3-flash".into());
         }
         _ => {
             p.name = "自定义端点".into();
@@ -278,5 +300,29 @@ mod tests {
             );
             assert!(!provider.name.is_empty());
         }
+    }
+
+    #[test]
+    fn opencode_presets_use_real_per_protocol_endpoints() {
+        let go = provider_from_preset("opencode_go");
+        assert_eq!(
+            go.base_url_for(Protocol::OpenAiChat),
+            "https://opencode.ai/inference/go/openai/v1"
+        );
+        assert_eq!(
+            go.base_url_for(Protocol::AnthropicMessages),
+            "https://opencode.ai/inference/go/anthropic/v1"
+        );
+        assert_eq!(
+            go.models_url(),
+            "https://opencode.ai/inference/go/v1/models"
+        );
+
+        let zen = provider_from_preset("opencode_zen");
+        assert_eq!(
+            zen.base_url_for(Protocol::OpenAiChat),
+            "https://opencode.ai/inference/openai/v1"
+        );
+        assert_eq!(zen.models_url(), "https://opencode.ai/inference/v1/models");
     }
 }

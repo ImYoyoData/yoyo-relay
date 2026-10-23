@@ -178,7 +178,7 @@ fn parse_models(body: &str) -> Vec<String> {
 }
 
 fn models_endpoint(provider: &Provider) -> String {
-    provider.join_url("models")
+    provider.models_url()
 }
 
 fn default_test_model(provider: &Provider) -> String {
@@ -222,7 +222,7 @@ fn minimal_url(provider: &Provider, protocol: Protocol) -> String {
         Protocol::AnthropicMessages => "messages",
         Protocol::OpenAiResponses => "responses",
     };
-    provider.join_url(path)
+    provider.join_url_for(protocol, path)
 }
 
 const AI_PRICING_SYSTEM_PROMPT: &str = r#"你是 YoyoRelay 的 LLM API 计费配置助手。根据用户的需求生成一个价格方案。

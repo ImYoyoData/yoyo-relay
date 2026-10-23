@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use armas::components::{Card, CardVariant};
 use egui::RichText;
 use egui_phosphor::regular as icons;
 
@@ -36,17 +35,22 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(" + ")
         };
-        let cny_total: f64 = totals
+        let display_currency = self.config.ui.active_currency();
+        let converted_total: f64 = totals
             .iter()
-            .map(|(currency, amount)| self.config.ui.fx_convert(*amount, currency, "CNY"))
+            .map(|(currency, amount)| {
+                self.config
+                    .ui
+                    .fx_convert(*amount, currency, &display_currency)
+            })
             .sum();
         let cny_sub = if totals.is_empty() {
             "暂无可用余额数据".to_string()
         } else {
-            let rate = self.config.ui.fx_rate("CNY");
+            let rate = self.config.ui.fx_rate(&display_currency);
             format!(
-                "折合 {} CNY · USD/CNY {rate:.2}",
-                widgets::format_money(cny_total, "CNY")
+                "折合 {} · 1 USD = {rate:.4} {display_currency}",
+                widgets::format_money(converted_total, &display_currency)
             )
         };
         let low = known
@@ -196,104 +200,98 @@ impl App {
             .map(|u| !u.trim().is_empty())
             .unwrap_or(false);
 
-        Card::new()
-            .variant(CardVariant::Outlined)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    super::kit::icon_tile(
-                        ui,
-                        icons::WALLET,
-                        if low_amount {
-                            theme::RED
-                        } else {
-                            theme::ACCENT
-                        },
-                        36.0,
-                    );
-                    ui.add_space(3.0);
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&balance.account_name).size(14.5).strong());
-                            super::kit::badge(ui, &balance.mode, theme::MUTED);
-                            if balance.estimated {
-                                super::kit::badge(ui, "估算", theme::ORANGE);
-                            }
-                        });
-                        ui.label(
-                            RichText::new(&balance.provider_name)
-                                .size(10.0)
-                                .color(theme::muted(ui)),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(amount) = balance.amount {
-                            ui.label(
-                                RichText::new(widgets::format_money(amount, &balance.currency))
-                                    .size(20.0)
-                                    .strong()
-                                    .color(if low_amount { theme::RED } else { theme::GREEN }),
-                            );
-                        } else {
-                            ui.label(RichText::new("—").color(theme::muted(ui)));
+        super::kit::surface(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                super::kit::icon_tile(
+                    ui,
+                    icons::WALLET,
+                    if low_amount {
+                        theme::RED
+                    } else {
+                        theme::ACCENT
+                    },
+                    36.0,
+                );
+                ui.add_space(3.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&balance.account_name).size(14.5).strong());
+                        super::kit::badge(ui, &balance.mode, theme::MUTED);
+                        if balance.estimated {
+                            super::kit::badge(ui, "估算", theme::ORANGE);
                         }
                     });
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&balance.status_text).size(10.0).color(
-                        if balance.amount.is_some() {
-                            theme::GREEN
-                        } else {
-                            theme::ORANGE
-                        },
-                    ));
-                    if balance.updated_at > 0 {
-                        ui.label(
-                            RichText::new(format!(
-                                "更新于 {}",
-                                widgets::time_ago(balance.updated_at, crate::config::now_ts())
-                            ))
+                    ui.label(
+                        RichText::new(&balance.provider_name)
                             .size(10.0)
                             .color(theme::muted(ui)),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(amount) = balance.amount {
+                        ui.label(
+                            RichText::new(widgets::format_money(amount, &balance.currency))
+                                .size(20.0)
+                                .strong()
+                                .color(if low_amount { theme::RED } else { theme::GREEN }),
                         );
+                    } else {
+                        ui.label(RichText::new("—").color(theme::muted(ui)));
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if super::kit::icon_button(
-                            ui,
-                            icons::PENCIL_SIMPLE,
-                            "余额设置：查询方式、JSON 路径、公式、百分比换算",
-                        )
-                        .clicked()
-                        {
-                            *action = Some(BalanceAction::Setup(balance.account_id.clone()));
-                        }
-                        if super::kit::icon_button(
-                            ui,
-                            icons::CURRENCY_CIRCLE_DOLLAR,
-                            "手动录入余额",
-                        )
-                        .clicked()
-                        {
-                            *action = Some(BalanceAction::Manual(balance.account_id.clone()));
-                        }
-                        if super::kit::labeled_button(
-                            ui,
-                            icons::ARROWS_CLOCKWISE,
-                            "刷新",
-                            armas::ButtonVariant::Outline,
-                            armas::ButtonSize::Small,
-                        )
-                        .clicked()
-                            && is_auto
-                            && has_url
-                            && !self.snapshot.balance_refreshing
-                        {
-                            *action = Some(BalanceAction::Refresh(balance.account_id.clone()));
-                        }
-                    });
                 });
             });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&balance.status_text).size(10.0).color(
+                    if balance.amount.is_some() {
+                        theme::GREEN
+                    } else {
+                        theme::ORANGE
+                    },
+                ));
+                if balance.updated_at > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "更新于 {}",
+                            widgets::time_ago(balance.updated_at, crate::config::now_ts())
+                        ))
+                        .size(10.0)
+                        .color(theme::muted(ui)),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if super::kit::icon_button(
+                        ui,
+                        icons::PENCIL_SIMPLE,
+                        "余额设置：查询方式、JSON 路径、公式、百分比换算",
+                    )
+                    .clicked()
+                    {
+                        *action = Some(BalanceAction::Setup(balance.account_id.clone()));
+                    }
+                    if super::kit::icon_button(ui, icons::CURRENCY_CIRCLE_DOLLAR, "手动录入余额")
+                        .clicked()
+                    {
+                        *action = Some(BalanceAction::Manual(balance.account_id.clone()));
+                    }
+                    if super::kit::labeled_button(
+                        ui,
+                        icons::ARROWS_CLOCKWISE,
+                        "刷新",
+                        armas::ButtonVariant::Outline,
+                        armas::ButtonSize::Small,
+                    )
+                    .clicked()
+                        && is_auto
+                        && has_url
+                        && !self.snapshot.balance_refreshing
+                    {
+                        *action = Some(BalanceAction::Refresh(balance.account_id.clone()));
+                    }
+                });
+            });
+        });
     }
 }
 

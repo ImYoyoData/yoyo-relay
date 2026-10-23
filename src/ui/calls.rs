@@ -205,12 +205,24 @@ impl App {
                                 delete = Some(row.id);
                             }
                             ui.label(
-                                RichText::new(widgets::format_cost(row.cost_micros))
-                                    .size(10.5)
-                                    .color(theme::ORANGE),
+                                RichText::new(widgets::format_cost_with(
+                                    row.cost_micros,
+                                    &self.config.ui,
+                                ))
+                                .size(10.5)
+                                .color(theme::ORANGE),
                             );
+                            let duration = if row.first_token_ms > 0 {
+                                format!(
+                                    "首字 {} · 总 {}",
+                                    widgets::format_duration_ms(row.first_token_ms),
+                                    widgets::format_duration_ms(row.latency_ms)
+                                )
+                            } else {
+                                format!("总 {}", widgets::format_duration_ms(row.latency_ms))
+                            };
                             ui.label(
-                                RichText::new(format!("{:.2} s", row.latency_ms as f64 / 1000.0))
+                                RichText::new(duration)
                                     .monospace()
                                     .size(9.5)
                                     .color(theme::muted(ui)),

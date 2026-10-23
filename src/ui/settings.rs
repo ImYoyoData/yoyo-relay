@@ -403,6 +403,63 @@ impl App {
 
         kit::section_card(
             ui,
+            icons::CURRENCY_DOLLAR,
+            "货币与花费",
+            "花费统一以 USD 存储，按汇率换算成你的货币显示",
+            |ui| {
+                kit::badge(ui, "USD 基准", theme::ACCENT);
+            },
+            |ui| {
+                let currencies = self.config.ui.currency_options();
+                let current = self.config.ui.home_currency();
+                let mut selected = current.clone();
+                ui.horizontal(|ui| {
+                    setting_label(ui, icons::CURRENCY_DOLLAR, "我的货币");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::secondary_button(ui, icons::ARROWS_CLOCKWISE, "刷新币种").clicked()
+                        {
+                            refresh_fx = true;
+                        }
+                        egui::ComboBox::from_id_salt("home_currency")
+                            .selected_text(&current)
+                            .show_ui(ui, |ui| {
+                                for currency in &currencies {
+                                    ui.selectable_value(&mut selected, currency.clone(), currency);
+                                }
+                            });
+                    });
+                });
+                if selected != current {
+                    if self.config.ui.currency_supported(&selected) {
+                        self.config.ui.home_currency = selected;
+                        self.config.ui.display_currency.clear();
+                        changed = true;
+                    } else {
+                        self.currency_error = Some(format!(
+                            "汇率表中没有 {selected} 的有效汇率，配置未保存。请点击「刷新币种」或「立即获取汇率」更新实时汇率后再选择。"
+                        ));
+                    }
+                }
+                setting_desc(
+                    ui,
+                    "下拉列表包含 ISO 4217 全部币种与实时汇率接口返回的币种；概览、用量、调用明细与任务栏徽标都会使用该货币，花费仍以 USD 保存。",
+                );
+                let home = self.config.ui.home_currency();
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new(format!(
+                        "当前显示：1 USD = {:.4} {home} · 花费卡片右上角可快速切换 USD / {home}",
+                        self.config.ui.fx_rate(&home)
+                    ))
+                    .size(9.5)
+                    .color(theme::muted(ui)),
+                );
+            },
+        );
+        ui.add_space(12.0);
+
+        kit::section_card(
+            ui,
             icons::SHIELD_CHECK,
             "快捷操作",
             "常用入口与本地状态",
@@ -699,7 +756,7 @@ impl App {
                                 ui.vertical(|ui| {
                                     if ui
                                         .add(
-                                            egui::TextEdit::singleline(&mut plan.name)
+                                            kit::text_input(&mut plan.name)
                                                 .id(egui::Id::new((
                                                     "price_plan_library_name",
                                                     index,
@@ -786,7 +843,7 @@ impl App {
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.price_plan_import_path)
+                            kit::text_input(&mut self.price_plan_import_path)
                                 .desired_width(380.0)
                                 .hint_text("价格方案 JSON 的绝对路径"),
                         );
@@ -1320,7 +1377,7 @@ impl App {
                     ui.add_space(8.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.import_path)
+                            kit::text_input(&mut self.import_path)
                                 .desired_width(360.0)
                                 .hint_text("导出 JSON 的绝对路径"),
                         );
@@ -1774,7 +1831,7 @@ fn proxy_fields_a(ui: &mut Ui, server: &mut crate::config::ServerConfig) -> bool
             ui.label("监听地址");
             changed |= ui
                 .add(
-                    egui::TextEdit::singleline(&mut server.bind)
+                    kit::text_input(&mut server.bind)
                         .id(proxy_bind_id())
                         .desired_width(170.0)
                         .hint_text("127.0.0.1"),

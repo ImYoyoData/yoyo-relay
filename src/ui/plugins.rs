@@ -7,6 +7,23 @@ use crate::snapshot::NoticeLevel;
 
 use super::{kit, theme, widgets, App, ConfirmAction, Page};
 
+fn open_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    let _ = std::fs::create_dir_all(path);
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer").arg(path).spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn()?;
+    }
+    Ok(())
+}
+
 impl App {
     pub(crate) fn page_plugins(&mut self, ui: &mut egui::Ui) {
         let mut install_samples = false;
@@ -105,6 +122,11 @@ impl App {
                     );
                     if kit::ghost_button(ui, icons::COPY, "复制").clicked() {
                         self.copy(ui.ctx(), &dir, "插件目录");
+                    }
+                    if kit::ghost_button(ui, icons::FOLDER_OPEN, "打开目录").clicked() {
+                        if let Err(err) = open_in_file_manager(std::path::Path::new(&dir)) {
+                            self.toast(NoticeLevel::Error, format!("无法打开插件目录：{err}"));
+                        }
                     }
                 });
                 kit::info_row(
@@ -617,7 +639,7 @@ impl App {
                 if is_prompt {
                     ui.add_space(8.0);
                     ui.add(
-                        egui::TextEdit::singleline(&mut text)
+                        kit::text_input(&mut text)
                             .id(egui::Id::new("plugin_ui_prompt"))
                             .desired_width(f32::INFINITY)
                             .hint_text("输入内容"),

@@ -379,6 +379,12 @@ pub struct UiConfig {
     pub fx_updated_at: i64,
     /// Human-readable source of the last live-rate refresh.
     pub fx_source: String,
+    /// The user's own currency, selected in Settings. Costs are stored in USD
+    /// and converted through `fx_rates` for display.
+    pub home_currency: String,
+    /// Optional temporary display override set by the cost-card toggle. Empty
+    /// means "follow home_currency".
+    pub display_currency: String,
     /// Windows taskbar badge composition and placement.
     pub taskbar: TaskbarBadgeConfig,
     /// Check GitHub for a newer release in the background.
@@ -426,6 +432,47 @@ impl UiConfig {
         }
         amount * to / from
     }
+
+    pub fn home_currency(&self) -> String {
+        let currency = normalize_currency(&self.home_currency);
+        if currency.is_empty() {
+            "USD".to_string()
+        } else {
+            currency
+        }
+    }
+
+    /// Currency currently used for cost display. The cost cards can switch to
+    /// USD without changing the configured home currency.
+    pub fn active_currency(&self) -> String {
+        if self.display_currency.trim().is_empty() {
+            self.home_currency()
+        } else {
+            normalize_currency(&self.display_currency)
+        }
+    }
+
+    pub fn active_fx_rate(&self) -> f64 {
+        self.fx_rate(&self.active_currency())
+    }
+
+    /// A currency can be used for display when it is USD or has a positive
+    /// live/manual rate.
+    pub fn currency_supported(&self, currency: &str) -> bool {
+        let currency = normalize_currency(currency);
+        currency == "USD" || self.fx_rates.get(&currency).is_some_and(|rate| *rate > 0.0)
+    }
+
+    /// Full dropdown list: the ISO catalogue plus every currency the live-rate
+    /// endpoint returned. Sorted and deduplicated for a stable menu.
+    pub fn currency_options(&self) -> Vec<String> {
+        let mut options: Vec<String> = CURRENCY_CODES.iter().map(|c| (*c).to_string()).collect();
+        options.extend(self.fx_rates.keys().cloned());
+        options.push(self.home_currency());
+        options.sort();
+        options.dedup();
+        options
+    }
 }
 
 impl Default for UiConfig {
@@ -452,6 +499,8 @@ impl Default for UiConfig {
             fx_refresh_hours: 12,
             fx_updated_at: 0,
             fx_source: String::new(),
+            home_currency: "CNY".to_string(),
+            display_currency: String::new(),
             taskbar: TaskbarBadgeConfig::default(),
             auto_update_check: true,
             update_check_hours: 12,
@@ -637,6 +686,13 @@ pub struct Provider {
     pub name: String,
     pub kind: ProviderKind,
     pub base_url: String,
+    /// Optional per-protocol base URLs for gateways that expose different
+    /// paths per dialect (for example OpenCode Go's `/openai/v1` and
+    /// `/anthropic/v1`). Keys are `Protocol::label()` values.
+    pub protocol_base_urls: BTreeMap<String, String>,
+    /// Optional base for the `/models` catalogue when it differs from the
+    /// chat base URL.
+    pub models_base_url: Option<String>,
     pub auth: AuthConfig,
     pub static_protocol: Protocol,
     pub protocol_strategy: ProtocolStrategy,
@@ -654,6 +710,8 @@ impl Default for Provider {
             name: String::new(),
             kind: ProviderKind::Official,
             base_url: String::new(),
+            protocol_base_urls: BTreeMap::new(),
+            models_base_url: None,
             auth: AuthConfig::default(),
             static_protocol: Protocol::OpenAiChat,
             protocol_strategy: ProtocolStrategy::default(),
@@ -710,8 +768,30 @@ impl Provider {
         self.protocol_for(upstream_model, explicit)
     }
 
-    pub fn join_url(&self, path: &str) -> String {
-        let base = self.base_url.trim_end_matches('/');
+    pub fn base_url_for(&self, protocol: Protocol) -> &str {
+        self.protocol_base_urls
+            .get(protocol.label())
+            .map(String::as_str)
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or(&self.base_url)
+    }
+
+    pub fn join_url_for(&self, protocol: Protocol, path: &str) -> String {
+        Self::join_base(self.base_url_for(protocol), path)
+    }
+
+    pub fn models_url(&self) -> String {
+        Self::join_base(
+            self.models_base_url
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+                .unwrap_or(&self.base_url),
+            "models",
+        )
+    }
+
+    fn join_base(base: &str, path: &str) -> String {
+        let base = base.trim_end_matches('/');
         let path = path.trim_start_matches('/');
         if path.is_empty() {
             base.to_string()
@@ -1501,6 +1581,24 @@ pub fn normalize_currency(currency: &str) -> String {
     }
 }
 
+/// Active ISO 4217 codes. The Settings dropdown uses this list so users can
+/// find their currency even before the first live-rate refresh; whether a code
+/// is actually selectable still depends on `UiConfig::currency_supported`.
+pub const CURRENCY_CODES: &[&str] = &[
+    "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT",
+    "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD",
+    "CDF", "CHF", "CLP", "CNY", "COP", "CRC", "CUP", "CVE", "CZK", "DJF", "DKK", "DOP", "DZD",
+    "EGP", "ERN", "ETB", "EUR", "FJD", "FKP", "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ",
+    "GYD", "HKD", "HNL", "HTG", "HUF", "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD", "JOD",
+    "JPY", "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT", "LAK", "LBP", "LKR",
+    "LRD", "LSL", "LYD", "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR",
+    "MWK", "MXN", "MYR", "MZN", "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PEN",
+    "PGK", "PHP", "PKR", "PLN", "PYG", "QAR", "RON", "RSD", "RUB", "RWF", "SAR", "SBD", "SCR",
+    "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SYP", "SZL", "THB", "TJS",
+    "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "USD", "UYU", "UZS", "VES",
+    "VND", "VUV", "WST", "XAF", "XCD", "XOF", "XPF", "YER", "ZAR", "ZMW", "ZWL",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1651,5 +1749,20 @@ mod tests {
         };
         assert!(config.has_content());
         assert!(!config.transparent_bg);
+    }
+
+    #[test]
+    fn display_currency_follows_home_and_cost_override() {
+        let mut ui = UiConfig::default();
+        ui.home_currency = "CNY".into();
+        assert_eq!(ui.active_currency(), "CNY");
+        ui.display_currency = "USD".into();
+        assert_eq!(ui.active_currency(), "USD");
+        assert_eq!(ui.active_fx_rate(), 1.0);
+        ui.display_currency.clear();
+        assert!((ui.active_fx_rate() - 7.2).abs() < 1e-9);
+        assert!(ui.currency_supported("CNY"));
+        assert!(!ui.currency_supported("XXX"));
+        assert!((ui.fx_convert(1.0, "USD", "CNY") - 7.2).abs() < 1e-9);
     }
 }

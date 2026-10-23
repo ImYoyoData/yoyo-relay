@@ -228,7 +228,8 @@ pub(crate) struct RouteModelDraft {
 
 pub(crate) struct LocalKeyDraft {
     pub name: String,
-    pub allowed_models_text: String,
+    /// Empty means "allow every client model".
+    pub allowed_models: Vec<String>,
     pub max_tokens: u64,
     pub max_requests: u64,
     pub enabled: bool,
@@ -317,6 +318,8 @@ pub struct App {
     pub(crate) ai_pricing_seq: u64,
     pub(crate) ai_pricing_apply: Option<(String, PricePlan)>,
     pub(crate) price_plan_import_path: String,
+    /// Validation message shown in a modal when the currency cannot be used.
+    pub(crate) currency_error: Option<String>,
     pub(crate) update_modal: bool,
     pub(crate) update_waiting: bool,
     pub(crate) update_prompted: Option<String>,
@@ -410,6 +413,7 @@ impl App {
             ai_pricing_seq: 0,
             ai_pricing_apply: None,
             price_plan_import_path: String::new(),
+            currency_error: None,
             update_modal: false,
             update_waiting: false,
             update_prompted: None,
@@ -543,6 +547,17 @@ impl App {
     }
 
     pub(crate) fn persist(&mut self) -> bool {
+        let home = self.config.ui.home_currency();
+        if !self.config.ui.currency_supported(&home) {
+            self.currency_error = Some(format!(
+                "汇率表中没有 {home} 的有效汇率，配置未保存。请先刷新实时汇率，或在「货币与花费」中手动填写 1 USD = ? {home}。"
+            ));
+            return false;
+        }
+        let display = crate::config::normalize_currency(&self.config.ui.display_currency);
+        if !display.is_empty() && !self.config.ui.currency_supported(&display) {
+            self.config.ui.display_currency.clear();
+        }
         let mut cfg = self.config.clone();
         if let Err(err) = self.store.save(&mut cfg) {
             self.toast(NoticeLevel::Error, format!("保存失败：{err}"));
@@ -1047,7 +1062,10 @@ impl App {
                 parts.push(format!("{rate}%"));
             }
             if badge_cfg.show_cost {
-                parts.push(widgets::format_cost(totals.cost_micros));
+                parts.push(widgets::format_cost_with(
+                    totals.cost_micros,
+                    &self.config.ui,
+                ));
             }
             if badge_cfg.show_speed {
                 parts.push(format!(
@@ -1786,6 +1804,14 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(22, 16)),
             )
             .show(ctx, |ui| {
+                // Panels occasionally report the full window width to the
+                // central UI instead of the space left of the sidebar. Clamp
+                // explicitly so header actions and right-aligned controls stay
+                // inside the visible window.
+                let content_width =
+                    (ctx.content_rect().width() - self.sidebar_width(ctx) - 44.0).max(320.0);
+                ui.set_min_width(content_width);
+                ui.set_max_width(content_width);
                 let height = ui.available_height();
                 kit::scroll_fill(ui, "central_content", height, false, |ui| {
                     let max_w = 1260.0_f32;
@@ -1824,10 +1850,14 @@ impl App {
             return;
         }
         let t = theme::tokens_ctx(ctx);
+        // Keep long notices inside the window: the toast column may never be
+        // wider than ~45% of the viewport, and the text wraps inside it.
+        let toast_width = (ctx.content_rect().width() * 0.45).clamp(260.0, 520.0);
         egui::Area::new(Id::new("toasts"))
             .anchor(Align2::RIGHT_BOTTOM, [-18.0, -42.0])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                ui.set_max_width(toast_width);
                 for toast in self.toasts.iter().rev().take(3) {
                     let color = match toast.level {
                         NoticeLevel::Success => t.green,
@@ -1842,12 +1872,18 @@ impl App {
                         .shadow(t.card_shadow)
                         .inner_margin(egui::Margin::symmetric(12, 9))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
+                            ui.set_max_width(toast_width - 24.0);
+                            ui.horizontal_top(|ui| {
                                 let (rect, _) =
                                     ui.allocate_exact_size(Vec2::splat(6.0), Sense::hover());
                                 ui.painter().circle_filled(rect.center(), 3.0, color);
                                 ui.add_space(4.0);
-                                ui.label(RichText::new(&toast.text).size(11.5).color(t.text));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&toast.text).size(11.5).color(t.text),
+                                    )
+                                    .wrap(),
+                                );
                             });
                         });
                     ui.add_space(6.0);
@@ -1858,6 +1894,18 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        // Any sub-pixel seam between the side panel and the central panel
+        // used to show the renderer's black clear colour as a thick divider.
+        let c = visuals.panel_fill;
+        [
+            c.r() as f32 / 255.0,
+            c.g() as f32 / 255.0,
+            c.b() as f32 / 255.0,
+            1.0,
+        ]
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let _ = &frame;
         if !self.ctx_attached {
@@ -1971,6 +2019,7 @@ impl eframe::App for App {
         self.show_plugin_ui(ctx);
         self.show_plugin_console(ctx);
         self.show_plugin_docs(ctx);
+        self.show_currency_error(ctx);
         self.show_confirm(ctx);
         self.show_test_modal(ctx);
         self.show_onboarding(ctx);
